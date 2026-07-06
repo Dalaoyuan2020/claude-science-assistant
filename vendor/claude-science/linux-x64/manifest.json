@@ -1,0 +1,9 @@
+﻿{
+    "product":  "claude-science",
+    "platform":  "linux-x64",
+    "version":  "0.1.15-dev.20260701.t220242.shaaa553de",
+    "profile":  "release, public",
+    "sha256":  "a5c966b3d07fb3e4460522d30b962c43eff7b6e15746defe0f37473b9df0a3d3",
+    "source":  "local WSL ~/.local/bin/claude-science captured for v0.1 portable package",
+    "capturedAt":  "2026-07-05T14:15:52.7547187Z"
+}

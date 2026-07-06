@@ -1,0 +1,41 @@
+# Local secrets and runtime state
+config.json
+.env
+.env.*
+!.env.example
+
+# Generated certificates. Never commit private CAs or server keys.
+certs/
+*.pem
+*.key
+*.csr
+*.srl
+
+# Generated launchd files and logs
+*.plist
+logs/
+*.log
+.daemon-model-patch.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Generated release/test packages
+dist/
+
+# Local captured/bundled third-party runtime binaries.
+# Keep these out of the source repo; publish portable ZIPs as GitHub Release assets instead.
+vendor/claude-science/linux-x64/claude-science
+
+# Local/private support playbooks. Do not upload.
+private/
+local/
+
+# macOS
+.DS_Store

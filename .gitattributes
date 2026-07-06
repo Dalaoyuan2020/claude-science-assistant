@@ -1,0 +1,9 @@
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
+.env.example text eol=lf
+vendor/claude-science/linux-x64/claude-science binary

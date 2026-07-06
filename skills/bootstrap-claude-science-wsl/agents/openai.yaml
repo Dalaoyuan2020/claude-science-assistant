@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Science 电脑体检"
+  short_description: "检查 Windows、WSL2 与 Claude Science 运行环境"
+  default_prompt: "Use $bootstrap-claude-science-wsl to inspect this Windows PC and produce a safe, redacted readiness report."

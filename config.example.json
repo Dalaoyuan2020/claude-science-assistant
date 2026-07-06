@@ -1,0 +1,44 @@
+{
+  "deepseek_api_key": "",
+  "openai_api_key": "",
+  "custom_api_key": "",
+  "deepseek_base_url": "https://api.deepseek.com/anthropic",
+  "openai_base_url": "https://api.openai.com",
+  "custom_base_url": "",
+  "default_backend": "deepseek",
+  "force_model": "deepseek-v4-pro",
+  "deepseek_model_map": {
+    "claude-sonnet-5": "deepseek-v4-pro",
+    "claude-sonnet-4-5": "deepseek-v4-pro",
+    "claude-opus-4-8": "deepseek-v4-pro",
+    "claude-haiku-4-5-20251001": "deepseek-v4-flash"
+  },
+  "openai_model_map": {
+    "claude-sonnet-4-5": "gpt-4o"
+  },
+  "custom_model_map": {},
+  "model_aliases": [
+    {
+      "id": "byok-model-0001",
+      "display_name": "DeepSeek V4 Pro",
+      "backend": "deepseek",
+      "model": "deepseek-v4-pro"
+    }
+  ],
+  "model_list_mode": "aliases",
+  "model_token_caps": {},
+  "default_max_tokens_cap": 0,
+  "deepseek_upstream_mode": "anthropic",
+  "openai_upstream_mode": "openai",
+  "custom_upstream_mode": "openai",
+  "proxy_auth_token": "",
+  "proxy_auth_mode": "optional",
+  "outbound_proxy_url": "",
+  "deepseek_model_pattern": "deepseek|deep-seek",
+  "openai_model_pattern": "^(gpt-|o1|o3|o4|chatgpt)",
+  "custom_model_pattern": "",
+  "reasoning_content_policy": "never",
+  "inline_image_policy": "auto",
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 9876
+}
