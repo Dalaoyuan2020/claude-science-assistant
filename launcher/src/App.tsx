@@ -93,19 +93,19 @@ const fallbackProviderGroups: ProviderGroup[] = [
     title: "官方直连",
     tier: "official",
     providers: [
-      { id: "glm", name: "GLM-5.2", meta: "智谱官方 API", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultModel: "glm-5.2" },
-      { id: "longcat", name: "LongCat", meta: "OpenAI / Anthropic 兼容", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://api.longcat.chat/openai", defaultModel: "LongCat-2.0" },
-      { id: "deepseek", name: "DeepSeek", meta: "官方 API", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.deepseek.com/anthropic", defaultModel: "deepseek-v4-pro" },
-      { id: "minimax", name: "MiniMax", meta: "官方 API / Anthropic 兼容", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.minimax.io/anthropic", defaultModel: "MiniMax-M3" },
+      { id: "glm", name: "GLM-5.2", meta: "智谱官方 API", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
+      { id: "longcat", name: "LongCat", meta: "OpenAI / Anthropic 兼容", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://api.longcat.chat/openai" },
+      { id: "deepseek", name: "DeepSeek", meta: "官方 API", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.deepseek.com/anthropic" },
+      { id: "minimax", name: "MiniMax", meta: "官方 API / Anthropic 兼容", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.minimax.io/anthropic" },
       { id: "claude", name: "Claude", meta: "官方登录 / API", badge: "官方", trust: "official", protocol: "official-login-or-api" },
-      { id: "openai", name: "OpenAI / GPT", meta: "官方登录 / API", badge: "官方", trust: "official", protocol: "official-login-or-api", baseUrl: "https://api.openai.com/v1", defaultModel: "gpt-5.5" },
+      { id: "openai", name: "OpenAI / GPT", meta: "官方登录 / API", badge: "官方", trust: "official", protocol: "official-login-or-api", baseUrl: "https://api.openai.com/v1" },
     ],
   },
   {
     title: "聚合平台",
     tier: "aggregator",
     providers: [
-      { id: "opencode-go", name: "OpenCode Go", meta: "订阅 API Key", badge: "聚合", trust: "aggregator", protocol: "openai-compatible", baseUrl: "https://opencode.ai/zen/go/v1", defaultModel: "glm-5.2" },
+      { id: "opencode-go", name: "OpenCode Go", meta: "订阅 API Key", badge: "聚合", trust: "aggregator", protocol: "openai-compatible", baseUrl: "https://opencode.ai/zen/go/v1" },
       { id: "openrouter", name: "OpenRouter", meta: "多模型路由", badge: "聚合", trust: "aggregator", protocol: "openai-compatible", baseUrl: "https://openrouter.ai/api/v1" },
     ],
   },
@@ -273,7 +273,7 @@ function App() {
     setDraftProviderId(provider?.id || providerId);
     setDraftApiKey("");
     setDraftBaseUrl(provider?.id === "custom" ? baseUrl : provider?.baseUrl || "");
-    setDraftModel(provider?.defaultModel || "");
+    setDraftModel("");
     setDraftModelAliases([]);
     setDraftConfirmed(provider?.trust.startsWith("untrusted") ? confirmed : false);
     setTestResult(undefined);
@@ -289,7 +289,7 @@ function App() {
     setDraftProviderId(provider.id);
     setDraftApiKey("");
     setDraftBaseUrl(provider.id === "custom" ? customBaseUrl : provider.baseUrl || "");
-    setDraftModel(provider.defaultModel || "");
+    setDraftModel("");
     setDraftModelAliases([]);
     setDraftConfirmed(false);
     setTestResult(undefined);
@@ -390,9 +390,9 @@ function App() {
         providerId: draftProvider.id,
         baseUrl: draftBaseUrl,
         upstreamMode: draftProvider.protocol.includes("anthropic") ? "anthropic" : "openai",
-        selectedModel: draftModel || draftProvider.defaultModel || "preview-model",
+        selectedModel: draftModel || "preview-model",
         reply: "OK",
-        models: [draftModel || draftProvider.defaultModel || "preview-model"],
+        models: [draftModel || "preview-model"],
         message: "浏览器预览模式：真实测试请打开 Tauri 启动器。",
       };
       setTestResult(preview);
@@ -448,7 +448,7 @@ function App() {
     }
 
     if (!isTauri) {
-      const primaryModel = draftModel || draftProvider.defaultModel || "preview-pro-model";
+      const primaryModel = draftModel || "preview-pro-model";
       const fastModel = primaryModel.includes("fast") ? primaryModel : "preview-fast-model";
       const aliases: ModelAlias[] = [
         { id: "byok-model-0001", displayName: `BYOK 主力模型 -> ${primaryModel}`, model: primaryModel },
@@ -757,7 +757,7 @@ function App() {
                   默认模型
                   <input
                     value={draftModel}
-                    placeholder={draftProvider?.defaultModel || "留空则由服务商默认决定"}
+                    placeholder="可留空；建议先测试连通或自动映射获取模型列表"
                     spellCheck={false}
                     onChange={(event) => {
                       setDraftModel(event.currentTarget.value);

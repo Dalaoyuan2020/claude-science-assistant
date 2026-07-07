@@ -49,8 +49,18 @@ function Invoke-Wsl {
 
 function Get-WslPath {
   param([string]$WindowsPath)
-  $converted = ((Invoke-Wsl @("wslpath", "-a", $WindowsPath)) -replace [char]0, "")
-  return ($converted | Select-Object -First 1).Trim()
+  $portablePath = (Resolve-Path -LiteralPath $WindowsPath).Path.Replace("\", "/")
+  $converted = @((Invoke-Wsl @("wslpath", "-a", $portablePath)) -replace [char]0, "")
+  $candidate = @(
+    $converted |
+      ForEach-Object { "$_".Trim() } |
+      Where-Object { $_ -match '^/' } |
+      Select-Object -First 1
+  )
+  if (-not $candidate.Count) {
+    throw "Failed to convert Windows path to WSL path: $WindowsPath"
+  }
+  return $candidate[0]
 }
 
 Write-Step "Read-only Windows inspection"

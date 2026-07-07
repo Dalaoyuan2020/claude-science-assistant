@@ -1,6 +1,6 @@
 [package]
 name = "claude-science-assistant"
-version = "0.1.1"
+version = "0.1.2"
 description = "Windows launcher for Claude Science and domestic model providers"
 authors = ["Claude Science Assistant contributors"]
 edition = "2021"
@@ -22,4 +22,3 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-

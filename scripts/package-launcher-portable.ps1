@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $LauncherDir = Join-Path $ProjectDir "launcher"
-$Version = "0.1.1"
+$Version = "0.1.2"
 
 if (-not $OutputDir) {
   $OutputDir = Join-Path $ProjectDir "dist"
@@ -26,6 +26,9 @@ if (-not $SkipBuild) {
       & pnpm tauri build --debug --no-bundle
     } else {
       & pnpm tauri build --no-bundle
+    }
+    if ($LASTEXITCODE -ne 0) {
+      throw "Tauri build failed with exit code $LASTEXITCODE"
     }
   } finally {
     Pop-Location
@@ -72,6 +75,7 @@ foreach ($file in @(
   "install-wsl-bridge-service.sh",
   "start-claude-science-wsl.sh",
   "start-claude-science-wsl.ps1",
+  "status-probe.ps1",
   "self-test.ps1",
   "acceptance-v0.1.ps1",
   "acceptance-v0.1.bat",
@@ -85,7 +89,7 @@ foreach ($file in @(
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "quick-start.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "quick-start.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "architecture-and-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "architecture-and-product-plan.zh-CN.md")
-Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.1.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.1.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.2.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.2.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
@@ -98,6 +102,9 @@ if (-not (Test-Path -LiteralPath $BundledClaudeBin)) {
   throw "Bundled Claude Science Linux binary is required but missing: $BundledClaudeBin"
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") -Destination (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse
+Get-ChildItem -LiteralPath (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse -File |
+  Where-Object { $_.Extension -in @(".rar", ".zip", ".7z") } |
+  Remove-Item -Force
 $BundledClaudeInfo = Get-Content -LiteralPath $BundledClaudeManifest -Raw -Encoding UTF8 | ConvertFrom-Json
 
 $Manifest = [ordered]@{
@@ -112,6 +119,7 @@ $Manifest = [ordered]@{
   acceptanceHelperBat = "scripts/acceptance-v0.1.bat"
   evidenceHelper = "scripts/collect-acceptance-evidence.ps1"
   evidenceHelperBat = "scripts/collect-acceptance-evidence.bat"
+  statusProbe = "scripts/status-probe.ps1"
   quickStartBats = @(
     "1-run-acceptance-preview.bat",
     "2-collect-acceptance-evidence.bat",
@@ -129,7 +137,7 @@ $Manifest = [ordered]@{
   docs = @(
     "docs/quick-start.zh-CN.md",
     "docs/architecture-and-product-plan.zh-CN.md",
-    "docs/github-release-v0.1.1.md",
+    "docs/github-release-v0.1.2.md",
     "docs/green-book-integration.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
@@ -166,6 +174,7 @@ $Readme = @(
   "",
   "Do not copy only the exe. The launcher and skill need proxy.py, requirements.txt, scripts/, static/, tests/, docs/, and skills/ in the same extracted folder.",
   "Add API Key is the model-entry flow. Non-Claude entries require a key, which is encrypted with Windows current-user DPAPI; saved keys can be switched from the ordered list and are never echoed.",
+  "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
   "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",

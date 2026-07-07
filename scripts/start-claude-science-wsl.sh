@@ -65,6 +65,13 @@ wait_tcp() {
   return 1
 }
 
+service_matches_project() {
+  if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" != "systemd" ]; then
+    return 0
+  fi
+  systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$PROJECT_DIR/proxy.py" >/dev/null 2>&1
+}
+
 if [ "${#PROXY_PORT}" -ne 4 ]; then
   echo "PROXY_PORT must be four digits for byte-length-preserving URL patches. Current: $PROXY_PORT" >&2
   exit 1
@@ -114,15 +121,26 @@ mkdir -p "$LOG_DIR" "$PATCH_DIR"
 echo "Using Claude Science Linux binary: $SOURCE_BIN"
 "$SOURCE_BIN" --version 2>/dev/null || true
 
+if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
+  && check_tcp 127.0.0.1 "$PROXY_PORT" \
+  && service_matches_project \
+  && pgrep -f "claude-science-api-bridge/patched/claude-science serve" >/dev/null 2>&1; then
+  echo "Claude Science and WSL BYOK proxy are already running; using fast start path."
+  if [ -x "$PATCHED_BIN" ]; then
+    "$PATCHED_BIN" url || true
+  else
+    echo "http://localhost:$CLAUDE_SCIENCE_PORT"
+  fi
+  exit 0
+fi
+
 if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then
   PROXY_PORT="$PROXY_PORT" PYTHON="$PYTHON_BIN" bash "$SCRIPT_DIR/install-wsl-bridge-service.sh" >/dev/null
-  if ! systemctl --user is-active --quiet claude-science-bridge.service; then
-    # Remove only an exact legacy Bridge process before handing ownership to systemd.
-    for pid in $(ps -eo pid=,args= | awk '/python.*claude-science-api-bridge.*\/proxy.py/ && !/awk/ {print $1}'); do
-      kill "$pid" 2>/dev/null || true
-    done
-    systemctl --user start claude-science-bridge.service
-  fi
+  # Remove only exact legacy fallback Bridge processes before handing ownership to systemd.
+  for pid in $(ps -eo pid=,args= | awk '/python.*claude-science-api-bridge.*\/proxy.py/ && !/awk/ {print $1}'); do
+    kill "$pid" 2>/dev/null || true
+  done
+  systemctl --user restart claude-science-bridge.service
   echo "WSL BYOK proxy managed by systemd user service on 127.0.0.1:$PROXY_PORT"
   if ! wait_tcp 127.0.0.1 "$PROXY_PORT"; then
     echo "WSL proxy service did not start on 127.0.0.1:$PROXY_PORT. Last log lines:" >&2
@@ -144,17 +162,32 @@ else
   echo "WSL BYOK proxy already listening on 127.0.0.1:$PROXY_PORT"
 fi
 
+TOKEN_FILE="$HOME/.claude-science/.oauth-tokens/byok-user-000000000000000000.enc"
 if [ -f "$HOME/.claude-science/encryption.key" ]; then
-  echo "Refreshing local fake OAuth token"
-  "$PYTHON_BIN" "$PROJECT_DIR/setup-token.py" >/dev/null
+  if [ -f "$TOKEN_FILE" ]; then
+    echo "Local fake OAuth token already exists"
+  else
+    echo "Refreshing local fake OAuth token"
+    "$PYTHON_BIN" "$PROJECT_DIR/setup-token.py" >/dev/null
+  fi
 else
   echo "Warning: ~/.claude-science/encryption.key does not exist; fake OAuth token was not generated." >&2
 fi
 
-cp -f "$SOURCE_BIN" "$PATCHED_BIN"
-chmod +x "$PATCHED_BIN"
+SOURCE_SHA="$(sha256sum "$SOURCE_BIN" | awk '{print $1}')"
+PATCH_MARKER="$PATCH_DIR/.claude-science.source.sha256"
+PATCH_CACHE_KEY="$SOURCE_SHA:$PROXY_PORT"
 
-TARGET="$PATCHED_BIN" PROXY_PORT="$PROXY_PORT" "$PYTHON_BIN" - <<'PY'
+if [ -x "$PATCHED_BIN" ] \
+  && [ -f "$PATCH_MARKER" ] \
+  && [ "$(cat "$PATCH_MARKER" 2>/dev/null || true)" = "$PATCH_CACHE_KEY" ] \
+  && "$PATCHED_BIN" --help >/dev/null 2>&1; then
+  echo "Patched Claude Science daemon cache is current"
+else
+  cp -f "$SOURCE_BIN" "$PATCHED_BIN"
+  chmod +x "$PATCHED_BIN"
+
+  TARGET="$PATCHED_BIN" PROXY_PORT="$PROXY_PORT" "$PYTHON_BIN" - <<'PY'
 import os
 import shutil
 import stat
@@ -237,9 +270,11 @@ for olds, new, _, _ in counts:
 print(f"Patched OAuth/API URL occurrence(s): {patched}")
 PY
 
-if ! "$PATCHED_BIN" --help >/dev/null 2>&1; then
-  echo "Patched daemon failed executable check." >&2
-  exit 1
+  if ! "$PATCHED_BIN" --help >/dev/null 2>&1; then
+    echo "Patched daemon failed executable check." >&2
+    exit 1
+  fi
+  printf '%s\n' "$PATCH_CACHE_KEY" > "$PATCH_MARKER"
 fi
 
 for pid in $(pgrep -f "claude-science" 2>/dev/null || true); do

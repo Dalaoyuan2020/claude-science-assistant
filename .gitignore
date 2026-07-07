@@ -32,6 +32,9 @@ dist/
 # Local captured/bundled third-party runtime binaries.
 # Keep these out of the source repo; publish portable ZIPs as GitHub Release assets instead.
 vendor/claude-science/linux-x64/claude-science
+vendor/**/*.rar
+vendor/**/*.zip
+vendor/**/*.7z
 
 # Local/private support playbooks. Do not upload.
 private/

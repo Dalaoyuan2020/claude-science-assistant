@@ -60,6 +60,7 @@ $required = @(
   "scripts\collect-acceptance-evidence.bat",
   "scripts\start-claude-science-wsl.ps1",
   "scripts\start-claude-science-wsl.sh",
+  "scripts\status-probe.ps1",
   "scripts\install-wsl-bridge-service.sh",
   "vendor\claude-science\linux-x64\claude-science",
   "vendor\claude-science\linux-x64\claude-science.sha256",

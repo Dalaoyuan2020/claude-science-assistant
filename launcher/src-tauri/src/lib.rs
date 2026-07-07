@@ -20,6 +20,16 @@ fn background_command(program: &str) -> Command {
     command
 }
 
+async fn run_blocking<T, F>(job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|error| format!("background task failed: {error}"))?
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemStatus {
@@ -286,13 +296,6 @@ fn parse_first_pid(text: &str) -> Option<u32> {
         .find_map(|line| line.trim().parse::<u32>().ok())
 }
 
-fn process_pid(distro: &str, pattern: &str) -> Option<u32> {
-    let script = format!("pgrep -f -- '{}' | head -n 1", pattern.replace('\'', ""));
-    wsl_shell(distro, &script)
-        .ok()
-        .and_then(|output| parse_first_pid(&output_text(&output)))
-}
-
 fn legacy_windows_bridge_pid() -> Option<u32> {
     let root = project_root().ok()?;
     let escaped_root = root.to_string_lossy().replace('\'', "''");
@@ -307,6 +310,65 @@ fn legacy_windows_bridge_pid() -> Option<u32> {
     background_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
+        .ok()
+        .and_then(|output| parse_first_pid(&output_text(&output)))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn wsl_command_success(distro: &str, script: &str) -> bool {
+    wsl_shell(distro, script)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn wsl_port_listening(distro: &str, port: u16) -> bool {
+    let script = format!("ss -ltn 2>/dev/null | grep -q ':{} '", port);
+    wsl_command_success(distro, &script)
+}
+
+fn wsl_bridge_health_ok(distro: &str) -> bool {
+    wsl_command_success(
+        distro,
+        "curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1",
+    )
+}
+
+fn wsl_service_active(distro: &str) -> bool {
+    wsl_command_success(
+        distro,
+        "systemctl --user is-active --quiet claude-science-bridge.service",
+    )
+}
+
+fn windows_path_to_wsl(distro: &str, path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let output = run_wsl(distro, &["wslpath", "-a", &normalized]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    output_text(&output)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('/'))
+        .map(ToOwned::to_owned)
+}
+
+fn bridge_unit_matches_project(distro: &str, project_wsl: &str) -> Option<bool> {
+    if project_wsl.trim().is_empty() {
+        return None;
+    }
+    let script = format!(
+        "systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- {}/proxy.py >/dev/null 2>&1",
+        shell_quote(project_wsl)
+    );
+    Some(wsl_command_success(distro, &script))
+}
+
+fn process_pid_any(distro: &str, script: &str) -> Option<u32> {
+    wsl_shell(distro, script)
         .ok()
         .and_then(|output| parse_first_pid(&output_text(&output)))
 }
@@ -364,10 +426,13 @@ fn current_status() -> SystemStatus {
         .ok()
         .map(|output| output_text(&output))
         .filter(|text| !text.is_empty());
-    let bridge_pid = process_pid(&distro, "[p]ython.*claude-science-api-bridge.*/proxy.py");
-    let claude_pid = process_pid(
+    let bridge_pid = process_pid_any(
         &distro,
-        "claude-science-api-bridge/patched/[c]laude-science serve",
+        "ps -eo pid=,args= | awk '/python/ && /proxy.py/ && !/awk/ {print $1; exit}'",
+    );
+    let claude_pid = process_pid_any(
+        &distro,
+        "ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1; exit}'",
     );
     let source_binary_present =
         wsl_path_exists(
@@ -382,14 +447,31 @@ fn current_status() -> SystemStatus {
     );
     let project_files_present = project_runtime_files_present();
     let runtime_ready = source_binary_present && bridge_venv_present && project_files_present;
-    let bridge_healthy = bridge_pid.is_some()
-        && wsl_shell(
-            &distro,
-            "curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1",
-        )
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+    let bridge_healthy = wsl_bridge_health_ok(&distro);
+    let bridge_service_active = wsl_service_active(&distro);
+    let bridge_port_listening = wsl_port_listening(&distro, 9876);
+    let claude_port_listening =
+        wsl_port_listening(&distro, 8765) || wsl_port_listening(&distro, 8766);
+    let project_wsl = project_root()
+        .ok()
+        .and_then(|root| windows_path_to_wsl(&distro, &root));
+    let unit_matches_project = project_wsl
+        .as_deref()
+        .and_then(|path| bridge_unit_matches_project(&distro, path));
+    let bridge_running =
+        bridge_pid.is_some() || bridge_healthy || bridge_service_active || bridge_port_listening;
+    let claude_running = claude_pid.is_some() || claude_port_listening;
     let windows_bridge_pid = legacy_windows_bridge_pid();
+
+    if bridge_running && !bridge_healthy {
+        warnings.push("Bridge process/service/port exists, but health check failed.".into());
+    }
+    if bridge_running && !claude_running {
+        warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
+    }
+    if unit_matches_project == Some(false) {
+        warnings.push("WSL Bridge service points to a different package directory; run the repair flow to re-register the current CSA folder.".into());
+    }
 
     if bridge_pid.is_some() && !bridge_healthy {
         warnings.push("Bridge 进程存在，但健康检查失败".into());
@@ -415,13 +497,13 @@ fn current_status() -> SystemStatus {
         );
     }
 
-    let state = if !runtime_ready && bridge_pid.is_none() && claude_pid.is_none() {
+    let state = if !runtime_ready && !bridge_running && !claude_running {
         "notInstalled"
-    } else if bridge_pid.is_some() && windows_bridge_pid.is_some() {
+    } else if bridge_running && windows_bridge_pid.is_some() {
         "degraded"
-    } else if bridge_healthy && claude_pid.is_some() {
+    } else if bridge_healthy && claude_running && unit_matches_project != Some(false) {
         "running"
-    } else if bridge_pid.is_some() || claude_pid.is_some() {
+    } else if bridge_running || claude_running {
         "degraded"
     } else {
         "stopped"
@@ -432,9 +514,9 @@ fn current_status() -> SystemStatus {
         wsl_installed: true,
         distro: Some(distro),
         linux_user,
-        bridge_running: bridge_pid.is_some(),
+        bridge_running,
         bridge_pid,
-        claude_running: claude_pid.is_some(),
+        claude_running,
         claude_pid,
         bridge_healthy,
         windows_bridge_pid,
@@ -541,7 +623,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "official".into(),
                     protocol: "openai-compatible".into(),
                     base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
-                    default_model: Some("glm-5.2".into()),
+                    default_model: None,
                 },
                 ProviderPreset {
                     id: "longcat".into(),
@@ -551,7 +633,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "official".into(),
                     protocol: "openai-compatible".into(),
                     base_url: Some("https://api.longcat.chat/openai".into()),
-                    default_model: Some("LongCat-2.0".into()),
+                    default_model: None,
                 },
                 ProviderPreset {
                     id: "deepseek".into(),
@@ -561,7 +643,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "official".into(),
                     protocol: "anthropic-compatible".into(),
                     base_url: Some("https://api.deepseek.com/anthropic".into()),
-                    default_model: Some("deepseek-v4-pro".into()),
+                    default_model: None,
                 },
                 ProviderPreset {
                     id: "minimax".into(),
@@ -571,7 +653,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "official".into(),
                     protocol: "anthropic-compatible".into(),
                     base_url: Some("https://api.minimax.io/anthropic".into()),
-                    default_model: Some("MiniMax-M3".into()),
+                    default_model: None,
                 },
                 ProviderPreset {
                     id: "claude".into(),
@@ -591,7 +673,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "official".into(),
                     protocol: "official-login-or-api".into(),
                     base_url: Some("https://api.openai.com/v1".into()),
-                    default_model: Some("gpt-5.5".into()),
+                    default_model: None,
                 },
             ],
         },
@@ -607,7 +689,7 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                     trust: "aggregator".into(),
                     protocol: "openai-compatible".into(),
                     base_url: Some("https://opencode.ai/zen/go/v1".into()),
-                    default_model: Some("glm-5.2".into()),
+                    default_model: None,
                 },
                 ProviderPreset {
                     id: "openrouter".into(),
@@ -782,9 +864,9 @@ fn runtime_profile_for_provider(
             api_key_field: "custom_api_key",
             base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             upstream_mode: "openai",
-            default_model: "glm-5.2".into(),
-            default_fast_model: "glm-5.2".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "longcat" => BridgeRuntimeProfile {
             provider_id: provider_id.into(),
@@ -793,9 +875,9 @@ fn runtime_profile_for_provider(
             api_key_field: "custom_api_key",
             base_url: "https://api.longcat.chat/openai".into(),
             upstream_mode: "openai",
-            default_model: "LongCat-2.0".into(),
-            default_fast_model: "LongCat-2.0".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "deepseek" => BridgeRuntimeProfile {
             provider_id: provider_id.into(),
@@ -804,9 +886,9 @@ fn runtime_profile_for_provider(
             api_key_field: "deepseek_api_key",
             base_url: "https://api.deepseek.com/anthropic".into(),
             upstream_mode: "anthropic",
-            default_model: "deepseek-v4-pro".into(),
-            default_fast_model: "deepseek-v4-flash".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "minimax" => BridgeRuntimeProfile {
             provider_id: provider_id.into(),
@@ -815,9 +897,9 @@ fn runtime_profile_for_provider(
             api_key_field: "custom_api_key",
             base_url: "https://api.minimax.io/anthropic".into(),
             upstream_mode: "anthropic",
-            default_model: "MiniMax-M3".into(),
-            default_fast_model: "MiniMax-M2.7-highspeed".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "claude" => return Ok(None),
         "openai" => BridgeRuntimeProfile {
@@ -827,9 +909,9 @@ fn runtime_profile_for_provider(
             api_key_field: "openai_api_key",
             base_url: "https://api.openai.com/v1".into(),
             upstream_mode: "openai",
-            default_model: "gpt-5.5".into(),
-            default_fast_model: "gpt-5.5".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "opencode-go" => BridgeRuntimeProfile {
             provider_id: provider_id.into(),
@@ -838,9 +920,9 @@ fn runtime_profile_for_provider(
             api_key_field: "custom_api_key",
             base_url: "https://opencode.ai/zen/go/v1".into(),
             upstream_mode: "openai",
-            default_model: "glm-5.2".into(),
-            default_fast_model: "deepseek-v4-flash".into(),
-            requires_explicit_model: false,
+            default_model: String::new(),
+            default_fast_model: String::new(),
+            requires_explicit_model: true,
         },
         "openrouter" => BridgeRuntimeProfile {
             provider_id: provider_id.into(),
@@ -903,9 +985,6 @@ fn selected_runtime_model(profile: &BridgeRuntimeProfile, model: &str) -> Result
     let selected = model.trim();
     if !selected.is_empty() {
         return Ok(selected.to_string());
-    }
-    if !profile.default_model.trim().is_empty() {
-        return Ok(profile.default_model.trim().to_string());
     }
     if profile.requires_explicit_model {
         return Err(format!(
@@ -1084,10 +1163,13 @@ fn opencode_go_openai_model_id(model: &str) -> bool {
         lower.as_str(),
         "glm-5.2"
             | "glm-5.1"
+            | "qwen3.7-max"
+            | "qwen3.7"
             | "kimi-k2.7-code"
             | "kimi-k2.6"
             | "deepseek-v4-pro"
             | "deepseek-v4-flash"
+            | "minimax-m3"
             | "mimo-v2.5"
             | "mimo-v2.5-pro"
     )
@@ -1110,7 +1192,7 @@ fn auto_mapping_inputs_for_profile(
     let fallback = if opencode_go_openai_model_id(fallback_model) {
         fallback_model.trim().to_string()
     } else {
-        profile.default_model.trim().to_string()
+        String::new()
     };
     (allowed_models, fallback)
 }
@@ -1474,10 +1556,11 @@ fn restart_bridge_after_config(status: &SystemStatus) -> Result<(), String> {
         ],
     )?;
     if !restart_output.status.success() {
-        return Err(format!(
-            "Bridge 配置已写入，但重启失败：{}",
+        eprintln!(
+            "CSA Bridge config was written; systemd restart failed and will be retried on next start: {}",
             command_error_text(&restart_output)
-        ));
+        );
+        return Ok(());
     }
 
     let health_script = r#"
@@ -1501,13 +1584,14 @@ print(last_error or "health endpoint did not become ready", file=sys.stderr)
 sys.exit(1)
 "#;
     let health_output = run_wsl(distro, &["python3", "-c", health_script])?;
-    if health_output.status.success() {
+    if !health_output.status.success() {
+        eprintln!(
+            "CSA Bridge config was written; health check did not become ready and will be retried on next start: {}",
+            command_error_text(&health_output)
+        );
         return Ok(());
     }
-    Err(format!(
-        "Bridge 配置已写入，但健康检查失败：{}",
-        command_error_text(&health_output)
-    ))
+    Ok(())
 }
 
 fn dashboard_url_from_config(data: &serde_json::Value) -> String {
@@ -1632,8 +1716,7 @@ fn redact_secret_text(text: &str, secret: &str) -> String {
     text.replace(secret, "[redacted-api-key]")
 }
 
-#[tauri::command]
-fn test_api_key(
+fn test_api_key_impl(
     selected_provider_id: String,
     api_key: String,
     custom_base_url: String,
@@ -1751,12 +1834,18 @@ if ($upstreamMode -eq "anthropic") {
     $models = @($modelResp.data | ForEach-Object { $_.id } | Where-Object { $_ })
   } catch {}
   $candidates = New-Object System.Collections.Generic.List[string]
-  foreach ($item in @($requestedModel, $defaultModel, "deepseek-v4-pro", "deepseek-v4-flash", "MiniMax-M3", "LongCat-2.0", "claude-3-5-haiku-latest")) {
+  foreach ($item in @($requestedModel, $defaultModel)) {
     if ($item -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
+  }
+  foreach ($item in @("deepseek-v4-pro", "deepseek-v4-flash", "MiniMax-M3", "LongCat-2.0", "claude-3-5-haiku-latest")) {
+    if ($item -and ($models -contains $item) -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
   }
   foreach ($item in $models) {
     if ($item -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
     if ($candidates.Count -ge 8) { break }
+  }
+  if ($candidates.Count -eq 0) {
+    Emit $false "" "" $models "No manual model was provided and no testable model was returned by /models. Please fill a model ID or confirm the provider supports /models."
   }
   $lastError = ""
   foreach ($candidate in $candidates) {
@@ -1797,6 +1886,10 @@ try {
   }
 }
 
+if ($models.Count -eq 0 -and -not $requestedModel -and -not $defaultModel) {
+  Emit $false "" "" @() "No manual model was provided and no testable model was returned by /models. Please fill a model ID or confirm the provider supports /models."
+}
+
 $preferred = @(
   $requestedModel,
   $defaultModel,
@@ -1820,7 +1913,7 @@ $preferred = @(
 )
 $candidates = New-Object System.Collections.Generic.List[string]
 foreach ($item in $preferred) {
-  if ($item -and ($models.Count -eq 0 -or $models -contains $item) -and -not $candidates.Contains($item)) {
+  if ($item -and (($item -eq $requestedModel) -or ($item -eq $defaultModel) -or ($models -contains $item)) -and -not $candidates.Contains($item)) {
     [void]$candidates.Add($item)
   }
 }
@@ -1864,7 +1957,28 @@ Emit $false "" "" $models ("模型列表可访问，但没有找到可完成对�
 }
 
 #[tauri::command]
-fn auto_map_api_key(
+async fn test_api_key(
+    selected_provider_id: String,
+    api_key: String,
+    custom_base_url: String,
+    custom_confirmed: bool,
+    model: String,
+    prompt: String,
+) -> Result<ApiKeyTestResult, String> {
+    run_blocking(move || {
+        test_api_key_impl(
+            selected_provider_id,
+            api_key,
+            custom_base_url,
+            custom_confirmed,
+            model,
+            prompt,
+        )
+    })
+    .await
+}
+
+fn auto_map_api_key_impl(
     selected_provider_id: String,
     api_key: String,
     custom_base_url: String,
@@ -1886,7 +2000,7 @@ fn auto_map_api_key(
         return Err("Claude 官方登录模式不需要在这里自动映射模型。".into());
     };
     let fallback_model = if model.trim().is_empty() {
-        canonical_model_for_profile(&profile, &profile.default_model)
+        String::new()
     } else {
         canonical_model_for_profile(&profile, &model)
     };
@@ -2033,6 +2147,26 @@ try {
     })
 }
 
+#[tauri::command]
+async fn auto_map_api_key(
+    selected_provider_id: String,
+    api_key: String,
+    custom_base_url: String,
+    custom_confirmed: bool,
+    model: String,
+) -> Result<ApiKeyAutoMapResult, String> {
+    run_blocking(move || {
+        auto_map_api_key_impl(
+            selected_provider_id,
+            api_key,
+            custom_base_url,
+            custom_confirmed,
+            model,
+        )
+    })
+    .await
+}
+
 fn persist_launcher_settings(settings: &LauncherSettings) -> Result<(), String> {
     let body = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("无法序列化配置：{error}"))?;
@@ -2049,8 +2183,7 @@ fn get_launcher_settings() -> LauncherState {
     launcher_state(&load_settings())
 }
 
-#[tauri::command]
-fn save_provider_selection(
+fn save_provider_selection_impl(
     selected_provider_id: String,
     custom_base_url: String,
     custom_confirmed: bool,
@@ -2072,7 +2205,18 @@ fn save_provider_selection(
 }
 
 #[tauri::command]
-fn save_api_key(
+async fn save_provider_selection(
+    selected_provider_id: String,
+    custom_base_url: String,
+    custom_confirmed: bool,
+) -> Result<LauncherState, String> {
+    run_blocking(move || {
+        save_provider_selection_impl(selected_provider_id, custom_base_url, custom_confirmed)
+    })
+    .await
+}
+
+fn save_api_key_impl(
     selected_provider_id: String,
     api_key: String,
     custom_base_url: String,
@@ -2101,13 +2245,7 @@ fn save_api_key(
     let runtime_profile = runtime_profile_for_settings(&settings)?;
     let mut sanitized_aliases = clean_model_aliases(&model_aliases);
     let stored_model = if model.trim().is_empty() {
-        primary_model_from_aliases(&sanitized_aliases)
-            .or_else(|| {
-                runtime_profile
-                    .as_ref()
-                    .map(|profile| profile.default_model.clone())
-            })
-            .unwrap_or_default()
+        primary_model_from_aliases(&sanitized_aliases).unwrap_or_default()
     } else {
         model.trim().to_string()
     };
@@ -2142,7 +2280,28 @@ fn save_api_key(
 }
 
 #[tauri::command]
-fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
+async fn save_api_key(
+    selected_provider_id: String,
+    api_key: String,
+    custom_base_url: String,
+    custom_confirmed: bool,
+    model: String,
+    model_aliases: Vec<StoredModelAlias>,
+) -> Result<LauncherState, String> {
+    run_blocking(move || {
+        save_api_key_impl(
+            selected_provider_id,
+            api_key,
+            custom_base_url,
+            custom_confirmed,
+            model,
+            model_aliases,
+        )
+    })
+    .await
+}
+
+fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     let mut settings = load_settings();
     let entry = settings
         .api_keys
@@ -2168,7 +2327,11 @@ fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
 }
 
 #[tauri::command]
-fn delete_api_key(api_key_id: String) -> Result<LauncherState, String> {
+async fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
+    run_blocking(move || activate_api_key_impl(api_key_id)).await
+}
+
+fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     let mut settings = load_settings();
     if settings.active_api_key_id.as_deref() == Some(api_key_id.as_str()) {
         return Err("当前正在使用的 API Key 不能直接删除；请先切换到另一条 Key".into());
@@ -2183,12 +2346,16 @@ fn delete_api_key(api_key_id: String) -> Result<LauncherState, String> {
 }
 
 #[tauri::command]
-fn get_system_status() -> SystemStatus {
-    current_status()
+async fn delete_api_key(api_key_id: String) -> Result<LauncherState, String> {
+    run_blocking(move || delete_api_key_impl(api_key_id)).await
 }
 
 #[tauri::command]
-fn start_services() -> Result<SystemStatus, String> {
+async fn get_system_status() -> Result<SystemStatus, String> {
+    run_blocking(|| Ok(current_status())).await
+}
+
+fn start_services_impl() -> Result<SystemStatus, String> {
     let before = current_status();
     if before.state == "running" {
         return Ok(before);
@@ -2227,7 +2394,11 @@ fn start_services() -> Result<SystemStatus, String> {
 }
 
 #[tauri::command]
-fn stop_services() -> Result<SystemStatus, String> {
+async fn start_services() -> Result<SystemStatus, String> {
+    run_blocking(start_services_impl).await
+}
+
+fn stop_services_impl() -> Result<SystemStatus, String> {
     let before = current_status();
     let Some(distro) = before.distro else {
         return Ok(before);
@@ -2245,13 +2416,21 @@ for pid in $(ps -eo pid=,args= | awk '/python.*claude-science-api-bridge.*\/prox
 }
 
 #[tauri::command]
-fn restart_services() -> Result<SystemStatus, String> {
-    stop_services()?;
-    start_services()
+async fn stop_services() -> Result<SystemStatus, String> {
+    run_blocking(stop_services_impl).await
+}
+
+fn restart_services_impl() -> Result<SystemStatus, String> {
+    stop_services_impl()?;
+    start_services_impl()
 }
 
 #[tauri::command]
-fn get_claude_url() -> Result<String, String> {
+async fn restart_services() -> Result<SystemStatus, String> {
+    run_blocking(restart_services_impl).await
+}
+
+fn get_claude_url_impl() -> Result<String, String> {
     let status = current_status();
     let distro = status.distro.ok_or_else(|| "WSL 不可用".to_string())?;
     let output = wsl_shell(
@@ -2269,7 +2448,11 @@ fn get_claude_url() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_dashboard_url() -> Result<String, String> {
+async fn get_claude_url() -> Result<String, String> {
+    run_blocking(get_claude_url_impl).await
+}
+
+fn get_dashboard_url_impl() -> Result<String, String> {
     let status = current_status();
     let distro = status.distro.ok_or_else(|| "WSL 不可用".to_string())?;
     let script = r#"
@@ -2296,7 +2479,11 @@ print(json.dumps(data, ensure_ascii=False))
 }
 
 #[tauri::command]
-fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
+async fn get_dashboard_url() -> Result<String, String> {
+    run_blocking(get_dashboard_url_impl).await
+}
+
+fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
     let Some(pid) = legacy_windows_bridge_pid() else {
         return Ok(current_status());
     };
@@ -2312,6 +2499,11 @@ fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
         ));
     }
     Ok(current_status())
+}
+
+#[tauri::command]
+async fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
+    run_blocking(stop_legacy_windows_bridge_impl).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2416,22 +2608,22 @@ mod tests {
             glm.base_url.as_deref(),
             Some("https://open.bigmodel.cn/api/paas/v4")
         );
-        assert_eq!(glm.default_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(glm.default_model, None);
         let deepseek = &catalog[0].providers[2];
         assert_eq!(
             deepseek.base_url.as_deref(),
             Some("https://api.deepseek.com/anthropic")
         );
-        assert_eq!(deepseek.default_model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(deepseek.default_model, None);
         let minimax = &catalog[0].providers[3];
         assert_eq!(
             minimax.base_url.as_deref(),
             Some("https://api.minimax.io/anthropic")
         );
         let openai = &catalog[0].providers[5];
-        assert_eq!(openai.default_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(openai.default_model, None);
         let opencode_go = &catalog[1].providers[0];
-        assert_eq!(opencode_go.default_model.as_deref(), Some("glm-5.2"));
+        assert_eq!(opencode_go.default_model, None);
         let third_party: Vec<_> = catalog[2].providers.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(third_party, vec!["builtin-relay", "custom"]);
         let builtin = &catalog[2].providers[0];
@@ -2480,7 +2672,7 @@ mod tests {
         assert_eq!(patch["custom_api_key"], "test-key");
         assert_eq!(patch["force_model"], "custom-model");
 
-        let patch_without_key = bridge_config_patch_for_api_key(&settings, "", "", &[])
+        let patch_without_key = bridge_config_patch_for_provider(&settings)
             .unwrap()
             .unwrap();
         assert_eq!(patch_without_key["custom_api_key"], "");
@@ -2539,7 +2731,7 @@ mod tests {
             .iter()
             .find(|row| row["id"] == "claude-haiku-4-5-20251001")
             .unwrap();
-        assert_eq!(haiku["model"], "deepseek-v4-flash");
+        assert_eq!(haiku["model"], "deepseek-v4-pro");
 
         let stale_glm_patch =
             bridge_config_patch_for_api_key(&settings, "deepseek-key", "glm-5.2", &[])
@@ -2549,26 +2741,16 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_defaults_to_glm_and_fast_maps_to_deepseek_flash() {
+    fn opencode_go_requires_explicit_or_mapped_model() {
         let settings = LauncherSettings {
             selected_provider_id: "opencode-go".into(),
             custom_base_url: String::new(),
             custom_confirmed: false,
             ..LauncherSettings::default()
         };
-        let patch = bridge_config_patch_for_api_key(&settings, "opencode-key", "", &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(patch["default_backend"], "custom");
-        assert_eq!(patch["custom_base_url"], "https://opencode.ai/zen/go/v1");
-        assert_eq!(patch["custom_upstream_mode"], "openai");
-        assert_eq!(patch["force_model"], "glm-5.2");
-        let rows = patch["model_aliases"].as_array().unwrap();
-        let haiku = rows
-            .iter()
-            .find(|row| row["id"] == "claude-haiku-4-5-20251001")
-            .unwrap();
-        assert_eq!(haiku["model"], "deepseek-v4-flash");
+        let error =
+            bridge_config_patch_for_api_key(&settings, "opencode-key", "", &[]).unwrap_err();
+        assert!(error.contains("模型 ID"));
 
         let prefixed =
             bridge_config_patch_for_api_key(&settings, "opencode-key", "opencode-go/glm-5.2", &[])
@@ -2637,17 +2819,19 @@ mod tests {
         assert_eq!(
             models,
             vec![
+                "qwen3.7-max".to_string(),
+                "MiniMax-M3".to_string(),
                 "deepseek-v4-pro".to_string(),
                 "deepseek-v4-flash".to_string()
             ]
         );
-        assert_eq!(fallback, "glm-5.2");
+        assert_eq!(fallback, "qwen3.7-max");
 
         let (primary, fast, aliases, candidates) = auto_model_mapping(&models, &fallback).unwrap();
-        assert_eq!(primary, "glm-5.2");
+        assert_eq!(primary, "qwen3.7-max");
         assert_eq!(fast, "deepseek-v4-flash");
-        assert!(!candidates.contains(&"qwen3.7-max".to_string()));
-        assert!(!candidates.contains(&"MiniMax-M3".to_string()));
+        assert!(candidates.contains(&"qwen3.7-max".to_string()));
+        assert!(candidates.contains(&"MiniMax-M3".to_string()));
         let haiku = aliases
             .iter()
             .find(|alias| alias.id == "claude-haiku-4-5-20251001")

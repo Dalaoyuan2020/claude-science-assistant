@@ -38,10 +38,18 @@ if (-not $User) {
 }
 
 $ProjectDir = Resolve-Path (Join-Path $PSScriptRoot "..")
-$ProjectWsl = (& wsl.exe -d $Distro -u $User -- wslpath -a $ProjectDir.Path | Select-Object -First 1).Trim()
+$ProjectPortablePath = $ProjectDir.Path.Replace("\", "/")
+$ProjectWslOutput = @((& wsl.exe -d $Distro -u $User -- wslpath -a $ProjectPortablePath) -replace [char]0, "")
+$ProjectWsl = @(
+  $ProjectWslOutput |
+    ForEach-Object { "$_".Trim() } |
+    Where-Object { $_ -match '^/' } |
+    Select-Object -First 1
+)
 if (-not $ProjectWsl) {
   throw "Failed to convert project path to WSL path."
 }
+$ProjectWsl = [string]$ProjectWsl[0]
 
 $output = & wsl.exe -d $Distro -u $User -- env `
   "PROXY_PORT=$ProxyPort" `

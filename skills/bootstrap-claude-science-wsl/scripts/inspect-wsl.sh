@@ -11,6 +11,7 @@ json_string() {
 
 user_name="$(id -un)"
 distro="${WSL_DISTRO_NAME:-unknown}"
+project_dir="${1:-${PROJECT_DIR:-}}"
 systemd_running=false
 if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then systemd_running=true; fi
 
@@ -18,10 +19,22 @@ source_bin="$HOME/.local/bin/claude-science"
 managed_bin="$HOME/.local/share/claude-science-api-bridge/bin/claude-science"
 patched_bin="$HOME/.local/share/claude-science-api-bridge/patched/claude-science"
 venv_python="$HOME/.local/share/claude-science-api-bridge/venv/bin/python"
-bridge_pid="$(pgrep -f '[p]ython.*claude-science-api-bridge.*/proxy.py' | head -n 1 || true)"
-claude_pid="$(pgrep -f 'claude-science-api-bridge/patched/[c]laude-science serve' | head -n 1 || true)"
+bridge_pid="$(ps -eo pid=,args= | awk '/python/ && /proxy.py/ && !/awk/ {print $1; exit}' || true)"
+claude_pid="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1; exit}' || true)"
 bridge_healthy=false
-if [ -n "$bridge_pid" ] && curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1; then bridge_healthy=true; fi
+if curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1; then bridge_healthy=true; fi
+bridge_service_active=false
+unit_matches_project=null
+if [ "$systemd_running" = true ]; then
+  if systemctl --user is-active --quiet claude-science-bridge.service; then bridge_service_active=true; fi
+  if [ -n "$project_dir" ]; then
+    if systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$project_dir/proxy.py" >/dev/null 2>&1; then
+      unit_matches_project=true
+    else
+      unit_matches_project=false
+    fi
+  fi
+fi
 
 printf '{'
 printf '"schema_version":1,'
@@ -46,8 +59,11 @@ printf '"runtime":{'
 printf '"bridge_pid":%s,' "${bridge_pid:-null}"
 printf '"claude_pid":%s,' "${claude_pid:-null}"
 printf '"bridge_healthy":%s,' "$bridge_healthy"
+printf '"bridge_service_active":%s,' "$bridge_service_active"
+printf '"unit_matches_project":%s,' "$unit_matches_project"
 printf '"port_9876":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":9876 "')"
-printf '"port_8765":%s' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8765 "')"
+printf '"port_8765":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8765 "')"
+printf '"port_8766":%s' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8766 "')"
 printf '},'
 printf '"secrets":{"values_included":false}'
 printf '}\n'
