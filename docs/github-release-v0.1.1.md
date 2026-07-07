@@ -22,7 +22,7 @@ SHA256: <从 claude-science-assistant-v0.1.1-release-portable.zip.sha256 复制>
 ## 这一版解决了什么
 
 - 把 CSA 定位为 Windows 上的 Claude Science 启动器，而不是一堆散落脚本。
-- 首页只显示当前 API Key、当前状态和启动动作；新增 Key 放到“添加 API Key”入口里选择。
+- 首页只显示当前 API Key、当前状态和启动动作；新增服务商放到“添加供应商”入口里选择。
 - API Key 按添加顺序保存，一次只激活一条，避免所有 Provider 平铺到主面板。
 - 添加“测试 API Key”和“自动映射”能力，减少跑到项目内部试错。
 - 修正 DeepSeek 兼容：
@@ -48,7 +48,7 @@ SHA256: <从 claude-science-assistant-v0.1.1-release-portable.zip.sha256 复制>
 4. 如果电脑已有可用 WSL/Ubuntu，确认后双击 `4-install-runtime-after-preview.bat`。它会安装/修复 CSA 的 WSL 运行时、启动服务并自测。
 5. 如果电脑没有 WSL/Ubuntu，不要把第 4 步当成静默系统安装器。需要额外确认 `-InstallWslIfMissing`，并准备管理员权限和可能的重启；新手建议让 Codex 使用包内 Skill 引导完成。
 6. 双击 `claude-science-assistant.exe`。
-7. 点击“添加 API Key”，选择服务商模板。
+7. 点击“添加供应商”，选择服务商模板。
 8. 输入 Key，测试连通；如果有多个模型，点击“自动映射”。
 9. 保存并启动 Claude Science。
 

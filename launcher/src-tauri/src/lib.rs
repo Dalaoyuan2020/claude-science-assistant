@@ -2234,7 +2234,7 @@ fn save_api_key_impl(
     }
     let clean_key = api_key.trim();
     if selected_provider_id != "claude" && clean_key.is_empty() {
-        return Err("添加 API Key 时请填写 Key；已保存的 Key 可直接从列表切换".into());
+        return Err("添加供应商时请填写 API Key；已保存的 Key 可直接从列表切换".into());
     }
     let validated_base_url = validate_base_url(&custom_base_url)?;
     let encrypted_api_key = protect_api_key(clean_key)?;

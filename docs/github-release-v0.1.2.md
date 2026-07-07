@@ -36,7 +36,7 @@ SHA256: <从 claude-science-assistant-v0.1.2-release-portable.zip.sha256 复制>
 4. 先做只读体检/预览，不要直接修改系统。
 5. 如果已有可用 WSL/Ubuntu，再确认执行 CSA WSL runtime 安装/修复。
 6. 双击 `claude-science-assistant.exe`。
-7. 点击“添加 API Key”，选择服务商模板，输入 Key 后测试连通。
+7. 点击“添加供应商”，选择服务商模板，输入 Key 后测试连通。
 8. 如果上游返回多个模型，再使用“自动映射”生成模型映射草案。
 
 ## 安全说明
@@ -59,4 +59,3 @@ skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh
 vendor/claude-science/linux-x64/claude-science
 vendor/claude-science/linux-x64/manifest.json
 ```
-

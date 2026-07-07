@@ -173,7 +173,7 @@ $Readme = @(
   "6. The original PowerShell scripts are still kept in scripts/: acceptance-v0.1.ps1 and collect-acceptance-evidence.ps1.",
   "",
   "Do not copy only the exe. The launcher and skill need proxy.py, requirements.txt, scripts/, static/, tests/, docs/, and skills/ in the same extracted folder.",
-  "Add API Key is the model-entry flow. Non-Claude entries require a key, which is encrypted with Windows current-user DPAPI; saved keys can be switched from the ordered list and are never echoed.",
+  "Add Provider is the model-entry flow. Non-Claude entries require a key, which is encrypted with Windows current-user DPAPI; saved keys can be switched from the ordered list and are never echoed.",
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),

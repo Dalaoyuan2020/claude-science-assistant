@@ -607,7 +607,7 @@ function App() {
             <span className="eyebrow">API Key</span>
             <h2>当前接入</h2>
           </div>
-          <p>先从服务商模板添加一个 API Key，再启动 Claude Science。新增 Key 时才展开模板，不把所有 Key 平铺在首页。</p>
+          <p>先从服务商模板添加一个供应商，再启动 Claude Science。新增供应商时才展开模板，不把所有 Key 平铺在首页。</p>
         </div>
 
         <div className="kit-layout">
@@ -615,8 +615,8 @@ function App() {
             <div className="kit-mark">{providerInitial(activeKeyEntry ? activeKeyProvider : undefined)}</div>
             <div className="kit-main">
               <span className="eyebrow">正在使用</span>
-              <h3>{activeKeyEntry ? activeKeyEntry.label : "未添加 API Key"}</h3>
-              <p>{activeKeyEntry ? activeKeyProvider?.meta : "请添加一个 API Key 后再启动服务"}</p>
+              <h3>{activeKeyEntry ? activeKeyEntry.label : "未添加供应商"}</h3>
+              <p>{activeKeyEntry ? activeKeyProvider?.meta : "请添加一个供应商后再启动服务"}</p>
               <div className="kit-meta">
                 {activeKeyEntry && activeKeyProvider && <span className={`trust-badge badge-${badgeClass[activeKeyProvider.badge]}`}>{activeKeyProvider.badge}</span>}
                 {activeKeyEntry?.hasSecret && <span>Key 已加密保存</span>}
@@ -625,7 +625,7 @@ function App() {
                 {activeKeyEntry?.baseUrl && <span>{activeKeyEntry.baseUrl}</span>}
               </div>
             </div>
-            <button className="secondary-button" onClick={openKeyPicker} disabled={busy}>更换 / 添加 Key</button>
+            <button className="secondary-button" onClick={openKeyPicker} disabled={busy}>更换 / 添加供应商</button>
           </article>
 
           <aside className="kit-queue">
@@ -634,9 +634,9 @@ function App() {
                 <strong>API Key 列表</strong>
                 <small>按添加顺序排列，一次只激活一条</small>
               </div>
-              <button onClick={openKeyPicker} disabled={busy}>添加 API Key</button>
+              <button onClick={openKeyPicker} disabled={busy}>添加供应商</button>
             </div>
-            {apiKeys.length === 0 && <div className="key-empty">还没有 API Key，点击下方按钮添加。</div>}
+            {apiKeys.length === 0 && <div className="key-empty">还没有供应商，点击下方按钮添加。</div>}
             {apiKeys.map((entry, index) => {
               const provider = providers.find((item) => item.id === entry.providerId);
               const active = entry.id === activeApiKeyId;
@@ -658,16 +658,16 @@ function App() {
             })}
             <button className="add-kit-row" onClick={openKeyPicker} disabled={busy}>
               <span>+</span>
-              添加新的 API Key
+              添加新的供应商
             </button>
           </aside>
         </div>
 
         {showKeyPicker && (
-          <div className="kit-picker" role="dialog" aria-label="添加 API Key">
+          <div className="kit-picker" role="dialog" aria-label="添加供应商">
             <div className="kit-picker-head">
               <div>
-                <span className="eyebrow">添加 API Key</span>
+                <span className="eyebrow">添加供应商</span>
                 <h3>从模板选择，再填入你的 Key</h3>
               </div>
               <button className="quiet-button" onClick={() => setShowKeyPicker(false)} disabled={busy}>关闭</button>

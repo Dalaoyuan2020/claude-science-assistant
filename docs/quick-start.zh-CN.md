@@ -24,7 +24,7 @@ Claude Science 助手不会要求修改 Clash、VPN、DNS、hosts、根证书、
 1. 帮我完成电脑体检。
 2. 如果环境允许，安装/修复 CSA 在 WSL 内的运行时。
 3. 启动 Claude Science 和本地 Bridge。
-4. 指导我添加 API Key、测试连通、自动映射模型。
+4. 指导我添加供应商、测试 API Key 连通性、自动映射模型。
 
 安全要求：
 1. 先只读检查和预览，不要一上来安装、删除、重启或修改系统。
@@ -38,7 +38,7 @@ Claude Science 助手不会要求修改 Clash、VPN、DNS、hosts、根证书、
 3. 如果已有 WSL/Ubuntu，请说明将要安装/修复的 CSA WSL 运行时；我确认后再运行 4-install-runtime-after-preview.bat。
 4. 如果没有 WSL/Ubuntu，请不要静默安装；先说明需要管理员权限、推荐 Ubuntu 版本、可能启用的 Windows 功能和是否可能重启。只有我明确同意后，才可以使用 -InstallWslIfMissing。
 5. 安装/修复后运行自测，确认没有重复 Bridge。
-6. 打开 claude-science-assistant.exe，引导我添加 API Key、测试 API Key、自动映射模型并启动 Claude Science。
+6. 打开 claude-science-assistant.exe，引导我添加供应商、测试 API Key、自动映射模型并启动 Claude Science。
 
 如果失败：
 1. 不要反复重装。
@@ -79,9 +79,9 @@ Claude Science 助手不会要求修改 Clash、VPN、DNS、hosts、根证书、
 
 如果电脑还没有 WSL/Ubuntu，`4-install-runtime-after-preview.bat` 不会默认静默安装系统级 WSL。此时需要额外确认 `-InstallWslIfMissing`，并准备管理员权限和可能的重启；新手建议让 Codex 使用包内 Skill 引导完成。
 
-## 第四步：添加或更换 API Key
+## 第四步：添加或更换供应商
 
-Claude Science 助手首页按添加顺序显示已保存的 API Key，并突出当前正在使用的一条。需要新增时，点击“添加 API Key”，服务商模板按以下顺序排列：
+Claude Science 助手首页按添加顺序显示已保存的 API Key，并突出当前正在使用的一条。需要新增时，点击“添加供应商”，服务商模板按以下顺序排列：
 
 1. 官方直连：GLM-5.2、LongCat、DeepSeek、Claude、OpenAI/GPT。
 2. 聚合平台：OpenCode Go、OpenRouter。
@@ -96,7 +96,7 @@ Claude 与 OpenAI/GPT 的“官方订阅登录”和“API Key”是不同入口
 
 DPAPI 密钥只属于当前 Windows 用户和当前电脑。把便携包复制到另一台电脑时，不会带走这些 API Key；需要在新电脑上重新添加。
 
-如果你从早期测试版升级，首页 API Key 列表可能为空。这是正常的：早期版本只保存当前服务商选择，没有保存可迁移的加密 Key 列表；请重新点击“添加 API Key”。
+如果你从早期测试版升级，首页 API Key 列表可能为空。这是正常的：早期版本只保存当前服务商选择，没有保存可迁移的加密 Key 列表；请重新点击“添加供应商”。
 
 需要高级路由、模型别名或连接测试时，先启动 Bridge，再点击启动器底部的“配置面板”。如果 Bridge 启用了 required path secret，启动器会打开带本地 path secret 的面板地址，但不会把 token 显示在界面上。
 
