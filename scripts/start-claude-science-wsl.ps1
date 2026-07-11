@@ -9,6 +9,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-WslQuiet {
+  param([string[]]$Arguments)
+  $previousErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $result = @(& wsl.exe @Arguments 2>$null)
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorAction
+  }
+  if ($exitCode -ne 0) {
+    throw "wsl.exe failed with exit code $exitCode."
+  }
+  return $result
+}
+
 function Get-Distros {
   $raw = ((& wsl.exe --list --quiet 2>$null) -replace [char]0, "")
   @($raw | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^docker-desktop' })
@@ -31,7 +47,7 @@ if (-not $Distro) {
   throw "No usable WSL distro found. Ubuntu-24.04 is recommended, but CSA can use another installed Ubuntu/WSL distro."
 }
 if (-not $User) {
-  $User = (((& wsl.exe -d $Distro -- id -un) -replace [char]0, "") | Select-Object -First 1).Trim()
+  $User = (((Invoke-WslQuiet @("-d", $Distro, "--", "id", "-un")) -replace [char]0, "") | Select-Object -First 1).Trim()
 }
 if (-not $User) {
   throw "Failed to detect WSL user for distro '$Distro'."
@@ -39,7 +55,7 @@ if (-not $User) {
 
 $ProjectDir = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ProjectPortablePath = $ProjectDir.Path.Replace("\", "/")
-$ProjectWslOutput = @((& wsl.exe -d $Distro -u $User -- wslpath -a $ProjectPortablePath) -replace [char]0, "")
+$ProjectWslOutput = @((Invoke-WslQuiet @("-d", $Distro, "-u", $User, "--", "wslpath", "-a", $ProjectPortablePath)) -replace [char]0, "")
 $ProjectWsl = @(
   $ProjectWslOutput |
     ForEach-Object { "$_".Trim() } |
@@ -51,12 +67,23 @@ if (-not $ProjectWsl) {
 }
 $ProjectWsl = [string]$ProjectWsl[0]
 
-$output = & wsl.exe -d $Distro -u $User -- env `
-  "PROXY_PORT=$ProxyPort" `
-  "CLAUDE_SCIENCE_PORT=$ClaudeSciencePort" `
-  bash "$ProjectWsl/scripts/start-claude-science-wsl.sh"
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  $output = @(& wsl.exe -d $Distro -u $User -- env `
+    "PROXY_PORT=$ProxyPort" `
+    "CLAUDE_SCIENCE_PORT=$ClaudeSciencePort" `
+    "CSA_MERGE_STDERR=1" `
+    bash "$ProjectWsl/scripts/start-claude-science-wsl.sh" 2>$null)
+  $exitCode = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $previousErrorAction
+}
 
 $output | ForEach-Object { Write-Host $_ }
+if ($exitCode -ne 0) {
+  throw "WSL start script failed with exit code $exitCode."
+}
 
 if ($Open) {
   $match = $output | Select-String -Pattern "http://localhost:\d+/\?nonce=[a-f0-9]+" | Select-Object -First 1

@@ -28,6 +28,9 @@ venv/
 
 # Generated release/test packages
 dist/
+launcher/dist/
+launcher/src-tauri/target/
+launcher/src-tauri/target-validation/
 
 # Local captured/bundled third-party runtime binaries.
 # Keep these out of the source repo; publish portable ZIPs as GitHub Release assets instead.

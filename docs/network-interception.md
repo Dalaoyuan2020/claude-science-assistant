@@ -32,10 +32,10 @@ http://user:password@127.0.0.1:7890
 
 ## Verification
 
-After setting `outbound_proxy_url`, restart the proxy:
+After setting `outbound_proxy_url` through the CSA launcher, use the launcher's restart action so the config transaction and health check are preserved. For an agent-controlled WSL start after the Bridge is stopped, run:
 
 ```powershell
-.\scripts\start-claude-science.ps1
+.\scripts\start-claude-science-wsl.ps1
 ```
 
 Then test with a real provider key:

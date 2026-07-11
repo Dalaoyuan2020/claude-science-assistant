@@ -1,12 +1,11 @@
 # Agent Runbook for Windows
 
-This is the main step-by-step guide for configuring this project on Windows.
+This is the agent-facing operations guide. The supported v0.1.3 product path is a Windows launcher controlling one WSL Bridge and one WSL Claude Science runtime.
 
-The current development machine also has a separate WSL launch path. Before
-installing or starting anything, read `architecture-and-product-plan.zh-CN.md`
-and check both Windows and WSL for an existing Bridge. Never start the Windows
-safe-mode Bridge alongside the WSL Bridge; that dual-instance state produces
-split configuration and request logs.
+Before installing or starting anything, read `v0.1-current-pc-verification.zh-CN.md`
+and check both Windows and WSL for an existing Bridge. Never start the legacy
+Windows Bridge alongside the WSL Bridge; that dual-instance state produces split
+configuration and request logs.
 
 Default to safe mode. Do not modify Clash, v2rayN, sing-box, VPN, TUN, DNS, Windows system proxy, hosts, certificate trust, or port 443.
 
@@ -28,6 +27,39 @@ Inspect:
 - whether the proxy is already healthy
 
 Do not change any network proxy tool.
+
+## Supported v0.1.3 Workflow
+
+Preview first:
+
+```powershell
+.\scripts\acceptance-v0.1.ps1
+.\scripts\status-probe.ps1
+```
+
+After explicit user approval, install or repair the WSL runtime through the bundled Skill or acceptance helper:
+
+```powershell
+.\scripts\acceptance-v0.1.ps1 -ApproveInstall -StartServices -RunSelfTest
+```
+
+Use `-InstallWslIfMissing` only after separate confirmation of administrator rights, Windows feature changes, downloads, and a possible reboot. Normal lifecycle startup uses:
+
+```powershell
+.\scripts\start-claude-science-wsl.ps1
+```
+
+Provider changes should go through the launcher transaction so Windows settings and WSL Bridge configuration either commit together or roll back. Verify with:
+
+```powershell
+.\scripts\status-probe.ps1
+.\scripts\self-test.ps1
+.\scripts\verify-proxy.ps1
+```
+
+## Legacy Windows Bridge Reference
+
+The remaining `install-safe.ps1`, scheduled-task, and `start-claude-science.ps1` sections describe the old Windows Bridge route. Keep them only for migration and diagnostics; do not use them as the default launcher workflow.
 
 ## Phase 1: Install Safe Mode
 
@@ -70,9 +102,13 @@ Minimum DeepSeek config:
   "deepseek_api_key": "REDACTED",
   "deepseek_base_url": "https://api.deepseek.com/anthropic",
   "default_backend": "deepseek",
-  "force_model": "deepseek-v4-pro"
+  "force_model": "<model returned by the account or explicitly confirmed by the user>"
 }
 ```
+
+For a MiniMax China account, use `https://api.minimaxi.com/anthropic` with
+`custom_upstream_mode=anthropic`. The launcher preset leaves the model empty;
+`MiniMax-M3` is an official model ID, but it must still be tested with the user's account.
 
 Generic OpenAI-compatible provider:
 

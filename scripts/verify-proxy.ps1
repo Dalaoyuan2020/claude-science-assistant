@@ -61,12 +61,16 @@ Write-Host "models=$($models.data.Count)"
 Write-Host "3. messages"
 $body = @{
   model = "claude-sonnet-4-5"
-  max_tokens = 32
+  max_tokens = 256
   messages = @(@{ role = "user"; content = "Reply with OK." })
 } | ConvertTo-Json -Depth 8
 $message = Invoke-RestMethod -Uri "$BaseUrl/v1/messages" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 60
-if ($message.type -eq "error" -or $message.error) { throw ($message | ConvertTo-Json -Depth 8) }
+$messageError = $message.PSObject.Properties["error"]
+if ($message.type -eq "error" -or ($messageError -and $messageError.Value)) { throw ($message | ConvertTo-Json -Depth 8) }
 if ($message.type -ne "message") { throw "message endpoint did not return an Anthropic message" }
+$messageText = (($message.content | Where-Object { $_.type -eq "text" } | ForEach-Object { $_.text }) -join " ").Trim()
+if (-not $messageText) { throw "message endpoint returned HTTP success but no visible text" }
+if ($message.stop_reason -eq "max_tokens") { throw "message verification exhausted its output budget" }
 Write-Host "message_id=$($message.id) stop_reason=$($message.stop_reason)"
 
 Write-Host "4. recent requests"
@@ -89,7 +93,7 @@ if ($VerifyImage -or ($env:VERIFY_IMAGE -eq "1")) {
   $stream.Dispose()
   $imageBody = @{
     model = "claude-opus-4-8"
-    max_tokens = 32
+    max_tokens = 256
     messages = @(@{
       role = "user"
       content = @(

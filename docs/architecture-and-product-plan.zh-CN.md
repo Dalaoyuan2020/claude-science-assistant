@@ -2,6 +2,8 @@
 
 本文记录 2026-07-04 在当前 Windows 机器上核验到的真实运行状态，并给出“电脑体检 Skill + Windows 启动器 + 管理面板”的产品化路线。它描述的是代码和运行证据，不把理想设计误写成现状。
 
+> 历史快照说明：第 1-3 节保留 2026-07-04 发现双 Bridge 时的 As-Is 证据，用于解释产品决策，不代表 v0.1.3 当前运行状态。当前实现、验证结果和剩余门槛以 [v0.1-current-pc-verification.zh-CN.md](v0.1-current-pc-verification.zh-CN.md) 为准。
+
 ## 1. 结论先行
 
 当前系统已经能用，实际主链路是：
@@ -212,7 +214,7 @@ bootstrap-claude-science-wsl/
 
 - 总状态：未安装 / 需重启 / 环境异常 / 已停止 / 启动中 / 运行中 / 故障。
 - 主按钮：安装、启动、停止、重启、打开 Claude Science，按状态只显示最合理动作。
-- 四项检查：WSL、Bridge、Claude Science、Provider。
+- 六项状态：WSL、Bridge、Claude Science、当前 Provider/API Key、WSL 存储、运行诊断；桌面按 2×3 展示并可折叠。
 - 展示实际 WSL 服务 PID、端口、版本与最近错误摘要。
 - 打开带 nonce 的 Claude Science URL。
 - 日志导出前自动脱敏。
@@ -241,7 +243,7 @@ v0.1 明确不做：
 
 **第一层：官方直连（默认推荐）**
 
-1. GLM 官方：默认展示 GLM-5.2，使用官方 API Key；模型列表仍以 Provider 实时返回为准。
+1. GLM 官方：保留官方入口和 Base URL，但初始模型为空；用户输入模型或读取 Provider 实时列表后再保存。
 2. LongCat 官方：使用 `https://api.longcat.chat`，优先采用其 Anthropic-compatible 接口。
 3. DeepSeek 官方：使用官方 API，优先采用其 Anthropic-compatible 接口；保留 OpenAI-compatible 模式作为兼容选项。
 4. Claude 官方：参考 CC Switch 的 Official Login Provider 交互，允许切回官方账号登录；官方订阅与 API Key 模式必须明确区分。
@@ -252,9 +254,9 @@ v0.1 明确不做：
 1. OpenCode Go：内置 Provider 预设，通过其订阅 API Key 接入，模型列表由 `/models` 实时发现。
 2. OpenRouter：内置官方 API Base URL `https://openrouter.ai/api/v1` 和 Provider 预设，模型列表实时发现，不固定承诺某个模型长期存在。
 
-**第三层：第三方中转与自定义**
+**第三层：项目方自建中转与自定义中转**
 
-1. 内置中转 OpenAI-compatible Provider：Base URL 固定为 `https://10521052.xyz/v1`，作为第三方入口展示，不标记为“官方”或“可信”。
+1. 项目方自建 OpenAI-compatible 中转：Base URL 固定为 `https://10521052.xyz/v1`；标明由 CSA 项目方自建，不冒充模型厂商官方 API，使用前仍要求确认域名。
 2. 自定义 OpenAI-compatible Provider：默认留空，用户自行填写 Base URL。
 3. 自定义 Anthropic-compatible Provider：允许用户选择协议模式、Base URL 和模型 ID。
 4. 第三方地址连接前显示目标域名，API Key 仅发送给用户最终确认的域名。
@@ -359,8 +361,8 @@ E. 新建 launcher/：Tauri 2 + Rust + React + TypeScript；只实现 distro 自
    status/start/stop/restart/open 五个命令和单页状态 UI。
 
 API Key 服务商模板遵循本文 5.4：官方 GLM、LongCat、DeepSeek、Claude、OpenAI/GPT 优先；
-OpenCode Go、OpenRouter 其次；第三方中转最后，其中内置中转固定展示
-https://10521052.xyz/v1，自定义中转由用户自行填写。第三方入口不得标记为官方或默认可信。
+OpenCode Go、OpenRouter 其次；中转服务最后，其中项目方自建中转固定展示
+https://10521052.xyz/v1，自定义中转由用户自行填写。中转入口不得冒充模型厂商官方 API，也不得跳过域名确认。
 
 每完成一个阶段都运行现有测试和新增测试。不要直接执行会产生真实 Provider 费用的
 端到端请求，除非用户明确授权。最终报告修改文件、测试结果、剩余风险和人工验证步骤。

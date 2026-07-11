@@ -12,7 +12,20 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $LauncherDir = Join-Path $ProjectDir "launcher"
-$Version = "0.1.2"
+$CargoToml = Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\Cargo.toml") -Raw -Encoding UTF8
+$CargoVersionMatch = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"([^"]+)"')
+if (-not $CargoVersionMatch.Success) {
+  throw "Unable to read launcher version from Cargo.toml."
+}
+$Version = $CargoVersionMatch.Groups[1].Value
+$PackageVersion = (Get-Content -LiteralPath (Join-Path $LauncherDir "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json).version
+$TauriVersion = (Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\tauri.conf.json") -Raw -Encoding UTF8 | ConvertFrom-Json).version
+if ($Version -ne $PackageVersion -or $Version -ne $TauriVersion) {
+  throw "Launcher versions disagree: Cargo=$Version package=$PackageVersion tauri=$TauriVersion"
+}
+if ($Profile -eq "release" -and $SkipBuild) {
+  throw "Release packaging must compile the launcher; -SkipBuild is allowed only for debug packages."
+}
 
 if (-not $OutputDir) {
   $OutputDir = Join-Path $ProjectDir "dist"
@@ -59,6 +72,7 @@ if (Test-Path -LiteralPath $ShaPath) {
 
 New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "docs") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "docs") "prompts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "skills") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "scripts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "static") | Out-Null
@@ -82,6 +96,7 @@ foreach ($file in @(
   "collect-acceptance-evidence.ps1",
   "collect-acceptance-evidence.bat",
   "verify-proxy.ps1",
+  "probe-provider-capabilities.ps1",
   "doctor.ps1",
   "uninstall.ps1"
 )) {
@@ -89,11 +104,15 @@ foreach ($file in @(
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "quick-start.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "quick-start.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "architecture-and-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "architecture-and-product-plan.zh-CN.md")
-Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.2.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.2.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.3.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.3.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.3-update-record.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.3-update-record.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-clean-pc-acceptance.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-clean-pc-acceptance.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "provider-access-matrix.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "provider-access-matrix.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "troubleshooting.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "troubleshooting.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $ProjectDir "docs") "prompts") "csa-install-or-upgrade-agent-prompt.zh-CN.md") -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "docs") "prompts") "csa-install-or-upgrade-agent-prompt.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "skills") "bootstrap-claude-science-wsl") -Destination (Join-Path (Join-Path $PackageRoot "skills") "bootstrap-claude-science-wsl") -Recurse
 $BundledClaudeDir = Join-Path (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") "linux-x64"
 $BundledClaudeBin = Join-Path $BundledClaudeDir "claude-science"
@@ -106,6 +125,36 @@ Get-ChildItem -LiteralPath (Join-Path (Join-Path $PackageRoot "vendor") "claude-
   Where-Object { $_.Extension -in @(".rar", ".zip", ".7z") } |
   Remove-Item -Force
 $BundledClaudeInfo = Get-Content -LiteralPath $BundledClaudeManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+$BundledClaudeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BundledClaudeBin).Hash.ToLowerInvariant()
+if ([string]$BundledClaudeInfo.sha256 -ne $BundledClaudeHash) {
+  throw "Bundled Claude Science hash does not match manifest.json."
+}
+
+$ExampleConfig = Get-Content -LiteralPath (Join-Path $ProjectDir "config.example.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($secretField in @("deepseek_api_key", "openai_api_key", "custom_api_key", "proxy_auth_token")) {
+  if (-not [string]::IsNullOrEmpty([string]$ExampleConfig.$secretField)) {
+    throw "config.example.json contains a value in $secretField."
+  }
+}
+if (
+  -not [string]::IsNullOrEmpty([string]$ExampleConfig.force_model) -or
+  @($ExampleConfig.model_aliases).Count -gt 0 -or
+  @($ExampleConfig.model_token_caps.PSObject.Properties).Count -gt 0 -or
+  @($ExampleConfig.deepseek_model_map.PSObject.Properties).Count -gt 0 -or
+  @($ExampleConfig.openai_model_map.PSObject.Properties).Count -gt 0 -or
+  @($ExampleConfig.custom_model_map.PSObject.Properties).Count -gt 0 -or
+  [int]$ExampleConfig.default_max_tokens_cap -ne 0
+) {
+  throw "config.example.json must preserve the empty model/output-cap state."
+}
+
+$ExeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ExePath).Hash.ToLowerInvariant()
+$SourceCommit = (& git -C $ProjectDir rev-parse HEAD 2>$null | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0) { $SourceCommit = "unknown" }
+$SourceDirty = $false
+if ($SourceCommit -ne "unknown") {
+  $SourceDirty = [bool](& git -C $ProjectDir status --porcelain 2>$null | Select-Object -First 1)
+}
 
 $Manifest = [ordered]@{
   schemaVersion = 1
@@ -114,7 +163,10 @@ $Manifest = [ordered]@{
   profile = $Profile
   packageName = $PackageName
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
+  sourceCommit = [string]$SourceCommit
+  sourceTreeDirty = $SourceDirty
   entrypoint = "claude-science-assistant.exe"
+  entrypointSha256 = $ExeHash
   acceptanceHelper = "scripts/acceptance-v0.1.ps1"
   acceptanceHelperBat = "scripts/acceptance-v0.1.bat"
   evidenceHelper = "scripts/collect-acceptance-evidence.ps1"
@@ -129,7 +181,7 @@ $Manifest = [ordered]@{
   bundledClaudeScience = [ordered]@{
     path = "vendor/claude-science/linux-x64/claude-science"
     manifest = "vendor/claude-science/linux-x64/manifest.json"
-    sha256 = $BundledClaudeInfo.sha256
+    sha256 = $BundledClaudeHash
     version = $BundledClaudeInfo.version
     platform = $BundledClaudeInfo.platform
   }
@@ -137,11 +189,15 @@ $Manifest = [ordered]@{
   docs = @(
     "docs/quick-start.zh-CN.md",
     "docs/architecture-and-product-plan.zh-CN.md",
-    "docs/github-release-v0.1.2.md",
+    "docs/github-release-v0.1.3.md",
     "docs/green-book-integration.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
-    "docs/v0.1-clean-pc-acceptance.zh-CN.md"
+    "docs/v0.1.3-update-record.zh-CN.md",
+    "docs/v0.1-clean-pc-acceptance.zh-CN.md",
+    "docs/provider-access-matrix.zh-CN.md",
+    "docs/troubleshooting.md",
+    "docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md"
   )
   security = [ordered]@{
     includesSecrets = $false
@@ -177,7 +233,7 @@ $Readme = @(
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
-  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
+  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
   "",
   "This package does not include API keys, OAuth tokens, control tokens, or user config."
 ) -join [Environment]::NewLine
@@ -241,6 +297,17 @@ Set-Content -LiteralPath (Join-Path $PackageRoot "4-install-runtime-after-previe
 $secretMatches = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Select-String -Pattern 'sk-[A-Za-z0-9_-]{20,}' -List -ErrorAction SilentlyContinue)
 if ($secretMatches.Count -gt 0) {
   throw "Package contains secret-like tokens; refusing to archive."
+}
+
+$forbiddenPackageFiles = @(
+  Get-ChildItem -LiteralPath $PackageRoot -Recurse -File |
+    Where-Object {
+      $_.FullName -match '[\\/]private[\\/]' -or
+      $_.Extension -in @(".rar", ".zip", ".7z")
+    }
+)
+if ($forbiddenPackageFiles.Count -gt 0) {
+  throw "Package contains private or nested archive files; refusing to archive."
 }
 
 Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -CompressionLevel Optimal

@@ -25,12 +25,16 @@ if (-not (Test-Path $Python)) {
   } else {
     throw "Python not found. Install Python 3 or set PYTHON to python.exe."
   }
+  if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment (exit $LASTEXITCODE)." }
   $Python = (Resolve-Path -LiteralPath $defaultPython).Path
   & $Python -m pip install --upgrade pip
+  if ($LASTEXITCODE -ne 0) { throw "Failed to install pip (exit $LASTEXITCODE)." }
   & $Python -m pip install -r (Join-Path $ProjectDir "requirements.txt")
+  if ($LASTEXITCODE -ne 0) { throw "Failed to install test requirements (exit $LASTEXITCODE)." }
 }
 
 & $Python -m py_compile proxy.py setup-token.py forward-443.py
+if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
 $code = @'
 import importlib.util
@@ -50,6 +54,7 @@ $tmp = New-TemporaryFile
 try {
   Set-Content -LiteralPath $tmp -Value $code -Encoding UTF8
   & $Python $tmp
+  if ($LASTEXITCODE -ne 0) { throw "Translation tests failed (exit $LASTEXITCODE)." }
 } finally {
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 }

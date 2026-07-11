@@ -2,18 +2,16 @@
 
 ## Proxy Is Not Running
 
-Check:
+Check the supported WSL runtime:
 
 ```powershell
-.\scripts\doctor.ps1
-Get-ScheduledTask -TaskName ClaudeScienceByokProxy
-Get-Content "$HOME\.claude-science\logs\proxy.log" -Tail 120
+.\scripts\status-probe.ps1
 ```
 
 Restart:
 
 ```powershell
-.\scripts\start-claude-science.ps1
+.\scripts\start-claude-science-wsl.ps1
 ```
 
 ## Backend 400: Invalid Tool Schema
@@ -24,6 +22,10 @@ If this still appears, capture only the backend error text from the log. Do not 
 ## Backend 400: max_tokens Too Large
 
 Some providers reject large `max_tokens` values.
+
+CSA does not apply one global output length to normal Claude Science requests. The Bridge preserves the caller's `max_tokens`; if the caller omits it for an OpenAI-compatible upstream, the field is omitted so the upstream can use its model default. `default_max_tokens_cap=0` means “do not clamp”.
+
+Only add a cap after the provider has returned a documented limit error. Do not use a very small blanket value: reasoning tokens, visible text, and tool-call arguments can all consume the same output budget, so an undersized cap can produce HTTP 200 with no visible answer or stop an agent before it calls a tool.
 
 Set a per-model cap:
 
@@ -56,7 +58,7 @@ Set the explicit outbound proxy:
 Then restart:
 
 ```powershell
-.\scripts\start-claude-science.ps1
+.\scripts\start-claude-science-wsl.ps1
 ```
 
 Do not change Clash, v2rayN, sing-box, DNS, TUN, Windows system proxy, hosts, certificates, or port 443 just to make this project use a node.
@@ -70,7 +72,7 @@ If markers still appear:
 
 ```powershell
 .\scripts\self-test.ps1
-.\scripts\start-claude-science.ps1
+.\scripts\start-claude-science-wsl.ps1
 ```
 
 Then check:
@@ -99,13 +101,13 @@ If `proxy_auth_mode=required`, clients must use:
 http://127.0.0.1:9876/<secret>
 ```
 
-Run:
+Reopen the dashboard from the launcher so it uses the required path secret. If the WSL runtime is stopped, run:
 
 ```powershell
-.\scripts\start-claude-science.ps1
+.\scripts\start-claude-science-wsl.ps1
 ```
 
-The script reads `config.json`, appends the secret automatically, and masks it in output.
+Do not manually print or paste the path secret.
 
 ## SSL Certificate Verify Failed When Proxy Calls Backend
 
@@ -122,6 +124,8 @@ If that does not apply, confirm the backend base URL is correct and the local Py
 ## Empty Content From Reasoning Models
 
 Some reasoning models put early tokens in `reasoning_content`.
+
+The launcher connectivity test uses a bounded adaptive budget: it starts at 256 tokens and retries the same model with 1024 only when the first response is length-limited or contains reasoning without visible text. This test budget is separate from normal Claude Science conversations and is never written into the Bridge runtime configuration.
 The proxy supports:
 
 - `never`: ignore reasoning content. Default and safest.
@@ -135,6 +139,24 @@ Recommended:
   "reasoning_content_policy": "never"
 }
 ```
+
+`reasoning_content_policy` controls what the Bridge displays; it does not control how much the model thinks. Keep `never` for normal use so private/internal reasoning is not surfaced. If a request ends with `stop_reason=max_tokens`, raise the caller's output budget or lower the model's effort; changing the display policy is not a real fix for truncation.
+
+## A Model Rejects Output, Thinking, or Parallel Tool Parameters
+
+OpenAI-compatible APIs share an endpoint shape, but not one universal parameter set. OpenAI
+o-series models use `max_completion_tokens`; GLM/Kimi/DeepSeek-style models, Qwen, MiniMax,
+OpenRouter, and SiliconFlow expose different reasoning controls.
+
+CSA translates an explicit Claude Science reasoning request by platform first and model family
+second. It does not turn reasoning on when the caller did not ask for it. If an upstream returns a
+specific HTTP 400/422 parameter error, the bridge may make one compatibility retry. It does not retry
+authentication, quota, model-not-found, network, or 5xx errors.
+
+For a saved Provider, run `scripts/probe-provider-capabilities.ps1` to check the model list, visible
+text, a 32768-token parameter probe, native function calling, parallel tool parameter acceptance,
+and the applicable reasoning control. This sends real, short API requests and can consume a small
+amount of quota; it never prints the saved key or answer body.
 
 ## Image Input Fails
 

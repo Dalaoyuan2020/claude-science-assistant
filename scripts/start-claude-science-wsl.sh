@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${CSA_MERGE_STDERR:-0}" = "1" ]; then
+  exec 2>&1
+fi
+
 # Start Claude Science on Windows via WSL, using a patched Linux daemon copy.
 #
 # What this script does:
@@ -27,6 +31,7 @@ MANAGED_CLAUDE_BIN="$MANAGED_CLAUDE_DIR/claude-science"
 PATCH_DIR="${PATCH_DIR:-$HOME/.local/share/claude-science-api-bridge/patched}"
 PATCHED_BIN="${PATCHED_BIN:-$PATCH_DIR/claude-science}"
 LOG_DIR="$HOME/.claude-science/logs"
+LOG_FILE="$LOG_DIR/wsl-proxy.log"
 
 if [ -x "$HOME/.local/share/claude-science-api-bridge/venv/bin/python" ]; then
   PYTHON_BIN="${PYTHON:-$HOME/.local/share/claude-science-api-bridge/venv/bin/python}"
@@ -34,35 +39,95 @@ else
   PYTHON_BIN="${PYTHON:-python3}"
 fi
 
-check_tcp() {
-  local host="$1"
-  local port="$2"
-  python3 - "$host" "$port" <<'PY'
-import socket
-import sys
-
-host, port = sys.argv[1], int(sys.argv[2])
-s = socket.socket()
-s.settimeout(0.5)
+check_bridge_health() {
+  local payload
+  payload="$(curl -fsS --connect-timeout 0.4 --max-time 1 "http://127.0.0.1:$PROXY_PORT/health" 2>/dev/null)" || return 1
+  "$PYTHON_BIN" -c '
+import json, os, sys
 try:
-    ok = s.connect_ex((host, port)) == 0
-finally:
-    s.close()
-raise SystemExit(0 if ok else 1)
-PY
+    health = json.loads(sys.argv[2])
+except Exception:
+    raise SystemExit(1)
+expected = os.path.realpath(sys.argv[1])
+actual = os.path.realpath(str(health.get("source_path") or ""))
+raise SystemExit(0 if health.get("status") == "ok" and actual == expected else 1)
+' "$PROJECT_DIR/proxy.py" "$payload" >/dev/null 2>&1
 }
 
-wait_tcp() {
-  local host="$1"
-  local port="$2"
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if check_tcp "$host" "$port"; then
-      return 0
+wait_bridge_health() {
+  local timeout="${1:-12}"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if check_bridge_health; then
+      # Require a second successful check so a process that only binds briefly
+      # is not reported as a successful Bridge start.
+      sleep 0.75
+      if check_bridge_health; then
+        return 0
+      fi
     fi
-    sleep 0.5
+    sleep 0.35
   done
   return 1
+}
+
+bridge_listener_pids() {
+  ss -ltnp "sport = :$PROXY_PORT" 2>/dev/null \
+    | grep -o 'pid=[0-9]*' \
+    | cut -d= -f2 \
+    | sort -u
+}
+
+stop_stale_bridge_listener() {
+  local pids pid cmdline stopped=0
+  pids="$(bridge_listener_pids || true)"
+  if [ -z "$pids" ]; then
+    if ss -ltn "sport = :$PROXY_PORT" 2>/dev/null | grep -q LISTEN; then
+      echo "Port $PROXY_PORT is occupied, but CSA cannot identify its owner. Stop that process before starting Bridge." >&2
+      return 1
+    fi
+    return 0
+  fi
+  for pid in $pids; do
+    cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cmdline" in
+      *"/proxy.py"*)
+        echo "Stopping stale CSA Bridge listener (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+        stopped=1
+        ;;
+      *)
+        echo "Port $PROXY_PORT is occupied by a non-CSA process (PID $pid)." >&2
+        return 1
+        ;;
+    esac
+  done
+  if [ "$stopped" = "1" ]; then
+    local deadline=$((SECONDS + 3))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if ! ss -ltn "sport = :$PROXY_PORT" 2>/dev/null | grep -q LISTEN; then
+        return 0
+      fi
+      sleep 0.2
+    done
+    echo "Stale CSA Bridge did not release port $PROXY_PORT." >&2
+    return 1
+  fi
+}
+
+rotate_bridge_log() {
+  if [ "$LOG_FILE" = "/dev/null" ] || [ ! -f "$LOG_FILE" ]; then
+    return 0
+  fi
+  local size
+  size="$(stat -c %s "$LOG_FILE" 2>/dev/null || printf 0)"
+  if [ "${size:-0}" -le $((50 * 1024 * 1024)) ]; then
+    return 0
+  fi
+  rm -f "$LOG_FILE.1" 2>/dev/null || true
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+  : >"$LOG_FILE"
+  echo "Rotated Bridge log at 50 MB (kept one backup: $LOG_FILE.1)"
 }
 
 service_matches_project() {
@@ -72,8 +137,106 @@ service_matches_project() {
   systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$PROJECT_DIR/proxy.py" >/dev/null 2>&1
 }
 
+start_fallback_proxy() {
+  if check_bridge_health; then
+    echo "WSL BYOK proxy already healthy on 127.0.0.1:$PROXY_PORT"
+    return 0
+  fi
+  echo "Starting fallback WSL BYOK proxy on 127.0.0.1:$PROXY_PORT"
+  stop_stale_bridge_listener
+  rotate_bridge_log
+  local proxy_pid
+  if ! proxy_pid="$("$PYTHON_BIN" - "$PYTHON_BIN" "$PROJECT_DIR/proxy.py" "$PROJECT_DIR" "$LOG_FILE" <<'PY'
+import os
+import subprocess
+import sys
+
+python_bin, proxy_script, project_dir, log_file = sys.argv[1:]
+with open(log_file, "ab", buffering=0) as log:
+    process = subprocess.Popen(
+        [python_bin, proxy_script],
+        cwd=project_dir,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+        env=os.environ.copy(),
+    )
+print(process.pid)
+PY
+  )"; then
+    echo "Fallback WSL proxy process could not be launched." >&2
+    return 1
+  fi
+  echo "Fallback WSL BYOK proxy process started (PID $proxy_pid)"
+  if ! wait_bridge_health 12; then
+    echo "Fallback WSL proxy did not start on 127.0.0.1:$PROXY_PORT. Last log lines:" >&2
+    if [ "$LOG_FILE" != "/dev/null" ]; then
+      tail -80 "$LOG_FILE" >&2 || true
+    else
+      echo "Proxy log is unavailable because no writable WSL log path was found." >&2
+    fi
+    if [ -r "/proc/$proxy_pid/cmdline" ]; then
+      local launched_cmdline
+      launched_cmdline="$(tr '\0' ' ' <"/proc/$proxy_pid/cmdline" 2>/dev/null || true)"
+      if [[ "$launched_cmdline" == *"$PROJECT_DIR/proxy.py"* ]]; then
+        kill "$proxy_pid" 2>/dev/null || true
+      fi
+    fi
+    return 1
+  fi
+}
+
+start_systemd_proxy() {
+  local unit_ready=0
+  if service_matches_project; then
+    unit_ready=1
+  elif PROXY_PORT="$PROXY_PORT" PYTHON="$PYTHON_BIN" bash "$SCRIPT_DIR/install-wsl-bridge-service.sh" >/dev/null; then
+    unit_ready=1
+  else
+    echo "Warning: failed to install/update systemd user service; falling back to direct WSL proxy start." >&2
+  fi
+
+  if [ "$unit_ready" != "1" ]; then
+    return 1
+  fi
+
+  # Remove only exact legacy fallback Bridge processes before handing ownership to systemd.
+  systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
+  stop_stale_bridge_listener
+  rotate_bridge_log
+  if ! systemctl --user restart claude-science-bridge.service; then
+    echo "Warning: systemd user service restart failed; falling back to direct WSL proxy start." >&2
+    return 1
+  fi
+  echo "WSL BYOK proxy managed by systemd user service on 127.0.0.1:$PROXY_PORT"
+  if ! wait_bridge_health 8; then
+    systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
+    echo "WSL proxy service did not start on 127.0.0.1:$PROXY_PORT. Last log lines:" >&2
+    tail -80 "$LOG_DIR/wsl-proxy.log" >&2 || true
+    return 1
+  fi
+}
+
 if [ "${#PROXY_PORT}" -ne 4 ]; then
   echo "PROXY_PORT must be four digits for byte-length-preserving URL patches. Current: $PROXY_PORT" >&2
+  exit 1
+fi
+
+write_probe() {
+  local dir="$1"
+  local probe="$dir/.csa-write-test-$$"
+  (: >"$probe") 2>/dev/null || return 1
+  rm -f "$probe" 2>/dev/null || true
+}
+
+if ! write_probe "${TMPDIR:-/tmp}"; then
+  echo "WSL temporary directory is not writable: ${TMPDIR:-/tmp}. Run 'wsl --shutdown', reopen Ubuntu, and retry. If it remains read-only, repair or recreate this WSL distro." >&2
+  exit 1
+fi
+if ! write_probe "$HOME"; then
+  echo "WSL user home is not writable: $HOME. CSA cannot create its runtime, logs, or Bridge configuration until the WSL filesystem is repaired." >&2
   exit 1
 fi
 
@@ -81,11 +244,11 @@ install_bundled_claude_science() {
   if [ ! -f "$BUNDLED_CLAUDE_BIN" ]; then
     return 1
   fi
-  mkdir -p "$MANAGED_CLAUDE_DIR"
-  cp -f "$BUNDLED_CLAUDE_BIN" "$MANAGED_CLAUDE_BIN"
-  chmod 755 "$MANAGED_CLAUDE_BIN"
+  mkdir -p "$MANAGED_CLAUDE_DIR" || return 1
+  cp -f "$BUNDLED_CLAUDE_BIN" "$MANAGED_CLAUDE_BIN" || return 1
+  chmod 755 "$MANAGED_CLAUDE_BIN" || return 1
   if [ -f "$BUNDLED_CLAUDE_SHA" ]; then
-    (cd "$MANAGED_CLAUDE_DIR" && sha256sum -c "$BUNDLED_CLAUDE_SHA")
+    (cd "$MANAGED_CLAUDE_DIR" && sha256sum -c "$BUNDLED_CLAUDE_SHA") || return 1
   fi
   return 0
 }
@@ -116,13 +279,19 @@ EOF
   exit 1
 fi
 
-mkdir -p "$LOG_DIR" "$PATCH_DIR"
+if mkdir -p "$LOG_DIR" 2>/dev/null && : >>"$LOG_FILE" 2>/dev/null; then
+  :
+else
+  echo "Warning: WSL log directory is not writable; proxy fallback logs will be discarded." >&2
+  LOG_FILE="/dev/null"
+fi
+mkdir -p "$PATCH_DIR"
 
 echo "Using Claude Science Linux binary: $SOURCE_BIN"
 "$SOURCE_BIN" --version 2>/dev/null || true
 
 if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
-  && check_tcp 127.0.0.1 "$PROXY_PORT" \
+  && check_bridge_health \
   && service_matches_project \
   && pgrep -f "claude-science-api-bridge/patched/claude-science serve" >/dev/null 2>&1; then
   echo "Claude Science and WSL BYOK proxy are already running; using fast start path."
@@ -135,31 +304,14 @@ if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
 fi
 
 if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then
-  PROXY_PORT="$PROXY_PORT" PYTHON="$PYTHON_BIN" bash "$SCRIPT_DIR/install-wsl-bridge-service.sh" >/dev/null
-  # Remove only exact legacy fallback Bridge processes before handing ownership to systemd.
-  for pid in $(ps -eo pid=,args= | awk '/python.*claude-science-api-bridge.*\/proxy.py/ && !/awk/ {print $1}'); do
-    kill "$pid" 2>/dev/null || true
-  done
-  systemctl --user restart claude-science-bridge.service
-  echo "WSL BYOK proxy managed by systemd user service on 127.0.0.1:$PROXY_PORT"
-  if ! wait_tcp 127.0.0.1 "$PROXY_PORT"; then
-    echo "WSL proxy service did not start on 127.0.0.1:$PROXY_PORT. Last log lines:" >&2
-    tail -80 "$LOG_DIR/wsl-proxy.log" >&2 || true
-    exit 1
-  fi
-elif ! check_tcp 127.0.0.1 "$PROXY_PORT"; then
-  echo "Starting fallback WSL BYOK proxy on 127.0.0.1:$PROXY_PORT"
-  (
-    cd "$PROJECT_DIR"
-    setsid -f "$PYTHON_BIN" "$PROJECT_DIR/proxy.py" >"$LOG_DIR/wsl-proxy.log" 2>&1
-  )
-  if ! wait_tcp 127.0.0.1 "$PROXY_PORT"; then
-    echo "Fallback WSL proxy did not start on 127.0.0.1:$PROXY_PORT. Last log lines:" >&2
-    tail -80 "$LOG_DIR/wsl-proxy.log" >&2 || true
-    exit 1
-  fi
+  start_systemd_proxy || start_fallback_proxy
+elif [ "${CSA_FORCE_RESTART:-0}" = "1" ]; then
+  stop_stale_bridge_listener
+  start_fallback_proxy
+elif ! check_bridge_health; then
+  start_fallback_proxy
 else
-  echo "WSL BYOK proxy already listening on 127.0.0.1:$PROXY_PORT"
+  echo "WSL BYOK proxy already healthy on 127.0.0.1:$PROXY_PORT"
 fi
 
 TOKEN_FILE="$HOME/.claude-science/.oauth-tokens/byok-user-000000000000000000.enc"

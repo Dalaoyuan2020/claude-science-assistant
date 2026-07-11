@@ -50,12 +50,12 @@ else
   say "systemd is not PID 1; no user service disable step is available."
 fi
 
-# Stop only known product-managed processes.
-for pid in $(pgrep -f 'python.*claude-science-api-bridge.*/proxy.py' 2>/dev/null || true); do
+# Stop only the process that owns CSA's Bridge port and actually runs proxy.py.
+for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true); do
   if [ -r "/proc/$pid/cmdline" ]; then
     cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
     case "$cmd" in
-      *"claude-science-api-bridge"*"proxy.py"*) run kill "$pid" ;;
+      *"/proxy.py"*) run kill "$pid" ;;
     esac
   fi
 done

@@ -83,11 +83,11 @@ Claude Science 助手不会要求修改 Clash、VPN、DNS、hosts、根证书、
 
 Claude Science 助手首页按添加顺序显示已保存的 API Key，并突出当前正在使用的一条。需要新增时，点击“添加供应商”，服务商模板按以下顺序排列：
 
-1. 官方直连：GLM-5.2、LongCat、DeepSeek、Claude、OpenAI/GPT。
+1. 官方直连：GLM-5.2、LongCat、DeepSeek、MiniMax、Claude、OpenAI/GPT。
 2. 聚合平台：OpenCode Go、OpenRouter。
-3. 第三方中转：内置中转 `https://10521052.xyz/v1`，以及用户自行填写的自定义中转。
+3. 中转服务：项目方自建中转 `https://10521052.xyz/v1`，以及用户自行填写的自定义中转。
 
-内置中转不会自动启用，也不代表官方背书。自定义中转默认留空；确认屏幕显示的域名后再保存 API Key。
+项目方自建中转由 CSA 项目方维护，但不是模型厂商官方 API，也不会自动启用。自定义中转默认留空；两者都应在确认屏幕显示的域名后再保存 API Key。
 
 Claude 与 OpenAI/GPT 的“官方订阅登录”和“API Key”是不同入口。订阅权益不能默认当成 API 余额使用。
 非 Claude 官方登录项添加时必须输入 API Key。启动器使用 Windows 当前用户 DPAPI 加密保存密钥；点击列表中的“使用”即可切换，不需要重新输入。界面只显示“已加密保存”，不会把已保存的 Key 或密文读回显示。当前正在使用的 Key 必须先切换到另一条后才能删除。

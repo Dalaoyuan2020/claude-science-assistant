@@ -136,7 +136,7 @@ function Copy-IfPresent {
 $summary = [ordered]@{
   schemaVersion = 1
   product = "Claude Science Assistant"
-  version = "0.1.2"
+  version = "0.1.3"
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
   mode = "read-only evidence collection"
   projectRootLeaf = Split-Path -Leaf $ProjectRoot

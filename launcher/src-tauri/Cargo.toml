@@ -1,6 +1,6 @@
 [package]
 name = "claude-science-assistant"
-version = "0.1.2"
+version = "0.1.3"
 description = "Windows launcher for Claude Science and domestic model providers"
 authors = ["Claude Science Assistant contributors"]
 edition = "2021"

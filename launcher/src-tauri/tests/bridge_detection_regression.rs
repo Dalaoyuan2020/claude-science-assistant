@@ -54,7 +54,9 @@ fn new_pattern_1_matches(args: &str) -> bool {
 /// NEW pattern #2 (the actual fix): `[p]ython[0-9.]* .*[/]proxy.py`
 /// Requires: "python" + optional digits/dots + whitespace + anything + "/proxy.py".
 fn new_pattern_2_matches(args: &str) -> bool {
-    let Some(idx) = args.find("python") else { return false };
+    let Some(idx) = args.find("python") else {
+        return false;
+    };
     let after_python = &args[idx + "python".len()..];
     // skip optional version suffix like "3" or "3.11"
     let after_version = after_python.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
@@ -109,17 +111,14 @@ const REAL_PROCESS_ARGS: &str =
      /mnt/h/Claude_agent/claude-science-assistant-v0.1.1-release-portable0707/proxy.py";
 
 /// Classic layout: bridge-name appears in the script path, AFTER python.
-const CLASSIC_PROCESS_ARGS: &str =
-    "python /opt/claude-science-api-bridge/proxy.py";
+const CLASSIC_PROCESS_ARGS: &str = "python /opt/claude-science-api-bridge/proxy.py";
 
 /// Python 3.11 in the bridge venv.
-const PY311_PROCESS_ARGS: &str =
-    "/home/user/claude-science-api-bridge/venv/bin/python3.11 \
+const PY311_PROCESS_ARGS: &str = "/home/user/claude-science-api-bridge/venv/bin/python3.11 \
      /mnt/c/some/path/proxy.py";
 
 /// Unrelated python process that should NOT match.
-const UNRELATED_PYTHON_PROCESS: &str =
-    "/usr/bin/python3 /home/user/some_other_script.py";
+const UNRELATED_PYTHON_PROCESS: &str = "/usr/bin/python3 /home/user/some_other_script.py";
 
 // ===========================================================================
 // Tests
@@ -249,13 +248,20 @@ fn lib_rs_does_not_contain_buggy_gating() {
         std::path::PathBuf::from("../src-tauri/src/lib.rs"),
     ];
     let Some(path) = candidates.iter().find(|p| p.exists()) else {
-        eprintln!("WARN: lib.rs not found in any of {:?}; skipping source audit.", candidates);
+        eprintln!(
+            "WARN: lib.rs not found in any of {:?}; skipping source audit.",
+            candidates
+        );
         return;
     };
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("WARN: could not read {}: {}; skipping source audit.", path.display(), e);
+            eprintln!(
+                "WARN: could not read {}: {}; skipping source audit.",
+                path.display(),
+                e
+            );
             return;
         }
     };

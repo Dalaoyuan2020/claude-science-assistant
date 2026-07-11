@@ -5,26 +5,12 @@
   "deepseek_base_url": "https://api.deepseek.com/anthropic",
   "openai_base_url": "https://api.openai.com",
   "custom_base_url": "",
-  "default_backend": "deepseek",
-  "force_model": "deepseek-v4-pro",
-  "deepseek_model_map": {
-    "claude-sonnet-5": "deepseek-v4-pro",
-    "claude-sonnet-4-5": "deepseek-v4-pro",
-    "claude-opus-4-8": "deepseek-v4-pro",
-    "claude-haiku-4-5-20251001": "deepseek-v4-flash"
-  },
-  "openai_model_map": {
-    "claude-sonnet-4-5": "gpt-4o"
-  },
+  "default_backend": "",
+  "force_model": "",
+  "deepseek_model_map": {},
+  "openai_model_map": {},
   "custom_model_map": {},
-  "model_aliases": [
-    {
-      "id": "byok-model-0001",
-      "display_name": "DeepSeek V4 Pro",
-      "backend": "deepseek",
-      "model": "deepseek-v4-pro"
-    }
-  ],
+  "model_aliases": [],
   "model_list_mode": "aliases",
   "model_token_caps": {},
   "default_max_tokens_cap": 0,

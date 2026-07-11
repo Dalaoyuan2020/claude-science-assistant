@@ -32,7 +32,14 @@ button, input { font: inherit; }
 .primary-button:hover, .primary-inline-button:hover, .secondary-button:hover { transform: translateY(-1px); }
 button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 
-.health-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0 26px; }
+.health-panel { margin: 14px 0 26px; border: 1px solid #d8dfd9; border-radius: 17px; padding: 12px; background: #f8faf8b8; }
+.health-panel.collapsed { padding: 10px 12px; }
+.health-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.health-panel-head strong, .health-panel-head small { display: block; }
+.health-panel-head strong { color: #34443a; font-size: 12px; }
+.health-panel-head small { margin-top: 2px; color: #7a857e; font-size: 10px; }
+.health-panel-head button { border: 1px solid #d1d9d2; border-radius: 9px; padding: 6px 10px; color: #45534a; background: #ffffffc9; cursor: pointer; font-size: 11px; font-weight: 750; }
+.health-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
 .health-item { display: flex; align-items: center; gap: 10px; border: 1px solid #dae0da; border-radius: 14px; padding: 13px; background: #ffffffb5; }
 .health-check { width: 26px; height: 26px; border-radius: 9px; display: grid; place-items: center; color: #8b958e; background: #edf0ed; font-weight: 800; }
 .health-check.ok { color: #176337; background: #dff2e5; }
@@ -145,6 +152,11 @@ footer { display: flex; justify-content: space-between; align-items: center; gap
   body { min-width: 0; }
   .app-shell { width: min(100% - 28px, 760px); }
   .hero, .current-kit-card { grid-template-columns: 1fr; }
-  .health-grid, .kit-layout, .kit-picker-grid { grid-template-columns: 1fr; }
+  .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kit-layout, .kit-picker-grid { grid-template-columns: 1fr; }
   .section-heading { align-items: flex-start; flex-direction: column; }
+}
+
+@media (max-width: 560px) {
+  .health-grid { grid-template-columns: 1fr; }
 }

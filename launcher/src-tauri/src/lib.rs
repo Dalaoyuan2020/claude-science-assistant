@@ -1,15 +1,49 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// Reasoning models such as GLM-5.2 can spend the first dozens of tokens in
+// reasoning_content. A tiny cap returns HTTP 200 with an empty final answer and
+// makes a valid Key look broken.
+const API_KEY_TEST_INITIAL_MAX_TOKENS: u32 = 256;
+const API_KEY_TEST_RETRY_MAX_TOKENS: u32 = 1024;
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    fn GetLocalTime(system_time: *mut WindowsSystemTime);
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
 fn background_command(program: &str) -> Command {
     let mut command = Command::new(program);
@@ -18,6 +52,62 @@ fn background_command(program: &str) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label}启动失败：{error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}无法读取标准输出"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}无法读取错误输出"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label}在 {} 秒内没有响应，已停止本次操作。请检查宿主磁盘空间、WSL VHDX 与发行版状态。",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{label}状态读取失败：{error}"));
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 async fn run_blocking<T, F>(job: F) -> Result<T, String>
@@ -46,7 +136,87 @@ struct SystemStatus {
     runtime_ready: bool,
     source_binary_present: bool,
     bridge_venv_present: bool,
+    wsl_storage_path: Option<String>,
+    wsl_storage_drive: Option<String>,
+    wsl_storage_free_gb: Option<f64>,
+    wsl_vhdx_size_gb: Option<f64>,
+    wsl_root_free_gb: Option<f64>,
+    settings_storage_drive: Option<String>,
+    settings_storage_free_gb: Option<f64>,
+    storage_warning: bool,
+    storage_blocked: bool,
+    restart_blocked: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct WindowsStorageSnapshot {
+    wsl_base_path: Option<String>,
+    wsl_drive: Option<String>,
+    wsl_drive_free_bytes: Option<u64>,
+    vhdx_size_bytes: Option<u64>,
+    settings_drive: Option<String>,
+    settings_drive_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeReport {
+    #[serde(default)]
+    wsl: WslProbeIdentity,
+    #[serde(default)]
+    components: WslProbeComponents,
+    #[serde(default)]
+    storage: WslProbeStorage,
+    #[serde(default)]
+    runtime: WslProbeRuntime,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeIdentity {
+    #[serde(default)]
+    user: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeComponents {
+    #[serde(default)]
+    source_binary: bool,
+    #[serde(default)]
+    bridge_venv: bool,
+    #[serde(default)]
+    tmp_writable: bool,
+    #[serde(default)]
+    home_writable: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeStorage {
+    root_total_kb: Option<u64>,
+    root_free_kb: Option<u64>,
+    root_inode_total: Option<u64>,
+    root_inode_free: Option<u64>,
+    #[serde(default)]
+    root_read_only: bool,
+    bridge_log_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeRuntime {
+    bridge_pid: Option<u32>,
+    claude_pid: Option<u32>,
+    #[serde(default)]
+    bridge_healthy: bool,
+    #[serde(default)]
+    bridge_health_responding: bool,
+    #[serde(default)]
+    bridge_service_active: bool,
+    unit_matches_project: Option<bool>,
+    #[serde(default)]
+    port_9876: bool,
+    #[serde(default)]
+    port_8765: bool,
+    #[serde(default)]
+    port_8766: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +302,13 @@ struct LauncherState {
 struct BridgeConfigRollback {
     restore: serde_json::Map<String, serde_json::Value>,
     delete: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedBridgeConfig {
+    distro: String,
+    rollback: BridgeConfigRollback,
+    previous_status: SystemStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -247,10 +424,9 @@ fn output_text(output: &Output) -> String {
 }
 
 fn discover_distros() -> Result<Vec<String>, String> {
-    let output = background_command("wsl.exe")
-        .args(["--list", "--quiet"])
-        .output()
-        .map_err(|error| format!("无法运行 wsl.exe：{error}"))?;
+    let mut command = background_command("wsl.exe");
+    command.args(["--list", "--quiet"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(5), "WSL 发行版检查")?;
     if !output.status.success() {
         return Err("WSL 尚未安装或当前不可用".to_string());
     }
@@ -278,13 +454,17 @@ fn preferred_distro(distros: &[String]) -> Option<String> {
 }
 
 fn run_wsl(distro: &str, args: &[&str]) -> Result<Output, String> {
-    background_command("wsl.exe")
+    run_wsl_with_timeout(distro, args, Duration::from_secs(8))
+}
+
+fn run_wsl_with_timeout(distro: &str, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let mut command = background_command("wsl.exe");
+    command
         .arg("--distribution")
         .arg(distro)
         .arg("--")
-        .args(args)
-        .output()
-        .map_err(|error| format!("无法调用 WSL {distro}：{error}"))
+        .args(args);
+    command_output_with_timeout(command, timeout, &format!("WSL {distro}"))
 }
 
 fn wsl_shell(distro: &str, script: &str) -> Result<Output, String> {
@@ -307,40 +487,11 @@ fn legacy_windows_bridge_pid() -> Option<u32> {
              if($p.CommandLine -match 'proxy\\.py'){{$c.OwningProcess}}}}}}",
         escaped_root
     );
-    background_command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
+    let mut command = background_command("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    command_output_with_timeout(command, Duration::from_secs(5), "旧版 Bridge 检查")
         .ok()
         .and_then(|output| parse_first_pid(&output_text(&output)))
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn wsl_command_success(distro: &str, script: &str) -> bool {
-    wsl_shell(distro, script)
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn wsl_port_listening(distro: &str, port: u16) -> bool {
-    let script = format!("ss -ltn 2>/dev/null | grep -q ':{} '", port);
-    wsl_command_success(distro, &script)
-}
-
-fn wsl_bridge_health_ok(distro: &str) -> bool {
-    wsl_command_success(
-        distro,
-        "curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1",
-    )
-}
-
-fn wsl_service_active(distro: &str) -> bool {
-    wsl_command_success(
-        distro,
-        "systemctl --user is-active --quiet claude-science-bridge.service",
-    )
 }
 
 fn windows_path_to_wsl(distro: &str, path: &Path) -> Option<String> {
@@ -356,21 +507,127 @@ fn windows_path_to_wsl(distro: &str, path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn bridge_unit_matches_project(distro: &str, project_wsl: &str) -> Option<bool> {
-    if project_wsl.trim().is_empty() {
-        return None;
+fn windows_storage_snapshot(distro: &str) -> WindowsStorageSnapshot {
+    let distro = distro.replace('\'', "''");
+    let settings = settings_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace('\'', "''");
+    let script = r#"
+$distro = '__DISTRO__'
+$settingsPath = '__SETTINGS_PATH__'
+function Normalize-LocalPath([string]$Path) {
+  if (-not $Path) { return '' }
+  $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+  if ($expanded.StartsWith('\\?\')) { return $expanded.Substring(4) }
+  return $expanded
+}
+function Get-DriveSnapshot([string]$Path) {
+  $clean = Normalize-LocalPath $Path
+  if (-not $clean) { return $null }
+  $root = [IO.Path]::GetPathRoot($clean)
+  if (-not $root) { return $null }
+  try {
+    $drive = [IO.DriveInfo]::new($root)
+    return [ordered]@{
+      name = $drive.Name.TrimEnd('\')
+      free_bytes = [int64]$drive.AvailableFreeSpace
     }
-    let script = format!(
-        "systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- {}/proxy.py >/dev/null 2>&1",
-        shell_quote(project_wsl)
-    );
-    Some(wsl_command_success(distro, &script))
+  } catch { return $null }
+}
+$entry = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction SilentlyContinue |
+  ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+  Where-Object { $_.DistributionName -eq $distro } |
+  Select-Object -First 1
+$base = if ($entry) { Normalize-LocalPath ([string]$entry.BasePath) } else { '' }
+$wslDrive = Get-DriveSnapshot $base
+$settingsDrive = Get-DriveSnapshot $settingsPath
+$vhdx = if ($base) { Join-Path $base 'ext4.vhdx' } else { '' }
+$vhdxItem = if ($vhdx -and (Test-Path -LiteralPath $vhdx)) { Get-Item -LiteralPath $vhdx -ErrorAction SilentlyContinue } else { $null }
+[ordered]@{
+  wsl_base_path = if ($base) { $base } else { $null }
+  wsl_drive = if ($wslDrive) { $wslDrive.name } else { $null }
+  wsl_drive_free_bytes = if ($wslDrive) { $wslDrive.free_bytes } else { $null }
+  vhdx_size_bytes = if ($vhdxItem) { [int64]$vhdxItem.Length } else { $null }
+  settings_drive = if ($settingsDrive) { $settingsDrive.name } else { $null }
+  settings_drive_free_bytes = if ($settingsDrive) { $settingsDrive.free_bytes } else { $null }
+} | ConvertTo-Json -Compress
+"#
+    .replace("__DISTRO__", &distro)
+    .replace("__SETTINGS_PATH__", &settings);
+    let mut command = background_command("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let Ok(output) =
+        command_output_with_timeout(command, Duration::from_secs(5), "WSL 存储位置检查")
+    else {
+        return WindowsStorageSnapshot::default();
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(&output_text(&output)) else {
+        return WindowsStorageSnapshot::default();
+    };
+    WindowsStorageSnapshot {
+        wsl_base_path: data
+            .get("wsl_base_path")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        wsl_drive: data
+            .get("wsl_drive")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        wsl_drive_free_bytes: data
+            .get("wsl_drive_free_bytes")
+            .and_then(serde_json::Value::as_u64),
+        vhdx_size_bytes: data
+            .get("vhdx_size_bytes")
+            .and_then(serde_json::Value::as_u64),
+        settings_drive: data
+            .get("settings_drive")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        settings_drive_free_bytes: data
+            .get("settings_drive_free_bytes")
+            .and_then(serde_json::Value::as_u64),
+    }
 }
 
-fn process_pid_any(distro: &str, script: &str) -> Option<u32> {
-    wsl_shell(distro, script)
-        .ok()
-        .and_then(|output| parse_first_pid(&output_text(&output)))
+fn rounded_gb_from_bytes(bytes: u64) -> f64 {
+    ((bytes as f64 / 1024_f64.powi(3)) * 10.0).round() / 10.0
+}
+
+fn rounded_gb_from_kb(kb: u64) -> f64 {
+    ((kb as f64 / 1024_f64.powi(2)) * 10.0).round() / 10.0
+}
+
+fn inspect_wsl_runtime(distro: &str, project_wsl: &str) -> Result<WslProbeReport, String> {
+    let inspect_script = format!(
+        "{}/skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh",
+        project_wsl.trim_end_matches('/')
+    );
+    let project_env = format!("PROJECT_DIR={project_wsl}");
+    let output = run_wsl_with_timeout(
+        distro,
+        &[
+            "env",
+            &project_env,
+            "PROXY_PORT=9876",
+            "bash",
+            &inspect_script,
+            project_wsl,
+        ],
+        Duration::from_secs(8),
+    )?;
+    if !output.status.success() {
+        return Err(format!("WSL 只读体检失败：{}", command_error_text(&output)));
+    }
+    let text = output_text(&output);
+    let json = text
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| "WSL 只读体检没有返回 JSON 结果".to_string())?;
+    serde_json::from_str(json).map_err(|error| format!("WSL 体检结果解析失败：{error}"))
 }
 
 fn current_status() -> SystemStatus {
@@ -393,6 +650,16 @@ fn current_status() -> SystemStatus {
                 runtime_ready: false,
                 source_binary_present: false,
                 bridge_venv_present: false,
+                wsl_storage_path: None,
+                wsl_storage_drive: None,
+                wsl_storage_free_gb: None,
+                wsl_vhdx_size_gb: None,
+                wsl_root_free_gb: None,
+                settings_storage_drive: None,
+                settings_storage_free_gb: None,
+                storage_warning: false,
+                storage_blocked: false,
+                restart_blocked: false,
                 warnings,
             };
         }
@@ -414,6 +681,16 @@ fn current_status() -> SystemStatus {
             runtime_ready: false,
             source_binary_present: false,
             bridge_venv_present: false,
+            wsl_storage_path: None,
+            wsl_storage_drive: None,
+            wsl_storage_free_gb: None,
+            wsl_vhdx_size_gb: None,
+            wsl_root_free_gb: None,
+            settings_storage_drive: None,
+            settings_storage_free_gb: None,
+            storage_warning: false,
+            storage_blocked: false,
+            restart_blocked: false,
             warnings,
         };
     };
@@ -421,50 +698,117 @@ fn current_status() -> SystemStatus {
     if !distro.eq_ignore_ascii_case("Ubuntu-24.04") {
         warnings.push(format!("推荐使用 Ubuntu-24.04；当前兼容使用 {}。", distro));
     }
-
-    let linux_user = run_wsl(&distro, &["id", "-un"])
-        .ok()
-        .map(|output| output_text(&output))
-        .filter(|text| !text.is_empty());
-    let bridge_pid = process_pid_any(
-        &distro,
-        "ps -eo pid=,args= | awk '/python/ && /proxy.py/ && !/awk/ {print $1; exit}'",
-    );
-    let claude_pid = process_pid_any(
-        &distro,
-        "ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1; exit}'",
-    );
-    let source_binary_present =
-        wsl_path_exists(
-            &distro,
-            "$HOME/.local/share/claude-science-api-bridge/bin/claude-science",
-            true,
-        ) || wsl_path_exists(&distro, "$HOME/.local/bin/claude-science", true);
-    let bridge_venv_present = wsl_path_exists(
-        &distro,
-        "$HOME/.local/share/claude-science-api-bridge/venv/bin/python",
-        true,
-    );
+    let windows_storage = windows_storage_snapshot(&distro);
+    let wsl_storage_free_gb = windows_storage
+        .wsl_drive_free_bytes
+        .map(rounded_gb_from_bytes);
+    let wsl_vhdx_size_gb = windows_storage.vhdx_size_bytes.map(rounded_gb_from_bytes);
+    let settings_storage_free_gb = windows_storage
+        .settings_drive_free_bytes
+        .map(rounded_gb_from_bytes);
     let project_files_present = project_runtime_files_present();
-    let runtime_ready = source_binary_present && bridge_venv_present && project_files_present;
-    let bridge_healthy = wsl_bridge_health_ok(&distro);
-    let bridge_service_active = wsl_service_active(&distro);
-    let bridge_port_listening = wsl_port_listening(&distro, 9876);
-    let claude_port_listening =
-        wsl_port_listening(&distro, 8765) || wsl_port_listening(&distro, 8766);
     let project_wsl = project_root()
         .ok()
         .and_then(|root| windows_path_to_wsl(&distro, &root));
-    let unit_matches_project = project_wsl
+    let probe = project_wsl
         .as_deref()
-        .and_then(|path| bridge_unit_matches_project(&distro, path));
-    let bridge_running =
-        bridge_pid.is_some() || bridge_healthy || bridge_service_active || bridge_port_listening;
-    let claude_running = claude_pid.is_some() || claude_port_listening;
+        .ok_or_else(|| "无法把当前 CSA 目录转换为 WSL 路径".to_string())
+        .and_then(|path| inspect_wsl_runtime(&distro, path));
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(error) => {
+            let storage_blocked = wsl_storage_free_gb.map(|free| free < 1.0).unwrap_or(false)
+                || settings_storage_free_gb
+                    .map(|free| free < 1.0)
+                    .unwrap_or(false);
+            warnings.push(format!(
+                "{error}。启动器已停止后续探测：若 WSL 本身无响应，请检查宿主盘空间与 VHDX；若体检脚本缺失，请重新解压完整 Release ZIP。"
+            ));
+            return SystemStatus {
+                state: "degraded".into(),
+                wsl_installed: true,
+                distro: Some(distro),
+                linux_user: None,
+                bridge_running: false,
+                bridge_pid: None,
+                claude_running: false,
+                claude_pid: None,
+                bridge_healthy: false,
+                windows_bridge_pid: None,
+                runtime_ready: false,
+                source_binary_present: false,
+                bridge_venv_present: false,
+                wsl_storage_path: windows_storage.wsl_base_path,
+                wsl_storage_drive: windows_storage.wsl_drive,
+                wsl_storage_free_gb,
+                wsl_vhdx_size_gb,
+                wsl_root_free_gb: None,
+                settings_storage_drive: windows_storage.settings_drive,
+                settings_storage_free_gb,
+                storage_warning: storage_blocked,
+                storage_blocked,
+                restart_blocked: true,
+                warnings,
+            };
+        }
+    };
+
+    let linux_user = (!probe.wsl.user.trim().is_empty()).then_some(probe.wsl.user);
+    let source_binary_present = probe.components.source_binary;
+    let bridge_venv_present = probe.components.bridge_venv;
+    let wsl_runtime_writable = probe.components.tmp_writable && probe.components.home_writable;
+    let runtime_ready = source_binary_present
+        && bridge_venv_present
+        && project_files_present
+        && wsl_runtime_writable
+        && !probe.storage.root_read_only;
+    let bridge_pid = probe.runtime.bridge_pid;
+    let claude_pid = probe.runtime.claude_pid;
+    let bridge_healthy = probe.runtime.bridge_healthy;
+    let bridge_running = bridge_pid.is_some()
+        || probe.runtime.bridge_health_responding
+        || probe.runtime.bridge_service_active
+        || probe.runtime.port_9876;
+    let claude_running = claude_pid.is_some() || probe.runtime.port_8765 || probe.runtime.port_8766;
+    let unit_matches_project = probe.runtime.unit_matches_project;
+    let wsl_root_free_gb = probe.storage.root_free_kb.map(rounded_gb_from_kb);
+    let root_free_ratio = probe
+        .storage
+        .root_total_kb
+        .zip(probe.storage.root_free_kb)
+        .filter(|(total, _)| *total > 0)
+        .map(|(total, free)| free as f64 / total as f64);
+    let inode_free_ratio = probe
+        .storage
+        .root_inode_total
+        .zip(probe.storage.root_inode_free)
+        .filter(|(total, _)| *total > 0)
+        .map(|(total, free)| free as f64 / total as f64);
+    let storage_blocked = probe.storage.root_read_only
+        || !wsl_runtime_writable
+        || wsl_storage_free_gb.map(|free| free < 1.0).unwrap_or(false)
+        || wsl_root_free_gb.map(|free| free < 1.0).unwrap_or(false)
+        || settings_storage_free_gb
+            .map(|free| free < 1.0)
+            .unwrap_or(false)
+        || root_free_ratio.map(|ratio| ratio < 0.01).unwrap_or(false)
+        || inode_free_ratio.map(|ratio| ratio < 0.01).unwrap_or(false);
+    let storage_warning = storage_blocked
+        || wsl_storage_free_gb.map(|free| free < 15.0).unwrap_or(false)
+        || wsl_root_free_gb.map(|free| free < 15.0).unwrap_or(false)
+        || settings_storage_free_gb
+            .map(|free| free < 10.0)
+            .unwrap_or(false)
+        || root_free_ratio.map(|ratio| ratio < 0.10).unwrap_or(false)
+        || inode_free_ratio.map(|ratio| ratio < 0.05).unwrap_or(false);
+    let restart_blocked = storage_blocked;
     let windows_bridge_pid = legacy_windows_bridge_pid();
 
-    if bridge_running && !bridge_healthy {
+    if bridge_running && !probe.runtime.bridge_health_responding {
         warnings.push("Bridge process/service/port exists, but health check failed.".into());
+    }
+    if probe.runtime.bridge_health_responding && !bridge_healthy {
+        warnings.push("Port 9876 is answered by a Bridge from another or older CSA package directory; restart from this package to migrate it.".into());
     }
     if bridge_running && !claude_running {
         warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
@@ -473,9 +817,6 @@ fn current_status() -> SystemStatus {
         warnings.push("WSL Bridge service points to a different package directory; run the repair flow to re-register the current CSA folder.".into());
     }
 
-    if bridge_pid.is_some() && !bridge_healthy {
-        warnings.push("Bridge 进程存在，但健康检查失败".into());
-    }
     if bridge_pid.is_some() && claude_pid.is_none() {
         warnings.push("Bridge 正在运行，但 Claude Science 尚未启动".into());
     }
@@ -497,12 +838,65 @@ fn current_status() -> SystemStatus {
         );
     }
 
-    let state = if !runtime_ready && !bridge_running && !claude_running {
+    if probe.storage.root_read_only {
+        warnings.push(
+            "WSL root filesystem is mounted read-only. Do not restart or repair CSA until the host disk and WSL VHDX are healthy.".into(),
+        );
+    }
+    if let Some(free) = wsl_storage_free_gb.filter(|free| *free < 15.0) {
+        let location = windows_storage
+            .wsl_base_path
+            .as_deref()
+            .unwrap_or("unknown WSL storage path");
+        warnings.push(format!(
+            "WSL virtual disk host volume has only {free:.1} GB free ({location}). Free space before running large experiments."
+        ));
+    }
+    if let Some(free) = wsl_root_free_gb.filter(|free| *free < 15.0) {
+        warnings.push(format!(
+            "WSL Linux root filesystem has only {free:.1} GB free. Move datasets/results to a suitable data volume or clean them before continuing."
+        ));
+    }
+    if let Some(free) = settings_storage_free_gb.filter(|free| *free < 10.0) {
+        let drive = windows_storage
+            .settings_drive
+            .as_deref()
+            .unwrap_or("Windows settings drive");
+        warnings.push(format!(
+            "Windows settings drive {drive} has only {free:.1} GB free. API Key switching can fail if this drive becomes full."
+        ));
+    }
+    if inode_free_ratio.map(|ratio| ratio < 0.05).unwrap_or(false) {
+        warnings.push("WSL root filesystem is running low on free inodes; a large number of small experiment files can prevent new files even when GB remain.".into());
+    }
+    if probe
+        .storage
+        .bridge_log_bytes
+        .map(|bytes| bytes > 50 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        warnings.push("Bridge log exceeds 50 MB and will be rotated on the next CSA start.".into());
+    }
+
+    if !probe.components.tmp_writable {
+        warnings.push(
+            "WSL temporary directory is read-only or not writable. Claude Science needs /tmp to create runtime files. Run `wsl --shutdown`, reopen Ubuntu, then retry; if it remains read-only, repair or recreate the WSL distro.".into(),
+        );
+    }
+    if !probe.components.home_writable {
+        warnings.push(
+            "WSL user home is read-only or not writable. CSA cannot update logs, runtime files, or Bridge configuration until the WSL distro is repaired.".into(),
+        );
+    }
+
+    let state = if bridge_healthy && claude_running && unit_matches_project != Some(false) {
+        "running"
+    } else if storage_blocked || !wsl_runtime_writable {
+        "degraded"
+    } else if !runtime_ready && !bridge_running && !claude_running {
         "notInstalled"
     } else if bridge_running && windows_bridge_pid.is_some() {
         "degraded"
-    } else if bridge_healthy && claude_running && unit_matches_project != Some(false) {
-        "running"
     } else if bridge_running || claude_running {
         "degraded"
     } else {
@@ -523,17 +917,18 @@ fn current_status() -> SystemStatus {
         runtime_ready,
         source_binary_present,
         bridge_venv_present,
+        wsl_storage_path: windows_storage.wsl_base_path,
+        wsl_storage_drive: windows_storage.wsl_drive,
+        wsl_storage_free_gb,
+        wsl_vhdx_size_gb,
+        wsl_root_free_gb,
+        settings_storage_drive: windows_storage.settings_drive,
+        settings_storage_free_gb,
+        storage_warning,
+        storage_blocked,
+        restart_blocked,
         warnings,
     }
-}
-
-fn wsl_path_exists(distro: &str, path: &str, executable: bool) -> bool {
-    let escaped = path.replace('"', "\\\"");
-    let flag = if executable { "-x" } else { "-e" };
-    let script = format!("test {flag} \"{escaped}\"");
-    wsl_shell(distro, &script)
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 fn project_runtime_files_present() -> bool {
@@ -544,6 +939,12 @@ fn project_runtime_files_present() -> bool {
                 && root
                     .join("scripts")
                     .join("start-claude-science-wsl.sh")
+                    .is_file()
+                && root
+                    .join("skills")
+                    .join("bootstrap-claude-science-wsl")
+                    .join("scripts")
+                    .join("inspect-wsl.sh")
                     .is_file()
         })
         .unwrap_or(false)
@@ -592,21 +993,88 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(base.join("ClaudeScienceAssistant").join("settings.json"))
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+struct PreparedAtomicWrite {
+    destination: PathBuf,
+    temporary: PathBuf,
+    committed: bool,
+}
+
+impl PreparedAtomicWrite {
+    fn commit(mut self) -> Result<(), String> {
+        replace_file_atomically(&self.temporary, &self.destination)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedAtomicWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(format!(
+            "无法原子替换配置文件：{}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination).map_err(|error| format!("无法原子替换配置文件：{error}"))
+}
+
+fn prepare_atomic_write(path: &Path, content: &str) -> Result<PreparedAtomicWrite, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "配置路径无父目录".to_string())?;
     fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
-    let tmp = path.with_extension("json.tmp");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!("json.{}.{suffix}.tmp", std::process::id()));
     {
-        let mut file =
-            fs::File::create(&tmp).map_err(|error| format!("无法写入临时配置：{error}"))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|error| format!("无法写入临时配置：{error}"))?;
         file.write_all(content.as_bytes())
             .map_err(|error| format!("无法写入配置内容：{error}"))?;
         file.sync_all()
             .map_err(|error| format!("无法同步配置：{error}"))?;
     }
-    fs::rename(&tmp, path).map_err(|error| format!("无法替换配置文件：{error}"))
+    Ok(PreparedAtomicWrite {
+        destination: path.to_path_buf(),
+        temporary: tmp,
+        committed: false,
+    })
 }
 
 fn provider_catalog() -> Vec<ProviderCatalogGroup> {
@@ -648,11 +1116,11 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
                 ProviderPreset {
                     id: "minimax".into(),
                     name: "MiniMax".into(),
-                    meta: "Official API / Anthropic compatible".into(),
-                    badge: "瀹樻柟".into(),
+                    meta: "中国区官方 API / Anthropic 兼容".into(),
+                    badge: "官方".into(),
                     trust: "official".into(),
                     protocol: "anthropic-compatible".into(),
-                    base_url: Some("https://api.minimax.io/anthropic".into()),
+                    base_url: Some("https://api.minimaxi.com/anthropic".into()),
                     default_model: None,
                 },
                 ProviderPreset {
@@ -704,14 +1172,14 @@ fn provider_catalog() -> Vec<ProviderCatalogGroup> {
             ],
         },
         ProviderCatalogGroup {
-            title: "第三方中转".into(),
+            title: "中转服务".into(),
             tier: "custom".into(),
             providers: vec![
                 ProviderPreset {
                     id: "builtin-relay".into(),
-                    name: "内置中转".into(),
-                    meta: "10521052.xyz/v1".into(),
-                    badge: "中转".into(),
+                    name: "项目方自建中转".into(),
+                    meta: "10521052.xyz/v1 · 非模型厂商官方 API".into(),
+                    badge: "自建".into(),
                     trust: "untrusted-builtin".into(),
                     protocol: "openai-compatible".into(),
                     base_url: Some("https://10521052.xyz/v1".into()),
@@ -781,8 +1249,11 @@ fn launcher_state(settings: &LauncherSettings) -> LauncherState {
 }
 
 fn run_powershell_with_stdin(script: &str, input: &str) -> Result<String, String> {
+    let script = format!(
+        "$utf8=New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $OutputEncoding=$utf8; {script}"
+    );
     let mut child = background_command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -834,6 +1305,73 @@ fn next_api_key_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("key-{nanos}-{}", std::process::id())
+}
+
+#[cfg(windows)]
+fn current_local_date() -> String {
+    let mut value = WindowsSystemTime::default();
+    unsafe { GetLocalTime(&mut value) };
+    format!("{:04}-{:02}-{:02}", value.year, value.month, value.day)
+}
+
+#[cfg(not(windows))]
+fn current_local_date() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64 / 86_400)
+        .unwrap_or_default();
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn validate_display_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.chars().any(char::is_control) {
+        return Err("中转名称不能包含控制字符".into());
+    }
+    if trimmed.chars().count() > 80 {
+        return Err("中转名称不能超过 80 个字符".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn custom_relay_label_for_date(
+    settings: &LauncherSettings,
+    requested_name: &str,
+    date: &str,
+) -> Result<String, String> {
+    let requested_name = validate_display_name(requested_name)?;
+    if !requested_name.is_empty() {
+        return Ok(requested_name);
+    }
+    let prefix = format!("自定义中转 {date} #");
+    let highest = settings
+        .api_keys
+        .iter()
+        .filter(|entry| entry.provider_id == "custom")
+        .filter_map(|entry| entry.label.strip_prefix(&prefix))
+        .filter_map(|sequence| sequence.parse::<u32>().ok())
+        .max()
+        .unwrap_or_default();
+    Ok(format!("{prefix}{:02}", highest.saturating_add(1)))
+}
+
+fn custom_relay_label(settings: &LauncherSettings, requested_name: &str) -> Result<String, String> {
+    custom_relay_label_for_date(settings, requested_name, &current_local_date())
 }
 
 fn validate_base_url(value: &str) -> Result<String, String> {
@@ -895,7 +1433,7 @@ fn runtime_profile_for_provider(
             label: provider.name,
             backend: "custom",
             api_key_field: "custom_api_key",
-            base_url: "https://api.minimax.io/anthropic".into(),
+            base_url: "https://api.minimaxi.com/anthropic".into(),
             upstream_mode: "anthropic",
             default_model: String::new(),
             default_fast_model: String::new(),
@@ -969,6 +1507,23 @@ fn runtime_profile_for_provider(
         _ => return Err("未知 Provider".into()),
     };
     Ok(Some(profile))
+}
+
+fn documented_models_for_profile(profile: &BridgeRuntimeProfile) -> Vec<String> {
+    match profile.provider_id.as_str() {
+        "deepseek" => vec!["deepseek-v4-pro".into(), "deepseek-v4-flash".into()],
+        "minimax" => vec![
+            "MiniMax-M3".into(),
+            "MiniMax-M2.7".into(),
+            "MiniMax-M2.7-highspeed".into(),
+            "MiniMax-M2.5".into(),
+            "MiniMax-M2.5-highspeed".into(),
+            "MiniMax-M2.1".into(),
+            "MiniMax-M2.1-highspeed".into(),
+            "MiniMax-M2".into(),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn runtime_profile_for_settings(
@@ -1079,12 +1634,14 @@ fn canonical_model_for_profile(profile: &BridgeRuntimeProfile, model: &str) -> S
     let lower = clean.to_ascii_lowercase();
     match profile.provider_id.as_str() {
         "deepseek" => match lower.as_str() {
-            "deep-chat" | "deepseek-chat" | "deepseek-reasoner" | "deepseek-v4" | "glm-5.2" => {
-                "deepseek-v4-pro".into()
-            }
-            "deepseek-fast" | "deepseek-v4-fast" | "deepseek-v4-flash" => {
-                "deepseek-v4-flash".into()
-            }
+            // Keep official IDs intact. Only repair the user's known speech-input
+            // typo; do not silently turn an unrelated or stale model into a paid
+            // DeepSeek model.
+            "deep-chat" => "deepseek-chat".into(),
+            "deepseek-chat" => "deepseek-chat".into(),
+            "deepseek-reasoner" => "deepseek-reasoner".into(),
+            "deepseek-v4-pro" => "deepseek-v4-pro".into(),
+            "deepseek-v4-flash" => "deepseek-v4-flash".into(),
             _ => clean.to_string(),
         },
         "longcat" => {
@@ -1096,8 +1653,13 @@ fn canonical_model_for_profile(profile: &BridgeRuntimeProfile, model: &str) -> S
         }
         "minimax" => match lower.as_str() {
             "minimax-m3" => "MiniMax-M3".into(),
+            "minimax-m2.7" => "MiniMax-M2.7".into(),
             "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed".into(),
+            "minimax-m2.5" => "MiniMax-M2.5".into(),
             "minimax-m2.5-highspeed" => "MiniMax-M2.5-highspeed".into(),
+            "minimax-m2.1" => "MiniMax-M2.1".into(),
+            "minimax-m2.1-highspeed" => "MiniMax-M2.1-highspeed".into(),
+            "minimax-m2" => "MiniMax-M2".into(),
             _ => clean.to_string(),
         },
         "opencode-go" => {
@@ -1412,7 +1974,7 @@ fn bridge_config_patch_for_runtime_profile(
 
     if aliases.is_empty() {
         patch.insert("model_aliases".into(), serde_json::Value::Array(Vec::new()));
-        patch.insert("model_list_mode".into(), "aliases_first".into());
+        patch.insert("model_list_mode".into(), "aliases".into());
     } else {
         let alias_values = aliases
             .iter()
@@ -1539,57 +2101,67 @@ os.chmod(path, 0o600)
     }
 }
 
-fn restart_bridge_after_config(status: &SystemStatus) -> Result<(), String> {
+fn restart_bridge_after_config(
+    status: &SystemStatus,
+    expected_revision: Option<&str>,
+) -> Result<(), String> {
     if !status.bridge_running {
         return Ok(());
     }
     let Some(distro) = status.distro.as_deref() else {
         return Ok(());
     };
-    let restart_output = run_wsl(
+    let project_wsl = project_root()
+        .ok()
+        .and_then(|root| windows_path_to_wsl(distro, &root))
+        .ok_or_else(|| "Bridge 配置已写入，但无法定位当前 CSA 的 WSL 启动脚本".to_string())?;
+    let start_script = format!(
+        "{}/scripts/start-claude-science-wsl.sh",
+        project_wsl.trim_end_matches('/')
+    );
+    let restart_output = run_wsl_with_timeout(
         distro,
         &[
-            "systemctl",
-            "--user",
-            "restart",
-            "claude-science-bridge.service",
+            "env",
+            "CSA_FORCE_RESTART=1",
+            "PROXY_PORT=9876",
+            "bash",
+            &start_script,
         ],
+        Duration::from_secs(45),
     )?;
     if !restart_output.status.success() {
-        eprintln!(
-            "CSA Bridge config was written; systemd restart failed and will be retried on next start: {}",
+        return Err(format!(
+            "Bridge 配置已写入，但重启失败：{}",
             command_error_text(&restart_output)
-        );
-        return Ok(());
+        ));
     }
-
-    let health_script = r#"
-import sys
-import time
-import urllib.error
-import urllib.request
-
-last_error = ""
-for _ in range(20):
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:9876/health", timeout=1) as response:
-            if response.status == 200:
-                sys.exit(0)
-            last_error = f"HTTP {response.status}"
-    except Exception as error:
-        last_error = str(error)
-    time.sleep(0.5)
-
-print(last_error or "health endpoint did not become ready", file=sys.stderr)
-sys.exit(1)
-"#;
-    let health_output = run_wsl(distro, &["python3", "-c", health_script])?;
-    if !health_output.status.success() {
-        eprintln!(
-            "CSA Bridge config was written; health check did not become ready and will be retried on next start: {}",
-            command_error_text(&health_output)
-        );
-        return Ok(());
+    if let Some(expected_revision) = expected_revision {
+        let health_output = run_wsl(
+            distro,
+            &[
+                "curl",
+                "-fsS",
+                "--connect-timeout",
+                "0.4",
+                "--max-time",
+                "2",
+                "http://127.0.0.1:9876/health",
+            ],
+        )?;
+        let health = serde_json::from_str::<serde_json::Value>(&output_text(&health_output))
+            .map_err(|error| format!("Bridge 已重启，但健康结果无法解析：{error}"))?;
+        let actual_revision = health
+            .get("config_revision")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let source_path = health
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if actual_revision != expected_revision || source_path.is_empty() {
+            return Err("Bridge 已响应，但仍未加载刚保存的配置或不是当前 CSA 实例".into());
+        }
     }
     Ok(())
 }
@@ -1637,18 +2209,39 @@ fn percent_encode_path_segment(value: &str) -> String {
         .collect()
 }
 
-fn apply_bridge_config_patch_value(patch: serde_json::Value) -> Result<(), String> {
+fn apply_bridge_config_patch_value(
+    mut patch: serde_json::Value,
+) -> Result<AppliedBridgeConfig, String> {
     let status = current_status();
+    if status.restart_blocked {
+        return Err("当前诊断不允许写入 API Key/模型配置；请先处理磁盘、WSL 或安装包问题".into());
+    }
     let Some(distro) = status.distro.as_deref() else {
         return Err("未检测到可用 WSL 发行版，暂不能应用 Provider 配置".into());
     };
+    let revision = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let object = patch
+        .as_object_mut()
+        .ok_or_else(|| "Bridge 配置补丁格式无效".to_string())?;
+    object.insert("_csa_revision".into(), revision.clone().into());
     let rollback = write_bridge_config_patch(distro, &patch)?;
-    match restart_bridge_after_config(&status) {
-        Ok(()) => Ok(()),
+    match restart_bridge_after_config(&status, Some(&revision)) {
+        Ok(()) => Ok(AppliedBridgeConfig {
+            distro: distro.to_string(),
+            rollback,
+            previous_status: status,
+        }),
         Err(error) => {
             let rollback_message = match restore_bridge_config(distro, &rollback) {
                 Ok(()) => {
-                    let _ = restart_bridge_after_config(&status);
+                    let _ = restart_bridge_after_config(&status, None);
                     "已回滚 Bridge 配置".to_string()
                 }
                 Err(rollback_error) => format!("回滚失败：{rollback_error}"),
@@ -1658,11 +2251,9 @@ fn apply_bridge_config_patch_value(patch: serde_json::Value) -> Result<(), Strin
     }
 }
 
-fn apply_bridge_provider_config(settings: &LauncherSettings) -> Result<(), String> {
-    let Some(patch) = bridge_config_patch_for_provider(settings)? else {
-        return Ok(());
-    };
-    apply_bridge_config_patch_value(patch)
+fn rollback_applied_bridge(applied: &AppliedBridgeConfig) -> Result<(), String> {
+    restore_bridge_config(&applied.distro, &applied.rollback)?;
+    restart_bridge_after_config(&applied.previous_status, None)
 }
 
 fn bridge_config_patch_for_api_key(
@@ -1731,7 +2322,7 @@ fn test_api_key_impl(
     let provider =
         provider_by_id(&selected_provider_id).ok_or_else(|| "未知 API Key 服务商".to_string())?;
     if provider.trust.starts_with("untrusted") && !custom_confirmed {
-        return Err("第三方中转需要先确认域名后再测试，避免 API Key 发到错误地址。".into());
+        return Err("中转服务需要先确认域名后再测试，避免 API Key 发到错误地址。".into());
     }
     let Some(profile) =
         runtime_profile_for_provider(&selected_provider_id, &custom_base_url, custom_confirmed)?
@@ -1753,7 +2344,10 @@ fn test_api_key_impl(
         "upstream_mode": profile.upstream_mode,
         "model": model.trim(),
         "default_model": profile.default_model,
-        "prompt": clean_prompt
+        "documented_models": documented_models_for_profile(&profile),
+        "prompt": clean_prompt,
+        "initial_max_tokens": API_KEY_TEST_INITIAL_MAX_TOKENS,
+        "retry_max_tokens": API_KEY_TEST_RETRY_MAX_TOKENS
     });
     let script = r#"
 $ErrorActionPreference = "Stop"
@@ -1765,7 +2359,14 @@ $baseUrl = ([string]$req.base_url).Trim().TrimEnd("/")
 $upstreamMode = ([string]$req.upstream_mode).Trim().ToLowerInvariant()
 $requestedModel = ([string]$req.model).Trim()
 $defaultModel = ([string]$req.default_model).Trim()
+$documentedModels = @($req.documented_models | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
 $prompt = ([string]$req.prompt).Trim()
+$initialMaxTokens = [int]$req.initial_max_tokens
+$retryMaxTokens = [int]$req.retry_max_tokens
+if ($initialMaxTokens -lt 64) { $initialMaxTokens = 64 }
+if ($retryMaxTokens -lt $initialMaxTokens) { $retryMaxTokens = $initialMaxTokens }
+$testBudgets = @($initialMaxTokens)
+if ($retryMaxTokens -gt $initialMaxTokens) { $testBudgets += $retryMaxTokens }
 if (-not $prompt) { $prompt = "Reply only: OK" }
 
 function Redact([string]$text) {
@@ -1833,12 +2434,14 @@ if ($upstreamMode -eq "anthropic") {
     $modelResp = Invoke-RestMethod -Method Get -Uri "$anthropicBase/models" -Headers $headers -TimeoutSec 12
     $models = @($modelResp.data | ForEach-Object { $_.id } | Where-Object { $_ })
   } catch {}
+  $usedDocumentedModels = $false
+  if ($models.Count -eq 0 -and $documentedModels.Count -gt 0) {
+    $models = @($documentedModels)
+    $usedDocumentedModels = $true
+  }
   $candidates = New-Object System.Collections.Generic.List[string]
   foreach ($item in @($requestedModel, $defaultModel)) {
     if ($item -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
-  }
-  foreach ($item in @("deepseek-v4-pro", "deepseek-v4-flash", "MiniMax-M3", "LongCat-2.0", "claude-3-5-haiku-latest")) {
-    if ($item -and ($models -contains $item) -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
   }
   foreach ($item in $models) {
     if ($item -and -not $candidates.Contains($item)) { [void]$candidates.Add($item) }
@@ -1849,23 +2452,32 @@ if ($upstreamMode -eq "anthropic") {
   }
   $lastError = ""
   foreach ($candidate in $candidates) {
-    $body = @{
-      model = $candidate
-      max_tokens = 8
-      messages = @(@{ role = "user"; content = $prompt })
-    } | ConvertTo-Json -Depth 8 -Compress
-    try {
-      $chat = Invoke-RestMethod -Method Post -Uri "$anthropicBase/messages" -Headers $headers -Body $body -TimeoutSec 18
-      $reply = ""
-      foreach ($part in @($chat.content)) {
-        if ($part.type -eq "text") { $reply += [string]$part.text }
+    foreach ($budget in $testBudgets) {
+      $body = @{
+        model = $candidate
+        max_tokens = $budget
+        messages = @(@{ role = "user"; content = $prompt })
+      } | ConvertTo-Json -Depth 8 -Compress
+      try {
+        $chat = Invoke-RestMethod -Method Post -Uri "$anthropicBase/messages" -Headers $headers -Body $body -TimeoutSec 45
+        $reply = ""
+        foreach ($part in @($chat.content)) {
+          if ($part.type -eq "text") { $reply += [string]$part.text }
+        }
+        if ($reply -and $reply.Trim()) {
+          $successMessage = if ($usedDocumentedModels) {
+            "连接成功；模型列表接口不可用，本次使用官方文档已核验模型完成测试。"
+          } else {
+            "连接成功。"
+          }
+          Emit $true $candidate $reply $models $successMessage
+        }
+        $lastError = "HTTP 200，但模型在 $budget tokens 内没有返回正文：" + $candidate
+        if ([string]$chat.stop_reason -ne "max_tokens") { break }
+      } catch {
+        $lastError = ShortError $_
+        break
       }
-      if ($reply -and $reply.Trim()) {
-        Emit $true $candidate $reply $models "连通成功。"
-      }
-      $lastError = "HTTP 200，但模型返回空内容：" + $candidate
-    } catch {
-      $lastError = ShortError $_
     }
   }
   Emit $false "" "" $models ("模型列表可访问，但对话测试失败：" + $lastError)
@@ -1881,39 +2493,24 @@ try {
   $models = @($modelResp.data | ForEach-Object { $_.id } | Where-Object { $_ })
 } catch {
   $last = ShortError $_
-  if (-not $requestedModel -and -not $defaultModel) {
+  if (-not $requestedModel -and -not $defaultModel -and $documentedModels.Count -eq 0) {
     Emit $false "" "" @() ("无法读取模型列表：" + $last)
   }
+}
+
+$usedDocumentedModels = $false
+if ($models.Count -eq 0 -and $documentedModels.Count -gt 0) {
+  $models = @($documentedModels)
+  $usedDocumentedModels = $true
 }
 
 if ($models.Count -eq 0 -and -not $requestedModel -and -not $defaultModel) {
   Emit $false "" "" @() "No manual model was provided and no testable model was returned by /models. Please fill a model ID or confirm the provider supports /models."
 }
 
-$preferred = @(
-  $requestedModel,
-  $defaultModel,
-  "glm-5.2",
-  "qwen3.7-max",
-  "deepseek-v4-pro",
-  "deepseek-v4-flash",
-  "grok-4.20-fast",
-  "LongCat-2.0",
-  "gpt-4o-mini",
-  "gpt-4.1-mini",
-  "glm-4.5",
-  "glm-4.5-air",
-  "step-router-v1",
-  "deepseek-ai/deepseek-v3.2",
-  "deepseek-ai/deepseek-v3.1-terminus",
-  "MiniMax-M3",
-  "MiniMax-M2.7-highspeed",
-  "minimax-m2.7",
-  "minimax-m2"
-)
 $candidates = New-Object System.Collections.Generic.List[string]
-foreach ($item in $preferred) {
-  if ($item -and (($item -eq $requestedModel) -or ($item -eq $defaultModel) -or ($models -contains $item)) -and -not $candidates.Contains($item)) {
+foreach ($item in @($requestedModel, $defaultModel)) {
+  if ($item -and -not $candidates.Contains($item)) {
     [void]$candidates.Add($item)
   }
 }
@@ -1924,22 +2521,33 @@ foreach ($item in $models) {
 
 $lastError = ""
 foreach ($candidate in $candidates) {
-  $body = @{
-    model = $candidate
-    messages = @(@{ role = "user"; content = $prompt })
-    max_tokens = 8
-    temperature = 0
-    stream = $false
-  } | ConvertTo-Json -Depth 8 -Compress
-  try {
-    $chat = Invoke-RestMethod -Method Post -Uri "$openaiBase/chat/completions" -Headers $headers -Body $body -TimeoutSec 18
-    $reply = [string]$chat.choices[0].message.content
+  foreach ($budget in $testBudgets) {
+    $body = @{
+      model = $candidate
+      messages = @(@{ role = "user"; content = $prompt })
+      max_tokens = $budget
+      temperature = 0
+      stream = $false
+    } | ConvertTo-Json -Depth 8 -Compress
+    try {
+      $chat = Invoke-RestMethod -Method Post -Uri "$openaiBase/chat/completions" -Headers $headers -Body $body -TimeoutSec 45
+      $reply = [string]$chat.choices[0].message.content
     if ($reply -and $reply.Trim()) {
-      Emit $true $candidate $reply $models "连通成功。"
+      $successMessage = if ($usedDocumentedModels) {
+        "连接成功；模型列表接口不可用，本次使用官方文档已核验模型完成测试。"
+      } else {
+        "连接成功。"
+      }
+      Emit $true $candidate $reply $models $successMessage
+      }
+      $reasoning = [string]$chat.choices[0].message.reasoning_content
+      $finishReason = [string]$chat.choices[0].finish_reason
+      $lastError = "HTTP 200，但模型在 $budget tokens 内没有返回正文：" + $candidate
+      if ($finishReason -ne "length" -and -not $reasoning) { break }
+    } catch {
+      $lastError = ShortError $_
+      break
     }
-    $lastError = "HTTP 200，但模型返回空内容：" + $candidate
-  } catch {
-    $lastError = ShortError $_
   }
 }
 
@@ -1992,7 +2600,7 @@ fn auto_map_api_key_impl(
     let provider =
         provider_by_id(&selected_provider_id).ok_or_else(|| "未知 API Key 服务商".to_string())?;
     if provider.trust.starts_with("untrusted") && !custom_confirmed {
-        return Err("第三方中转需要先确认域名后再自动映射，避免 API Key 发到错误地址。".into());
+        return Err("中转服务需要先确认域名后再自动映射，避免 API Key 发到错误地址。".into());
     }
     let Some(profile) =
         runtime_profile_for_provider(&selected_provider_id, &custom_base_url, custom_confirmed)?
@@ -2009,6 +2617,7 @@ fn auto_map_api_key_impl(
         "api_key": clean_key,
         "base_url": profile.base_url.clone(),
         "upstream_mode": profile.upstream_mode,
+        "documented_models": documented_models_for_profile(&profile),
     });
     let script = r#"
 $ErrorActionPreference = "Stop"
@@ -2017,6 +2626,7 @@ $req = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $apiKey = [string]$req.api_key
 $baseUrl = ([string]$req.base_url).Trim().TrimEnd("/")
 $upstreamMode = ([string]$req.upstream_mode).Trim().ToLowerInvariant()
+$documentedModels = @($req.documented_models | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
 
 function Redact([string]$text) {
   if (-not $text) { return "" }
@@ -2075,8 +2685,15 @@ if ($upstreamMode -eq "anthropic") {
   try {
     $modelResp = Invoke-RestMethod -Method Get -Uri "$anthropicBase/models" -Headers $headers -TimeoutSec 12
     $models = @($modelResp.data | ForEach-Object { $_.id } | Where-Object { $_ })
-    Emit $models "模型列表读取成功。"
+    if ($models.Count -gt 0) { Emit $models "模型列表读取成功。" }
+    if ($documentedModels.Count -gt 0) {
+      Emit $documentedModels "模型列表接口未返回模型，已使用官方文档已核验模型。"
+    }
+    Emit @() "模型列表接口未返回模型；请手动填写模型 ID。"
   } catch {
+    if ($documentedModels.Count -gt 0) {
+      Emit $documentedModels "模型列表接口不可用，已使用官方文档已核验模型。"
+    }
     Emit @() (ShortError $_)
   }
 }
@@ -2089,8 +2706,15 @@ $headers = @{
 try {
   $modelResp = Invoke-RestMethod -Method Get -Uri "$openaiBase/models" -Headers $headers -TimeoutSec 12
   $models = @($modelResp.data | ForEach-Object { $_.id } | Where-Object { $_ })
-  Emit $models "模型列表读取成功。"
+  if ($models.Count -gt 0) { Emit $models "模型列表读取成功。" }
+  if ($documentedModels.Count -gt 0) {
+    Emit $documentedModels "模型列表接口未返回模型，已使用官方文档已核验模型。"
+  }
+  Emit @() "模型列表接口未返回模型；请手动填写模型 ID。"
 } catch {
+  if ($documentedModels.Count -gt 0) {
+    Emit $documentedModels "模型列表接口不可用，已使用官方文档已核验模型。"
+  }
   Emit @() (ShortError $_)
 }
 "#;
@@ -2167,10 +2791,44 @@ async fn auto_map_api_key(
     .await
 }
 
-fn persist_launcher_settings(settings: &LauncherSettings) -> Result<(), String> {
+fn launcher_settings_body(settings: &LauncherSettings) -> Result<String, String> {
     let body = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("无法序列化配置：{error}"))?;
-    atomic_write(&settings_path()?, &(body + "\n"))
+    Ok(body + "\n")
+}
+
+fn prepare_launcher_settings(settings: &LauncherSettings) -> Result<PreparedAtomicWrite, String> {
+    prepare_atomic_write(&settings_path()?, &launcher_settings_body(settings)?)
+}
+
+fn persist_launcher_settings(settings: &LauncherSettings) -> Result<(), String> {
+    prepare_launcher_settings(settings)?.commit()
+}
+
+fn commit_launcher_settings_with_bridge(
+    settings: &LauncherSettings,
+    patch: Option<serde_json::Value>,
+) -> Result<(), String> {
+    // Pre-write and fsync Windows settings before touching WSL. This catches a
+    // full APPDATA drive without leaving Bridge on a different active Key.
+    let prepared_settings = prepare_launcher_settings(settings)?;
+    let applied_bridge = match patch {
+        Some(patch) => Some(apply_bridge_config_patch_value(patch)?),
+        None => None,
+    };
+    if let Err(settings_error) = prepared_settings.commit() {
+        let rollback_message = match applied_bridge.as_ref() {
+            Some(applied) => match rollback_applied_bridge(applied) {
+                Ok(()) => "Bridge 已恢复到切换前配置".to_string(),
+                Err(error) => format!("Bridge 回滚失败：{error}"),
+            },
+            None => "Bridge 未发生改动".to_string(),
+        };
+        return Err(format!(
+            "Windows 启动器配置提交失败：{settings_error}；{rollback_message}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2199,8 +2857,8 @@ fn save_provider_selection_impl(
     settings.custom_base_url = validate_base_url(&custom_base_url)?;
     settings.custom_confirmed = custom_confirmed;
     settings.active_api_key_id = None;
-    apply_bridge_provider_config(&settings)?;
-    persist_launcher_settings(&settings)?;
+    let patch = bridge_config_patch_for_provider(&settings)?;
+    commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
 
@@ -2219,6 +2877,7 @@ async fn save_provider_selection(
 fn save_api_key_impl(
     selected_provider_id: String,
     api_key: String,
+    display_name: String,
     custom_base_url: String,
     custom_confirmed: bool,
     model: String,
@@ -2227,7 +2886,7 @@ fn save_api_key_impl(
     let provider =
         provider_by_id(&selected_provider_id).ok_or_else(|| "未知 API Key 服务商".to_string())?;
     if provider.trust.starts_with("untrusted") && !custom_confirmed {
-        return Err("第三方中转需要确认后才能保存 API Key".into());
+        return Err("中转服务需要确认域名后才能保存 API Key".into());
     }
     if selected_provider_id == "custom" && custom_base_url.trim().is_empty() {
         return Err("确认自定义中转前，请先填写 Base URL".into());
@@ -2258,15 +2917,17 @@ fn save_api_key_impl(
             sanitized_aliases = default_aliases_for_profile(profile, &stored_model);
         }
     }
-    if let Some(patch) =
-        bridge_config_patch_for_api_key(&settings, clean_key, &stored_model, &sanitized_aliases)?
-    {
-        apply_bridge_config_patch_value(patch)?;
-    }
+    let patch =
+        bridge_config_patch_for_api_key(&settings, clean_key, &stored_model, &sanitized_aliases)?;
+    let label = if selected_provider_id == "custom" {
+        custom_relay_label(&settings, &display_name)?
+    } else {
+        provider.name
+    };
     let entry = StoredApiKey {
         id: next_api_key_id(),
         provider_id: selected_provider_id,
-        label: provider.name,
+        label,
         base_url: validated_base_url,
         model: stored_model,
         custom_confirmed,
@@ -2275,7 +2936,7 @@ fn save_api_key_impl(
     };
     settings.active_api_key_id = Some(entry.id.clone());
     settings.api_keys.push(entry);
-    persist_launcher_settings(&settings)?;
+    commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
 
@@ -2283,6 +2944,7 @@ fn save_api_key_impl(
 async fn save_api_key(
     selected_provider_id: String,
     api_key: String,
+    display_name: String,
     custom_base_url: String,
     custom_confirmed: bool,
     model: String,
@@ -2292,6 +2954,7 @@ async fn save_api_key(
         save_api_key_impl(
             selected_provider_id,
             api_key,
+            display_name,
             custom_base_url,
             custom_confirmed,
             model,
@@ -2316,13 +2979,10 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     settings.selected_provider_id = entry.provider_id.clone();
     settings.custom_base_url = entry.base_url.clone();
     settings.custom_confirmed = entry.custom_confirmed;
-    if let Some(patch) =
-        bridge_config_patch_for_api_key(&settings, &api_key, &entry.model, &entry.model_aliases)?
-    {
-        apply_bridge_config_patch_value(patch)?;
-    }
+    let patch =
+        bridge_config_patch_for_api_key(&settings, &api_key, &entry.model, &entry.model_aliases)?;
     settings.active_api_key_id = Some(entry.id);
-    persist_launcher_settings(&settings)?;
+    commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
 
@@ -2355,21 +3015,12 @@ async fn get_system_status() -> Result<SystemStatus, String> {
     run_blocking(|| Ok(current_status())).await
 }
 
-fn start_services_impl() -> Result<SystemStatus, String> {
-    let before = current_status();
-    if before.state == "running" {
-        return Ok(before);
-    }
-    let distro = before
-        .distro
-        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
-    let user = before
-        .linux_user
-        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+fn start_services_raw(distro: &str, user: &str) -> Result<(), String> {
     let script = project_root()?
         .join("scripts")
         .join("start-claude-science-wsl.ps1");
-    let output = background_command("powershell.exe")
+    let mut command = background_command("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -2379,17 +3030,42 @@ fn start_services_impl() -> Result<SystemStatus, String> {
         ])
         .arg(script)
         .arg("-Distro")
-        .arg(&distro)
+        .arg(distro)
         .arg("-User")
-        .arg(&user)
-        .output()
-        .map_err(|error| format!("启动失败：{error}"))?;
-    if !output.status.success() {
-        return Err(format!(
+        .arg(user);
+    let output =
+        command_output_with_timeout(command, Duration::from_secs(45), "Claude Science 启动")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
             "Claude Science 启动失败：{}",
             command_error_text(&output)
+        ))
+    }
+}
+
+fn start_services_impl() -> Result<SystemStatus, String> {
+    let before = current_status();
+    if before.state == "running" {
+        return Ok(before);
+    }
+    if before.restart_blocked {
+        return Err(format!(
+            "当前诊断不允许自动启动（{}）。请先检查磁盘空间、WSL 状态和安装包完整性；CSA 不会冒险修改环境。",
+            before
+                .wsl_storage_path
+                .as_deref()
+                .unwrap_or("WSL 虚拟磁盘位置未知")
         ));
     }
+    let distro = before
+        .distro
+        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+    let user = before
+        .linux_user
+        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+    start_services_raw(&distro, &user)?;
     Ok(current_status())
 }
 
@@ -2398,20 +3074,42 @@ async fn start_services() -> Result<SystemStatus, String> {
     run_blocking(start_services_impl).await
 }
 
+fn stop_services_raw(distro: &str) -> Result<(), String> {
+    let script = r#"
+systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
+for pid in $(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}'); do
+  kill "$pid" 2>/dev/null || true
+done
+for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+  if [ -r "/proc/$pid/cmdline" ]; then
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cmd" in *"/proxy.py"*) kill "$pid" 2>/dev/null || true;; esac
+  fi
+done
+deadline=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if ! curl -fsS --connect-timeout 0.3 --max-time 0.6 http://127.0.0.1:9876/health >/dev/null 2>&1 \
+    && ! ss -ltn 2>/dev/null | grep -qE ':(8765|8766) '; then
+    exit 0
+  fi
+  sleep 0.25
+done
+echo "CSA services did not stop within 5 seconds." >&2
+exit 1
+"#;
+    let output = run_wsl_with_timeout(distro, &["sh", "-lc", script], Duration::from_secs(10))?;
+    if !output.status.success() {
+        return Err(format!("停止服务失败：{}", command_error_text(&output)));
+    }
+    Ok(())
+}
+
 fn stop_services_impl() -> Result<SystemStatus, String> {
     let before = current_status();
     let Some(distro) = before.distro else {
         return Ok(before);
     };
-    let script = r#"
-systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
-for pid in $(ps -eo pid=,args= | awk '/claude-science-api-bridge\/patched\/claude-science serve/ && !/awk/ {print $1}'); do kill "$pid" 2>/dev/null || true; done
-for pid in $(ps -eo pid=,args= | awk '/python.*claude-science-api-bridge.*\/proxy.py/ && !/awk/ {print $1}'); do kill "$pid" 2>/dev/null || true; done
-"#;
-    let output = wsl_shell(&distro, script)?;
-    if !output.status.success() {
-        return Err(format!("停止服务失败：{}", command_error_text(&output)));
-    }
+    stop_services_raw(&distro)?;
     Ok(current_status())
 }
 
@@ -2421,8 +3119,19 @@ async fn stop_services() -> Result<SystemStatus, String> {
 }
 
 fn restart_services_impl() -> Result<SystemStatus, String> {
-    stop_services_impl()?;
-    start_services_impl()
+    let before = current_status();
+    if before.restart_blocked {
+        return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应或安装包不完整。现有服务不会被停止。".into());
+    }
+    let distro = before
+        .distro
+        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+    let user = before
+        .linux_user
+        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+    stop_services_raw(&distro)?;
+    start_services_raw(&distro, &user)?;
+    Ok(current_status())
 }
 
 #[tauri::command]
@@ -2430,9 +3139,13 @@ async fn restart_services() -> Result<SystemStatus, String> {
     run_blocking(restart_services_impl).await
 }
 
+fn selected_distro_quick() -> Result<String, String> {
+    let distros = discover_distros()?;
+    preferred_distro(&distros).ok_or_else(|| "WSL 不可用".to_string())
+}
+
 fn get_claude_url_impl() -> Result<String, String> {
-    let status = current_status();
-    let distro = status.distro.ok_or_else(|| "WSL 不可用".to_string())?;
+    let distro = selected_distro_quick()?;
     let output = wsl_shell(
         &distro,
         "$HOME/.local/share/claude-science-api-bridge/patched/claude-science url",
@@ -2453,8 +3166,33 @@ async fn get_claude_url() -> Result<String, String> {
 }
 
 fn get_dashboard_url_impl() -> Result<String, String> {
-    let status = current_status();
-    let distro = status.distro.ok_or_else(|| "WSL 不可用".to_string())?;
+    let distro = selected_distro_quick()?;
+    let project_wsl = project_root()
+        .ok()
+        .and_then(|root| windows_path_to_wsl(&distro, &root))
+        .ok_or_else(|| "无法定位当前 CSA Bridge".to_string())?;
+    let health = run_wsl(
+        &distro,
+        &[
+            "curl",
+            "-fsS",
+            "--connect-timeout",
+            "0.4",
+            "--max-time",
+            "2",
+            "http://127.0.0.1:9876/health",
+        ],
+    )?;
+    let health = serde_json::from_str::<serde_json::Value>(&output_text(&health))
+        .map_err(|_| "当前 Bridge 健康信息无效，请先从本目录启动/迁移 Bridge".to_string())?;
+    let expected_source = format!("{}/proxy.py", project_wsl.trim_end_matches('/'));
+    let actual_source = health
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if actual_source.replace('\\', "/") != expected_source.replace('\\', "/") {
+        return Err("9876 端口不是当前 CSA 目录的 Bridge；请先启动当前包完成迁移".into());
+    }
     let script = r#"
 import json
 import pathlib
@@ -2488,10 +3226,10 @@ fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
         return Ok(current_status());
     };
     let command = format!("Stop-Process -Id {pid} -Force -ErrorAction Stop");
-    let output = background_command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
-        .output()
-        .map_err(|error| format!("无法停止旧 Windows Bridge：{error}"))?;
+    let mut process = background_command("powershell.exe");
+    process.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+    let output =
+        command_output_with_timeout(process, Duration::from_secs(10), "停止旧 Windows Bridge")?;
     if !output.status.success() {
         return Err(format!(
             "无法停止旧 Windows Bridge：{}",
@@ -2534,6 +3272,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_atomic_write_replaces_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "csa-atomic-write-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("settings.json");
+        fs::write(&destination, "old").unwrap();
+        prepare_atomic_write(&destination, "new\n")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "new\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn decodes_wsl_utf16_output() {
@@ -2618,8 +3377,10 @@ mod tests {
         let minimax = &catalog[0].providers[3];
         assert_eq!(
             minimax.base_url.as_deref(),
-            Some("https://api.minimax.io/anthropic")
+            Some("https://api.minimaxi.com/anthropic")
         );
+        assert_eq!(minimax.badge, "官方");
+        assert_eq!(minimax.default_model, None);
         let openai = &catalog[0].providers[5];
         assert_eq!(openai.default_model, None);
         let opencode_go = &catalog[1].providers[0];
@@ -2714,7 +3475,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_profile_uses_v4_and_maps_fast_role() {
+    fn deepseek_profile_preserves_official_models_and_only_repairs_known_typo() {
         let settings = LauncherSettings {
             selected_provider_id: "deepseek".into(),
             custom_base_url: String::new(),
@@ -2725,19 +3486,127 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(patch["default_backend"], "deepseek");
-        assert_eq!(patch["force_model"], "deepseek-v4-pro");
+        assert_eq!(patch["force_model"], "deepseek-chat");
         let rows = patch["model_aliases"].as_array().unwrap();
         let haiku = rows
             .iter()
             .find(|row| row["id"] == "claude-haiku-4-5-20251001")
             .unwrap();
-        assert_eq!(haiku["model"], "deepseek-v4-pro");
+        assert_eq!(haiku["model"], "deepseek-chat");
 
         let stale_glm_patch =
             bridge_config_patch_for_api_key(&settings, "deepseek-key", "glm-5.2", &[])
                 .unwrap()
                 .unwrap();
-        assert_eq!(stale_glm_patch["force_model"], "deepseek-v4-pro");
+        assert_eq!(stale_glm_patch["force_model"], "glm-5.2");
+
+        let official_v4_patch =
+            bridge_config_patch_for_api_key(&settings, "deepseek-key", "deepseek-v4-pro", &[])
+                .unwrap()
+                .unwrap();
+        assert_eq!(official_v4_patch["force_model"], "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn minimax_china_profile_preserves_all_official_anthropic_model_ids() {
+        let profile = runtime_profile_for_provider("minimax", "", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.base_url, "https://api.minimaxi.com/anthropic");
+        assert_eq!(profile.upstream_mode, "anthropic");
+        assert_eq!(profile.default_model, "");
+
+        for expected in [
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.1",
+            "MiniMax-M2.1-highspeed",
+            "MiniMax-M2",
+        ] {
+            assert_eq!(
+                canonical_model_for_profile(&profile, &expected.to_lowercase()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn minimax_china_key_writes_anthropic_bridge_config_without_a_fixed_default() {
+        let settings = LauncherSettings {
+            selected_provider_id: "minimax".into(),
+            custom_base_url: String::new(),
+            custom_confirmed: false,
+            ..LauncherSettings::default()
+        };
+        let empty_error =
+            bridge_config_patch_for_api_key(&settings, "minimax-key", "", &[]).unwrap_err();
+        assert!(empty_error.contains("模型 ID"));
+
+        let patch = bridge_config_patch_for_api_key(&settings, "minimax-key", "MiniMax-M3", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(patch["default_backend"], "custom");
+        assert_eq!(
+            patch["custom_base_url"],
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(patch["custom_upstream_mode"], "anthropic");
+        assert_eq!(patch["force_model"], "MiniMax-M3");
+        assert_eq!(patch["deepseek_api_key"], "");
+        assert_eq!(patch["openai_api_key"], "");
+    }
+
+    #[test]
+    fn minimax_live_models_map_m3_to_primary_and_highspeed_to_fast() {
+        let live_models = vec![
+            "MiniMax-M2.7".to_string(),
+            "MiniMax-M2.7-highspeed".to_string(),
+            "MiniMax-M3".to_string(),
+        ];
+        let (primary, fast, aliases, candidates) = auto_model_mapping(&live_models, "").unwrap();
+        assert_eq!(primary, "MiniMax-M3");
+        assert_eq!(fast, "MiniMax-M2.7-highspeed");
+        assert_eq!(candidates, live_models);
+        let haiku = aliases
+            .iter()
+            .find(|item| item.id == "claude-haiku-4-5-20251001")
+            .unwrap();
+        assert_eq!(haiku.model, "MiniMax-M2.7-highspeed");
+    }
+
+    #[test]
+    fn documented_model_fallback_is_limited_to_verified_official_profiles() {
+        let deepseek = runtime_profile_for_provider("deepseek", "", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            documented_models_for_profile(&deepseek),
+            vec!["deepseek-v4-pro", "deepseek-v4-flash"]
+        );
+
+        let minimax = runtime_profile_for_provider("minimax", "", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(documented_models_for_profile(&minimax)[0], "MiniMax-M3");
+
+        let custom = runtime_profile_for_provider("custom", "https://example.com/v1", true)
+            .unwrap()
+            .unwrap();
+        assert!(documented_models_for_profile(&custom).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_json_output_is_forced_to_utf8() {
+        let output = run_powershell_with_stdin(
+            "[ordered]@{message='连接成功。'} | ConvertTo-Json -Compress",
+            "",
+        )
+        .unwrap();
+        assert_eq!(output, r#"{"message":"连接成功。"}"#);
     }
 
     #[test]
@@ -2909,6 +3778,54 @@ mod tests {
         let state = launcher_state(&settings);
         assert_eq!(state.api_keys[0].id, "key-first");
         assert_eq!(state.api_keys[1].id, "key-second");
+    }
+
+    #[test]
+    fn custom_relay_uses_user_name_when_provided() {
+        let settings = LauncherSettings::default();
+        assert_eq!(
+            custom_relay_label_for_date(&settings, "  实验室主线路  ", "2026-07-11").unwrap(),
+            "实验室主线路"
+        );
+    }
+
+    #[test]
+    fn unnamed_custom_relays_use_date_and_next_sequence() {
+        let make_entry = |provider_id: &str, label: &str| StoredApiKey {
+            id: next_api_key_id(),
+            provider_id: provider_id.into(),
+            label: label.into(),
+            base_url: String::new(),
+            model: String::new(),
+            custom_confirmed: provider_id == "custom",
+            model_aliases: Vec::new(),
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let settings = LauncherSettings {
+            api_keys: vec![
+                make_entry("custom", "自定义中转 2026-07-11 #01"),
+                make_entry("custom", "自定义中转 2026-07-11 #03"),
+                make_entry("custom", "自定义中转 2026-07-10 #20"),
+                make_entry("deepseek", "自定义中转 2026-07-11 #99"),
+            ],
+            ..LauncherSettings::default()
+        };
+        assert_eq!(
+            custom_relay_label_for_date(&settings, "", "2026-07-11").unwrap(),
+            "自定义中转 2026-07-11 #04"
+        );
+    }
+
+    #[test]
+    fn custom_relay_name_rejects_control_characters() {
+        let settings = LauncherSettings::default();
+        assert!(custom_relay_label_for_date(&settings, "坏\n名称", "2026-07-11").is_err());
+    }
+
+    #[test]
+    fn api_key_test_budget_supports_reasoning_models() {
+        assert!(API_KEY_TEST_INITIAL_MAX_TOKENS >= 256);
+        assert!(API_KEY_TEST_RETRY_MAX_TOKENS >= API_KEY_TEST_INITIAL_MAX_TOKENS * 4);
     }
 
     #[test]

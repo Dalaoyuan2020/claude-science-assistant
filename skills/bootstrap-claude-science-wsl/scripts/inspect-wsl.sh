@@ -6,7 +6,13 @@ json_bool() {
 }
 
 json_string() {
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'
+  local value
+  value="$(cat)"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  printf '"%s"' "$value"
 }
 
 user_name="$(id -un)"
@@ -22,7 +28,57 @@ venv_python="$HOME/.local/share/claude-science-api-bridge/venv/bin/python"
 bridge_pid="$(ps -eo pid=,args= | awk '/python/ && /proxy.py/ && !/awk/ {print $1; exit}' || true)"
 claude_pid="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1; exit}' || true)"
 bridge_healthy=false
-if curl -fsS --max-time 2 http://127.0.0.1:9876/health >/dev/null 2>&1; then bridge_healthy=true; fi
+bridge_health_responding=false
+bridge_source_matches=null
+health_payload="$(curl -fsS --connect-timeout 0.4 --max-time 1 http://127.0.0.1:9876/health 2>/dev/null || true)"
+if [ -n "$health_payload" ]; then
+  bridge_health_responding=true
+  health_python=""
+  if [ -x "$venv_python" ]; then
+    health_python="$venv_python"
+  elif command -v python3 >/dev/null 2>&1; then
+    health_python="$(command -v python3)"
+  fi
+  health_state="foreign"
+  if [ -n "$health_python" ]; then
+    health_state="$("$health_python" -c '
+import json, os, sys
+try:
+    health = json.loads(sys.argv[2])
+except Exception:
+    print("invalid")
+    raise SystemExit
+expected = os.path.realpath(sys.argv[1])
+actual = os.path.realpath(str(health.get("source_path") or ""))
+print("current" if health.get("status") == "ok" and actual == expected else "foreign")
+' "$project_dir/proxy.py" "$health_payload" 2>/dev/null || true)"
+  fi
+  if [ "$health_state" = current ]; then
+    bridge_healthy=true
+    bridge_source_matches=true
+  else
+    bridge_source_matches=false
+  fi
+fi
+tmp_writable=false
+tmp_dir="${TMPDIR:-/tmp}"
+if [ -d "$tmp_dir" ] && [ -w "$tmp_dir" ] \
+  && ! findmnt -no OPTIONS -T "$tmp_dir" 2>/dev/null | tr ',' '\n' | grep -qx ro; then
+  tmp_writable=true
+fi
+home_writable=false
+if [ -d "$HOME" ] && [ -w "$HOME" ] \
+  && ! findmnt -no OPTIONS -T "$HOME" 2>/dev/null | tr ',' '\n' | grep -qx ro; then
+  home_writable=true
+fi
+root_total_kb="$(LC_ALL=C df -Pk / 2>/dev/null | awk 'NR==2 {print $2}' || true)"
+root_free_kb="$(LC_ALL=C df -Pk / 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+root_inode_total="$(LC_ALL=C df -Pi / 2>/dev/null | awk 'NR==2 {print $2}' || true)"
+root_inode_free="$(LC_ALL=C df -Pi / 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+root_options="$(findmnt -no OPTIONS -T / 2>/dev/null || true)"
+root_read_only=false
+if printf '%s\n' "$root_options" | tr ',' '\n' | grep -qx ro; then root_read_only=true; fi
+bridge_log_bytes="$(stat -c %s "$HOME/.claude-science/logs/wsl-proxy.log" 2>/dev/null || true)"
 bridge_service_active=false
 unit_matches_project=null
 if [ "$systemd_running" = true ]; then
@@ -53,12 +109,24 @@ printf '"source_binary":%s,' "$(json_bool bash -c "test -x '$managed_bin' || tes
 printf '"managed_binary":%s,' "$(json_bool test -x "$managed_bin")"
 printf '"user_binary":%s,' "$(json_bool test -x "$source_bin")"
 printf '"patched_binary":%s,' "$(json_bool test -x "$patched_bin")"
-printf '"bridge_venv":%s' "$(json_bool test -x "$venv_python")"
+printf '"bridge_venv":%s,' "$(json_bool test -x "$venv_python")"
+printf '"tmp_writable":%s,' "$tmp_writable"
+printf '"home_writable":%s' "$home_writable"
+printf '},'
+printf '"storage":{'
+printf '"root_total_kb":%s,' "${root_total_kb:-null}"
+printf '"root_free_kb":%s,' "${root_free_kb:-null}"
+printf '"root_inode_total":%s,' "${root_inode_total:-null}"
+printf '"root_inode_free":%s,' "${root_inode_free:-null}"
+printf '"root_read_only":%s,' "$root_read_only"
+printf '"bridge_log_bytes":%s' "${bridge_log_bytes:-null}"
 printf '},'
 printf '"runtime":{'
 printf '"bridge_pid":%s,' "${bridge_pid:-null}"
 printf '"claude_pid":%s,' "${claude_pid:-null}"
 printf '"bridge_healthy":%s,' "$bridge_healthy"
+printf '"bridge_health_responding":%s,' "$bridge_health_responding"
+printf '"bridge_source_matches":%s,' "$bridge_source_matches"
 printf '"bridge_service_active":%s,' "$bridge_service_active"
 printf '"unit_matches_project":%s,' "$unit_matches_project"
 printf '"port_9876":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":9876 "')"

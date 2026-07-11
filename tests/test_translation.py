@@ -110,10 +110,38 @@ def test_deepseek_native_anthropic_mode_normalizes_base_url():
     assert backend["backend"] == "deepseek"
     assert backend["mode"] == "anthropic"
     assert backend["base_url"] == "https://api.deepseek.com/anthropic/v1"
-    assert backend["model"] == "deepseek-v4-pro"
+    assert backend["model"] == "deepseek-chat"
 
 
-def test_deepseek_misspelled_legacy_model_normalizes_to_v4_pro():
+def test_native_anthropic_auto_thinking_becomes_adaptive_without_mutating_input():
+    body = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 4096,
+        "thinking": {"type": "auto", "budget_tokens": 2048},
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+    native = proxy.build_anthropic_backend_body(body, "deepseek-v4-pro")
+
+    assert native["thinking"] == {"type": "adaptive"}
+    assert native["stream"] is True
+    assert body["thinking"] == {"type": "auto", "budget_tokens": 2048}
+
+
+def test_native_anthropic_explicit_thinking_mode_is_preserved():
+    body = {
+        "model": "claude-opus-4-8",
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    native = proxy.build_anthropic_backend_body(body, "MiniMax-M3")
+
+    assert native["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_misspelled_legacy_model_repairs_only_the_typo():
     with config_values(
         default_backend="deepseek",
         deepseek_api_key="test-key",
@@ -124,10 +152,10 @@ def test_deepseek_misspelled_legacy_model_normalizes_to_v4_pro():
         backend = proxy.config.resolve_backend("claude-sonnet-5")
 
     assert backend["backend"] == "deepseek"
-    assert backend["model"] == "deepseek-v4-pro"
+    assert backend["model"] == "deepseek-chat"
 
 
-def test_deepseek_stale_glm_model_normalizes_to_v4_pro():
+def test_deepseek_unrelated_model_is_not_silently_changed_to_a_paid_model():
     with config_values(
         default_backend="deepseek",
         deepseek_api_key="test-key",
@@ -138,6 +166,19 @@ def test_deepseek_stale_glm_model_normalizes_to_v4_pro():
         backend = proxy.config.resolve_backend("claude-sonnet-5")
 
     assert backend["backend"] == "deepseek"
+    assert backend["model"] == "glm-5.2"
+
+
+def test_deepseek_current_official_v4_model_is_preserved():
+    with config_values(
+        default_backend="deepseek",
+        deepseek_api_key="test-key",
+        deepseek_base_url="https://api.deepseek.com/anthropic",
+        deepseek_upstream_mode="anthropic",
+        force_model="deepseek-v4-pro",
+    ):
+        backend = proxy.config.resolve_backend("claude-sonnet-5")
+
     assert backend["model"] == "deepseek-v4-pro"
 
 
@@ -197,6 +238,15 @@ def test_max_tokens_cap_applies_to_openai_translation_and_native_body():
     assert native["max_tokens"] == 8192
 
 
+def test_openai_translation_uses_upstream_default_when_caller_omits_max_tokens():
+    body = {
+        "model": "byok-model-0001",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    converted = proxy.anthropic_to_openai(body, "glm-5.2", "custom", "https://example.com/v1")
+    assert "max_tokens" not in converted
+
+
 def test_models_endpoint_can_return_only_third_party_aliases():
     client = TestClient(proxy.app)
     with config_values(
@@ -250,6 +300,46 @@ def test_provider_presets_include_protocol_modes():
     presets = response.json()["presets"]
     assert presets["siliconflow_kimi"]["upstream_mode"] == "openai"
     assert presets["deepseek_anthropic"]["upstream_mode"] == "anthropic"
+    assert all(preset["default_model"] == "" for preset in presets.values())
+    assert all(preset["model_aliases"] == [] for preset in presets.values())
+
+
+def test_models_endpoint_supports_intentional_empty_state():
+    client = TestClient(proxy.app)
+    with config_values(force_model="", model_aliases=[], model_list_mode="aliases"):
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": [],
+        "has_more": False,
+        "first_id": None,
+        "last_id": None,
+    }
+
+
+def test_packaged_example_config_is_secret_free_empty_state():
+    cfg = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+
+    assert cfg["deepseek_api_key"] == ""
+    assert cfg["openai_api_key"] == ""
+    assert cfg["custom_api_key"] == ""
+    assert cfg["default_backend"] == ""
+    assert cfg["force_model"] == ""
+    assert cfg["model_aliases"] == []
+    assert cfg["model_list_mode"] == "aliases"
+    assert proxy.Config.DEFAULTS["default_backend"] == ""
+
+
+def test_minimax_china_anthropic_base_url_is_normalized_without_duplication():
+    assert (
+        proxy.normalize_anthropic_base_url("https://api.minimaxi.com/anthropic")
+        == "https://api.minimaxi.com/anthropic/v1"
+    )
+    assert (
+        proxy.normalize_anthropic_base_url("https://api.minimaxi.com/anthropic/v1")
+        == "https://api.minimaxi.com/anthropic/v1"
+    )
 
 
 def test_outbound_proxy_configures_httpx_client_kwargs():
@@ -347,6 +437,137 @@ def test_openai_forced_tool_choice_keeps_function_choice():
     converted = proxy.anthropic_to_openai(body, "gpt-4o", "openai", "https://api.openai.com/v1")
 
     assert converted["tool_choice"] == {"type": "function", "function": {"name": "python"}}
+
+
+def test_parallel_tool_preference_is_preserved():
+    body = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 256,
+        "tools": [{
+            "name": "lookup",
+            "input_schema": {"type": "object", "properties": {}},
+        }],
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+        "messages": [{"role": "user", "content": "look it up"}],
+    }
+
+    converted = proxy.anthropic_to_openai(body, "glm-5.2", "custom", "https://example.com/v1")
+
+    assert converted["parallel_tool_calls"] is False
+
+
+def test_o_series_uses_max_completion_tokens():
+    body = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    converted = proxy.anthropic_to_openai(body, "openai/o3-mini")
+
+    assert converted["max_completion_tokens"] == 4096
+    assert "max_tokens" not in converted
+
+
+def test_glm_explicit_thinking_is_mapped_without_implicit_injection():
+    explicit = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4096,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    ordinary = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    explicit_result = proxy.anthropic_to_openai(
+        explicit, "glm-5.2", "custom", "https://opencode.ai/zen/go/v1"
+    )
+    ordinary_result = proxy.anthropic_to_openai(
+        ordinary, "glm-5.2", "custom", "https://opencode.ai/zen/go/v1"
+    )
+
+    assert explicit_result["thinking"] == {"type": "enabled"}
+    assert "thinking" not in ordinary_result
+
+
+def test_gpt5_explicit_effort_is_mapped_and_max_becomes_xhigh():
+    body = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 4096,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    converted = proxy.anthropic_to_openai(body, "gpt-5.5")
+
+    assert converted["reasoning_effort"] == "xhigh"
+
+
+def test_openrouter_platform_rule_wins_over_glm_model_rule():
+    body = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 4096,
+        "thinking": {"type": "enabled", "budget_tokens": 8000},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    converted = proxy.anthropic_to_openai(
+        body, "z-ai/glm-5.2", "custom", "https://openrouter.ai/api/v1"
+    )
+
+    assert converted["reasoning"] == {"effort": "medium"}
+    assert "thinking" not in converted
+
+
+def test_parameter_error_can_switch_to_max_completion_tokens_once():
+    body = {"model": "o3", "messages": [], "max_tokens": 4096}
+    retry = proxy.adapt_openai_body_after_error(
+        body,
+        400,
+        "max_tokens is not supported for this model; use max_completion_tokens instead",
+    )
+
+    assert retry is not None
+    adapted, reason = retry
+    assert adapted["max_completion_tokens"] == 4096
+    assert "max_tokens" not in adapted
+    assert reason == "max_tokens->max_completion_tokens"
+
+
+def test_provider_advertised_output_limit_is_used_for_retry():
+    body = {"model": "example", "messages": [], "max_tokens": 32768}
+    retry = proxy.adapt_openai_body_after_error(
+        body,
+        400,
+        "max_tokens must be less than or equal to 8192",
+    )
+
+    assert retry is not None
+    adapted, reason = retry
+    assert adapted["max_tokens"] == 8192
+    assert reason == "max_tokens-clamped-to-provider-limit"
+
+
+def test_unknown_output_limit_falls_back_to_provider_default_without_global_cap():
+    body = {"model": "example", "messages": [], "max_tokens": 32768}
+    retry = proxy.adapt_openai_body_after_error(body, 422, "invalid max_tokens for selected model")
+
+    assert retry is not None
+    adapted, reason = retry
+    assert "max_tokens" not in adapted
+    assert reason == "max_tokens-omitted-for-provider-default"
+
+
+def test_unrelated_or_auth_errors_are_not_retried():
+    body = {"model": "example", "messages": [], "max_tokens": 32768}
+
+    assert proxy.adapt_openai_body_after_error(body, 401, "invalid api key") is None
+    assert proxy.adapt_openai_body_after_error(body, 400, "invalid messages array") is None
 
 
 def test_tool_results_follow_assistant_tool_calls_immediately():

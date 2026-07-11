@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Local proxy that lets Claude Science use DeepSeek and ChatGPT APIs.
 
 Features:
@@ -65,13 +65,13 @@ class Config:
         "deepseek_base_url": "https://api.deepseek.com/anthropic",
         "openai_base_url": "https://api.openai.com",
         "custom_base_url": "",
-        "default_backend": "deepseek",
+        "default_backend": "",
         "force_model": "",
         "deepseek_model_map": {},
         "openai_model_map": {},
         "custom_model_map": {},
         "model_aliases": [],
-        "model_list_mode": "aliases_first",
+        "model_list_mode": "aliases",
         "model_token_caps": {},
         "default_max_tokens_cap": 0,
         "deepseek_upstream_mode": "anthropic",
@@ -337,16 +337,22 @@ def normalize_openai_base_url(base_url: str) -> str:
 
 
 def normalize_backend_model_id(backend: str, model: str) -> str:
-    """Normalize common stale/misspelled model IDs before sending upstream."""
+    """Repair proven input typos without guessing a different upstream model."""
     cleaned = (model or "").strip()
     if not cleaned:
         return cleaned
     normalized = cleaned.lower()
     if backend == "deepseek":
-        if normalized in {"deep-chat", "deepseek-chat", "deepseek-reasoner", "deepseek-v4", "glm-5.2"}:
-            return "deepseek-v4-pro"
-        if normalized in {"deepseek-fast", "deepseek-v4-fast", "deepseek-v4-flash"}:
-            return "deepseek-v4-flash"
+        if normalized == "deep-chat":
+            return "deepseek-chat"
+        official_ids = {
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        }
+        if normalized in official_ids:
+            return normalized
     return cleaned
 
 
@@ -396,6 +402,16 @@ def build_anthropic_backend_body(body: dict, backend_model: str) -> dict:
     """Prepare a native Anthropic request for providers with /v1/messages support."""
     out = dict(body)
     out["model"] = backend_model
+    thinking = out.get("thinking")
+    if isinstance(thinking, dict) and str(thinking.get("type", "")).strip().lower() == "auto":
+        # Claude Science emits `auto`, while DeepSeek and MiniMax native
+        # Anthropic endpoints accept `adaptive`/`enabled`/`disabled`.
+        # Adaptive mode chooses its own budget, so a caller-side fixed budget
+        # must not leak through with the normalized type.
+        normalized_thinking = dict(thinking)
+        normalized_thinking["type"] = "adaptive"
+        normalized_thinking.pop("budget_tokens", None)
+        out["thinking"] = normalized_thinking
     if "max_tokens" in out:
         out["max_tokens"] = clamp_max_tokens_for_model(out["max_tokens"], backend_model)
     return out
@@ -453,57 +469,40 @@ PROVIDER_PRESETS = {
         "backend": "deepseek",
         "base_url": "https://api.deepseek.com",
         "upstream_mode": "openai",
-        "default_model": "deepseek-v4-pro",
-        "model_aliases": [
-            {"id": "byok-model-0001", "display_name": "DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-opus-4-8", "display_name": "Claude Opus -> DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-sonnet-5", "display_name": "Claude Sonnet -> DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku -> DeepSeek V4 Flash", "backend": "deepseek", "model": "deepseek-v4-flash"},
-        ],
+        "default_model": "",
+        "model_aliases": [],
     },
     "deepseek_anthropic": {
         "label": "DeepSeek native Anthropic",
         "backend": "deepseek",
         "base_url": "https://api.deepseek.com/anthropic",
         "upstream_mode": "anthropic",
-        "default_model": "deepseek-v4-pro",
-        "model_aliases": [
-            {"id": "byok-model-0001", "display_name": "DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-opus-4-8", "display_name": "Claude Opus -> DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-sonnet-5", "display_name": "Claude Sonnet -> DeepSeek V4 Pro", "backend": "deepseek", "model": "deepseek-v4-pro"},
-            {"id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku -> DeepSeek V4 Flash", "backend": "deepseek", "model": "deepseek-v4-flash"},
-        ],
+        "default_model": "",
+        "model_aliases": [],
     },
     "siliconflow_kimi": {
         "label": "SiliconFlow Kimi",
         "backend": "custom",
         "base_url": "https://api.siliconflow.cn",
         "upstream_mode": "openai",
-        "default_model": "Pro/moonshotai/Kimi-K2.6",
-        "model_aliases": [
-            {"id": "byok-model-0001", "display_name": "Kimi K2.6 Pro++", "backend": "custom", "model": "Pro/moonshotai/Kimi-K2.6"},
-        ],
+        "default_model": "",
+        "model_aliases": [],
     },
     "dashscope_qwen": {
         "label": "Alibaba DashScope Qwen",
         "backend": "custom",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "upstream_mode": "openai",
-        "default_model": "qwen-plus",
-        "model_aliases": [
-            {"id": "byok-model-0001", "display_name": "Qwen Plus", "backend": "custom", "model": "qwen-plus"},
-            {"id": "byok-model-0002", "display_name": "Qwen Max", "backend": "custom", "model": "qwen-max"},
-        ],
+        "default_model": "",
+        "model_aliases": [],
     },
     "moonshot_anthropic": {
         "label": "Moonshot native Anthropic",
         "backend": "custom",
         "base_url": "https://api.moonshot.cn/anthropic",
         "upstream_mode": "anthropic",
-        "default_model": "kimi-k2-0711-preview",
-        "model_aliases": [
-            {"id": "byok-model-0001", "display_name": "Moonshot Kimi", "backend": "custom", "model": "kimi-k2-0711-preview"},
-        ],
+        "default_model": "",
+        "model_aliases": [],
     },
 }
 
@@ -599,7 +598,7 @@ def model_list_for_config(cfg: Config) -> list[dict]:
         seen = {m["id"] for m in aliases}
         aliases = aliases + [m for m in force_aliases if m["id"] not in seen]
     mode = (cfg.model_list_mode or "aliases_first").lower()
-    if mode in {"aliases", "alias", "third_party", "third-party"} and aliases:
+    if mode in {"aliases", "alias", "third_party", "third-party"}:
         return aliases
     if mode in {"builtin", "builtins", "compat"}:
         return list(BUILTIN_COMPAT_MODELS)
@@ -1324,6 +1323,181 @@ def _convert_tool_choice(tool_choice, tool_name_map: dict, backend_name: str, ba
     return None
 
 
+def _normalized_model_family(model: str) -> str:
+    """Return a provider-prefix-free lowercase model id for capability checks."""
+    return str(model or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def _is_openai_o_series(model: str) -> bool:
+    model_id = _normalized_model_family(model)
+    return len(model_id) > 1 and model_id[0] == "o" and model_id[1].isdigit()
+
+
+def _supports_openai_reasoning_effort(model: str) -> bool:
+    model_id = _normalized_model_family(model)
+    if _is_openai_o_series(model_id):
+        return True
+    match = re.match(r"^gpt-(\d+)", model_id)
+    return bool(match and int(match.group(1)) >= 5)
+
+
+def _requested_reasoning_effort(anthropic_body: dict) -> Optional[str]:
+    """Translate only an explicit Anthropic reasoning request; never enable it implicitly."""
+    output_config = anthropic_body.get("output_config")
+    if isinstance(output_config, dict):
+        effort = str(output_config.get("effort") or "").lower()
+        if effort in {"low", "medium", "high"}:
+            return effort
+        if effort in {"max", "xhigh"}:
+            return "xhigh"
+
+    thinking = anthropic_body.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    thinking_type = str(thinking.get("type") or "").lower()
+    if thinking_type in {"disabled", "none", "off"}:
+        return None
+    if thinking_type == "adaptive":
+        return "xhigh"
+    if thinking_type != "enabled":
+        return None
+    try:
+        budget = int(thinking.get("budget_tokens"))
+    except (TypeError, ValueError):
+        return "high"
+    if budget < 4000:
+        return "low"
+    if budget < 16000:
+        return "medium"
+    return "high"
+
+
+def _requested_thinking_enabled(anthropic_body: dict) -> Optional[bool]:
+    thinking = anthropic_body.get("thinking")
+    output_config = anthropic_body.get("output_config")
+    if isinstance(thinking, dict):
+        thinking_type = str(thinking.get("type") or "").lower()
+        if thinking_type in {"disabled", "none", "off"}:
+            return False
+        if thinking_type in {"enabled", "adaptive"}:
+            return True
+    if isinstance(output_config, dict) and output_config.get("effort"):
+        return True
+    return None
+
+
+def _apply_reasoning_controls(
+    openai_body: dict,
+    anthropic_body: dict,
+    backend_model: str,
+    backend_name: str,
+    backend_base_url: str,
+) -> None:
+    """Map explicit reasoning intent using platform-first, model-second capability rules."""
+    enabled = _requested_thinking_enabled(anthropic_body)
+    if enabled is None:
+        return
+
+    model_id = _normalized_model_family(backend_model)
+    platform = f"{backend_name} {backend_base_url}".lower()
+    effort = _requested_reasoning_effort(anthropic_body)
+
+    # Aggregators define their own wire protocol even when the underlying model
+    # belongs to another vendor, so platform rules must win over model names.
+    if "openrouter" in platform:
+        if enabled and effort:
+            openai_body["reasoning"] = {"effort": effort}
+        elif not enabled:
+            openai_body["reasoning"] = {"effort": "none"}
+        return
+    if "siliconflow" in platform:
+        openai_body["enable_thinking"] = enabled
+        return
+
+    if _supports_openai_reasoning_effort(model_id):
+        if enabled and effort:
+            openai_body["reasoning_effort"] = effort
+        return
+    if any(name in model_id for name in ("glm", "kimi", "moonshot", "deepseek", "mimo")):
+        openai_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+        return
+    if "qwen" in model_id:
+        openai_body["enable_thinking"] = enabled
+        return
+    if "minimax" in model_id:
+        openai_body["reasoning_split"] = enabled
+
+
+def _output_limit_from_error(error_text: str) -> Optional[int]:
+    """Extract an advertised output ceiling without mistaking the requested value for it."""
+    text = str(error_text or "").lower().replace(",", "")
+    patterns = (
+        r"(?:max_tokens|max_completion_tokens)[^\n]{0,120}?(?:less than or equal to|at most|maximum(?:\s+(?:is|of))?|<=)\s*[:=]?\s*(\d+)",
+        r"(?:maximum|max)\s+(?:allowed\s+)?(?:output\s+)?tokens?[^\d]{0,30}(\d+)",
+        r"(?:limit|ceiling)[^\d]{0,30}(\d+)\s*(?:output\s+)?tokens?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        value = int(match.group(1))
+        if 64 <= value <= 1_000_000:
+            return value
+    return None
+
+
+def adapt_openai_body_after_error(body: dict, status_code: int, error_text: str) -> Optional[tuple[dict, str]]:
+    """Return one conservative retry body for explicit parameter-compatibility errors."""
+    if status_code not in {400, 422}:
+        return None
+    text = str(error_text or "").lower()
+    adapted = dict(body)
+
+    if "max_tokens" in text or "max_completion_tokens" in text or "output token" in text:
+        if (
+            "max_tokens" in adapted
+            and "max_completion_tokens" in text
+            and any(word in text for word in ("use", "instead", "unsupported", "not supported"))
+        ):
+            adapted["max_completion_tokens"] = adapted.pop("max_tokens")
+            return adapted, "max_tokens->max_completion_tokens"
+
+        limit = _output_limit_from_error(text)
+        token_field = "max_completion_tokens" if "max_completion_tokens" in adapted else "max_tokens"
+        if limit and token_field in adapted:
+            try:
+                requested = int(adapted[token_field])
+            except (TypeError, ValueError):
+                requested = limit
+            adapted[token_field] = min(requested, limit)
+            if adapted[token_field] != body.get(token_field):
+                return adapted, f"{token_field}-clamped-to-provider-limit"
+
+        # OpenAI-compatible upstreams define their own model default when the
+        # optional output field is absent. This is safer than inventing a global cap.
+        if token_field in adapted:
+            adapted.pop(token_field)
+            return adapted, f"{token_field}-omitted-for-provider-default"
+
+    optional_fields = (
+        "parallel_tool_calls",
+        "reasoning_effort",
+        "reasoning",
+        "thinking",
+        "enable_thinking",
+        "reasoning_split",
+        "temperature",
+        "top_p",
+    )
+    for field in optional_fields:
+        if field in adapted and field.lower() in text and any(
+            marker in text for marker in ("unsupported", "not supported", "unknown", "unrecognized", "invalid")
+        ):
+            adapted.pop(field)
+            return adapted, f"unsupported-{field}-removed"
+    return None
+
+
 def anthropic_to_openai(
     anthropic_body: dict,
     backend_model: str,
@@ -1440,9 +1614,15 @@ def anthropic_to_openai(
 
     openai_body = {"model": backend_model, "messages": openai_messages}
 
-    max_tokens = anthropic_body.get("max_tokens", 4096)
-    max_tokens = clamp_max_tokens_for_model(max_tokens, backend_model)
-    openai_body["max_tokens"] = max_tokens
+    # Preserve the caller's output budget. If it is absent, omit the field so
+    # an OpenAI-compatible upstream can apply its own model default instead of
+    # receiving an arbitrary bridge-wide value.
+    if "max_tokens" in anthropic_body and anthropic_body.get("max_tokens") is not None:
+        max_tokens = clamp_max_tokens_for_model(anthropic_body["max_tokens"], backend_model)
+        if _is_openai_o_series(backend_model):
+            openai_body["max_completion_tokens"] = max_tokens
+        else:
+            openai_body["max_tokens"] = max_tokens
 
     if "temperature" in anthropic_body:
         openai_body["temperature"] = anthropic_body["temperature"]
@@ -1483,6 +1663,16 @@ def anthropic_to_openai(
             converted_choice = _convert_tool_choice(tool_choice, tool_name_map, backend_name, backend_base_url)
             if converted_choice:
                 openai_body["tool_choice"] = converted_choice
+            if isinstance(tool_choice, dict) and "disable_parallel_tool_use" in tool_choice:
+                openai_body["parallel_tool_calls"] = not bool(tool_choice["disable_parallel_tool_use"])
+
+    _apply_reasoning_controls(
+        openai_body,
+        anthropic_body,
+        backend_model,
+        backend_name,
+        backend_base_url,
+    )
 
     return openai_body
 
@@ -1881,22 +2071,30 @@ async def messages_api(request: Request):
     if stream:
         async def stream_gen():
             try:
-                async with client.stream("POST", url, json=openai_body, headers=headers) as backend_resp:
-                    if backend_resp.status_code != 200:
+                request_body = openai_body
+                for attempt in range(2):
+                    async with client.stream("POST", url, json=request_body, headers=headers) as backend_resp:
+                        if backend_resp.status_code == 200:
+                            log_request(backend["backend"], backend["model"], True, "success")
+                            events = translate_stream(backend_resp, original_model, request_id, tool_name_lookup)
+                            async for event in stream_events_with_heartbeat(events):
+                                yield event
+                            return
                         try:
                             error_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
                         except Exception:
                             error_text = "(unreadable response)"
+                        retry = adapt_openai_body_after_error(request_body, backend_resp.status_code, error_text)
+                        if attempt == 0 and retry:
+                            request_body, reason = retry
+                            print(f"[proxy] retrying compatible request | reason={reason}", flush=True)
+                            continue
                         print(f"[proxy] backend error {backend_resp.status_code}: {error_text}", flush=True)
                         log_request(backend["backend"], backend["model"], True, f"error {backend_resp.status_code}")
                         err_msg = f"Backend error {backend_resp.status_code}: {error_text}"
                         safe_msg = err_msg.encode("ascii", errors="replace").decode("ascii")
                         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':safe_msg}})}\n\n"
                         return
-                    log_request(backend["backend"], backend["model"], True, "success")
-                    events = translate_stream(backend_resp, original_model, request_id, tool_name_lookup)
-                    async for event in stream_events_with_heartbeat(events):
-                        yield event
             except Exception as e:
                 log_request(backend["backend"], backend["model"], True, "error")
                 yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':str(e)}})}\n\n"
@@ -1906,6 +2104,12 @@ async def messages_api(request: Request):
     else:
         try:
             resp = await client.post(url, json=openai_body, headers=headers)
+            if resp.status_code != 200:
+                retry = adapt_openai_body_after_error(openai_body, resp.status_code, resp.text[:500])
+                if retry:
+                    retry_body, reason = retry
+                    print(f"[proxy] retrying compatible request | reason={reason}", flush=True)
+                    resp = await client.post(url, json=retry_body, headers=headers)
             if resp.status_code != 200:
                 err_text = resp.text[:500] if resp.text else "(empty)"
                 print(f"[proxy] backend error {resp.status_code}: {err_text}", flush=True)
@@ -2058,7 +2262,12 @@ async def userinfo_mock(request: Request):
 async def list_models(request: Request):
     """Return compatible model list."""
     models = model_list_for_config(config)
-    return JSONResponse({"data": models, "has_more": False, "first_id": models[0]["id"], "last_id": models[-1]["id"]})
+    return JSONResponse({
+        "data": models,
+        "has_more": False,
+        "first_id": models[0]["id"] if models else None,
+        "last_id": models[-1]["id"] if models else None,
+    })
 
 
 # Add proper organization endpoint (not just catch-all)
@@ -2360,6 +2569,8 @@ async def health():
         "outbound_proxy_url": mask_url_credentials(config.outbound_proxy_url),
         "inline_image_policy": config.inline_image_policy,
         "proxy_dir": str(PROXY_DIR),
+        "source_path": str(Path(__file__).resolve()),
+        "config_revision": str(config.get("_csa_revision", "") or ""),
     }
 
 

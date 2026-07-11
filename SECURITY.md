@@ -21,12 +21,12 @@ Use `outbound_proxy_url` for explicit backend egress through a local node.
 
 ## Local Control Plane
 
-Loopback binding is not an authentication boundary. Before distributing this
-project, the management API must require a control credential, reject untrusted
-Origin and Host headers, and avoid wildcard CORS. The data API must use a
-high-entropy token by default. Do not expose the current service to a LAN or
-package it as a launcher-managed product until these controls and their tests
-are in place.
+Loopback binding is not an authentication boundary. The management API rejects
+untrusted browser origins, and required path/control-token mode is supported,
+but the current local default can still be `optional`. Do not expose the Bridge
+to a LAN or public interface. A future non-loopback mode must require a
+high-entropy data token, strict Host/Origin checks, and rate limiting before it
+can be considered supported.
 
 Run only one writable Bridge instance. A Windows Bridge and a WSL Bridge must
 not share the same configuration file or present separate dashboards for one

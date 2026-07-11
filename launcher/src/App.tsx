@@ -19,6 +19,16 @@ interface SystemStatus {
   runtimeReady: boolean;
   sourceBinaryPresent: boolean;
   bridgeVenvPresent: boolean;
+  wslStoragePath?: string;
+  wslStorageDrive?: string;
+  wslStorageFreeGb?: number;
+  wslVhdxSizeGb?: number;
+  wslRootFreeGb?: number;
+  settingsStorageDrive?: string;
+  settingsStorageFreeGb?: number;
+  storageWarning: boolean;
+  storageBlocked: boolean;
+  restartBlocked: boolean;
   warnings: string[];
 }
 
@@ -26,7 +36,7 @@ interface Provider {
   id: string;
   name: string;
   meta: string;
-  badge: "官方" | "聚合" | "中转" | "自定义";
+  badge: "官方" | "聚合" | "中转" | "自建" | "自定义";
   trust: string;
   protocol: string;
   baseUrl?: string;
@@ -96,7 +106,7 @@ const fallbackProviderGroups: ProviderGroup[] = [
       { id: "glm", name: "GLM-5.2", meta: "智谱官方 API", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
       { id: "longcat", name: "LongCat", meta: "OpenAI / Anthropic 兼容", badge: "官方", trust: "official", protocol: "openai-compatible", baseUrl: "https://api.longcat.chat/openai" },
       { id: "deepseek", name: "DeepSeek", meta: "官方 API", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.deepseek.com/anthropic" },
-      { id: "minimax", name: "MiniMax", meta: "官方 API / Anthropic 兼容", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.minimax.io/anthropic" },
+      { id: "minimax", name: "MiniMax", meta: "中国区官方 API / Anthropic 兼容", badge: "官方", trust: "official", protocol: "anthropic-compatible", baseUrl: "https://api.minimaxi.com/anthropic" },
       { id: "claude", name: "Claude", meta: "官方登录 / API", badge: "官方", trust: "official", protocol: "official-login-or-api" },
       { id: "openai", name: "OpenAI / GPT", meta: "官方登录 / API", badge: "官方", trust: "official", protocol: "official-login-or-api", baseUrl: "https://api.openai.com/v1" },
     ],
@@ -110,10 +120,10 @@ const fallbackProviderGroups: ProviderGroup[] = [
     ],
   },
   {
-    title: "第三方中转",
+    title: "中转服务",
     tier: "custom",
     providers: [
-      { id: "builtin-relay", name: "内置中转", meta: "10521052.xyz/v1", badge: "中转", trust: "untrusted-builtin", protocol: "openai-compatible", baseUrl: "https://10521052.xyz/v1" },
+      { id: "builtin-relay", name: "项目方自建中转", meta: "10521052.xyz/v1 · 非模型厂商官方 API", badge: "自建", trust: "untrusted-builtin", protocol: "openai-compatible", baseUrl: "https://10521052.xyz/v1" },
       { id: "custom", name: "自定义中转", meta: "用户填写 Base URL", badge: "自定义", trust: "untrusted-custom", protocol: "openai-compatible" },
     ],
   },
@@ -135,6 +145,9 @@ const initialStatus: SystemStatus = {
   runtimeReady: false,
   sourceBinaryPresent: false,
   bridgeVenvPresent: false,
+  storageWarning: false,
+  storageBlocked: false,
+  restartBlocked: false,
   warnings: [],
 };
 
@@ -149,6 +162,16 @@ const browserPreviewStatus: SystemStatus = {
   runtimeReady: true,
   sourceBinaryPresent: true,
   bridgeVenvPresent: true,
+  wslStoragePath: "E:\\WSL\\Ubuntu-24.04",
+  wslStorageDrive: "E:",
+  wslStorageFreeGb: 420,
+  wslVhdxSizeGb: 48,
+  wslRootFreeGb: 390,
+  settingsStorageDrive: "C:",
+  settingsStorageFreeGb: 80,
+  storageWarning: false,
+  storageBlocked: false,
+  restartBlocked: false,
   warnings: [],
 };
 
@@ -165,6 +188,7 @@ const badgeClass: Record<Provider["badge"], string> = {
   官方: "official",
   聚合: "aggregator",
   中转: "relay",
+  自建: "relay",
   自定义: "custom",
 };
 
@@ -180,6 +204,35 @@ const providerInitial = (provider?: Provider) => {
 
 const providerList = (groups: ProviderGroup[]) => groups.flatMap((group) => group.providers);
 
+const previewCustomRelayLabel = (entries: ApiKeyEntry[], requestedName: string) => {
+  const requested = requestedName.trim();
+  if (requested) return requested;
+  const date = new Date().toLocaleDateString("sv-SE");
+  const prefix = `自定义中转 ${date} #`;
+  const next = entries.reduce((highest, entry) => {
+    if (entry.providerId !== "custom" || !entry.label.startsWith(prefix)) return highest;
+    const sequence = Number.parseInt(entry.label.slice(prefix.length), 10);
+    return Number.isFinite(sequence) ? Math.max(highest, sequence) : highest;
+  }, 0) + 1;
+  return `${prefix}${String(next).padStart(2, "0")}`;
+};
+
+const initialHealthCollapsed = () => {
+  try {
+    return window.localStorage.getItem("csa-health-collapsed") === "1";
+  } catch {
+    return false;
+  }
+};
+
+const rememberHealthCollapsed = (value: boolean) => {
+  try {
+    window.localStorage.setItem("csa-health-collapsed", value ? "1" : "0");
+  } catch {
+    // The launcher remains usable when WebView storage is disabled or unavailable.
+  }
+};
+
 function App() {
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
   const [providerGroups, setProviderGroups] = useState<ProviderGroup[]>(fallbackProviderGroups);
@@ -191,6 +244,7 @@ function App() {
   const [showKeyPicker, setShowKeyPicker] = useState(false);
   const [draftProviderId, setDraftProviderId] = useState(fallbackSettings.selectedProviderId);
   const [draftApiKey, setDraftApiKey] = useState("");
+  const [draftDisplayName, setDraftDisplayName] = useState("");
   const [draftBaseUrl, setDraftBaseUrl] = useState("");
   const [draftModel, setDraftModel] = useState("");
   const [draftModelAliases, setDraftModelAliases] = useState<ModelAlias[]>([]);
@@ -202,7 +256,9 @@ function App() {
   const [autoMappingKey, setAutoMappingKey] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
   const refreshInFlight = useRef(false);
+  const busyRef = useRef(false);
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
@@ -214,7 +270,7 @@ function App() {
   const summary = stateText[status.state];
 
   const refresh = useCallback(async () => {
-    if (refreshInFlight.current) return;
+    if (refreshInFlight.current || busyRef.current) return;
     refreshInFlight.current = true;
     try {
       if (!isTauri) {
@@ -255,10 +311,16 @@ function App() {
 
   const primaryLabel = useMemo(() => {
     if (status.state === "running") return "打开 Claude Science";
+    if (status.restartBlocked) return "先处理诊断问题";
     if (status.state === "notInstalled") return "安装运行环境";
     if (status.state === "degraded") return "修复并重启";
     return "启动 Claude Science";
-  }, [status.state]);
+  }, [status.state, status.restartBlocked]);
+
+  function updateBusy(value: boolean) {
+    busyRef.current = value;
+    setBusy(value);
+  }
 
   function applyLauncherState(settings: LauncherSettings) {
     setActiveProvider(settings.selectedProviderId);
@@ -272,6 +334,7 @@ function App() {
     const provider = providerList(groups).find((item) => item.id === providerId) || providerList(groups)[0];
     setDraftProviderId(provider?.id || providerId);
     setDraftApiKey("");
+    setDraftDisplayName("");
     setDraftBaseUrl(provider?.id === "custom" ? baseUrl : provider?.baseUrl || "");
     setDraftModel("");
     setDraftModelAliases([]);
@@ -288,6 +351,7 @@ function App() {
   function chooseDraftProvider(provider: Provider) {
     setDraftProviderId(provider.id);
     setDraftApiKey("");
+    setDraftDisplayName("");
     setDraftBaseUrl(provider.id === "custom" ? customBaseUrl : provider.baseUrl || "");
     setDraftModel("");
     setDraftModelAliases([]);
@@ -297,25 +361,29 @@ function App() {
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
-    setBusy(true);
+    updateBusy(true);
     setError("");
     try {
       setStatus(await invoke<SystemStatus>(command));
     } catch (reason) {
       setError(String(reason));
     } finally {
-      setBusy(false);
+      updateBusy(false);
     }
   }
 
   async function applyDraftKey() {
     if (!draftProvider) return;
+    if (status.restartBlocked) {
+      setError("当前诊断不允许写入或切换 API Key；请先处理磁盘、WSL 或安装包问题。连接测试仍可使用。");
+      return;
+    }
     if (draftNeedsBaseUrl && !draftBaseUrl.trim()) {
       setError("请先填写自定义中转 Base URL。");
       return;
     }
     if (draftIsThirdParty && !draftConfirmed) {
-      setError("第三方中转需要先确认域名，避免 API Key 被误发到不熟悉的地址。");
+      setError("中转服务需要先确认域名，避免 API Key 被误发到不熟悉的地址。");
       return;
     }
     if (draftProvider.id !== "claude" && !draftApiKey.trim()) {
@@ -328,7 +396,9 @@ function App() {
       const entry: ApiKeyEntry = {
         id,
         providerId: draftProvider.id,
-        label: draftProvider.name,
+        label: draftProvider.id === "custom"
+          ? previewCustomRelayLabel(apiKeys, draftDisplayName)
+          : draftProvider.name,
         baseUrl: draftBaseUrl,
         model: draftModel,
         customConfirmed: draftConfirmed,
@@ -343,15 +413,17 @@ function App() {
       setCustomConfirmed(draftConfirmed);
       setShowKeyPicker(false);
       setDraftApiKey("");
+      setDraftDisplayName("");
       return;
     }
 
-    setBusy(true);
+    updateBusy(true);
     setError("");
     try {
       const saved = await invoke<LauncherSettings>("save_api_key", {
         selectedProviderId: draftProvider.id,
         apiKey: draftApiKey,
+        displayName: draftDisplayName,
         customBaseUrl: draftBaseUrl,
         customConfirmed: draftConfirmed,
         model: draftModel,
@@ -359,13 +431,14 @@ function App() {
       });
       applyLauncherState(saved);
       setDraftApiKey("");
+      setDraftDisplayName("");
       setDraftModelAliases([]);
       setAutoMapResult(undefined);
       setShowKeyPicker(false);
     } catch (reason) {
       setError(String(reason));
     } finally {
-      setBusy(false);
+      updateBusy(false);
     }
   }
 
@@ -376,7 +449,7 @@ function App() {
       return;
     }
     if (draftIsThirdParty && !draftConfirmed) {
-      setError("第三方中转需要先确认域名后再测试，避免 API Key 发到错误地址。");
+      setError("中转服务需要先确认域名后再测试，避免 API Key 发到错误地址。");
       return;
     }
     if (!draftApiKey.trim()) {
@@ -439,7 +512,7 @@ function App() {
       return;
     }
     if (draftIsThirdParty && !draftConfirmed) {
-      setError("第三方中转需要先确认域名后再自动映射，避免 API Key 发到错误地址。");
+      setError("中转服务需要先确认域名后再自动映射，避免 API Key 发到错误地址。");
       return;
     }
     if (!draftApiKey.trim()) {
@@ -497,6 +570,10 @@ function App() {
 
   async function activateKey(apiKeyId: string) {
     if (apiKeyId === activeApiKeyId) return;
+    if (status.restartBlocked) {
+      setError("当前诊断不允许切换 API Key；请先处理磁盘、WSL 或安装包问题。");
+      return;
+    }
     if (!isTauri) {
       const entry = apiKeys.find((item) => item.id === apiKeyId);
       if (!entry) return;
@@ -505,14 +582,14 @@ function App() {
       setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === apiKeyId })));
       return;
     }
-    setBusy(true);
+    updateBusy(true);
     setError("");
     try {
       applyLauncherState(await invoke<LauncherSettings>("activate_api_key", { apiKeyId }));
     } catch (reason) {
       setError(String(reason));
     } finally {
-      setBusy(false);
+      updateBusy(false);
     }
   }
 
@@ -521,14 +598,14 @@ function App() {
       setApiKeys((current) => current.filter((item) => item.id !== apiKeyId));
       return;
     }
-    setBusy(true);
+    updateBusy(true);
     setError("");
     try {
       applyLauncherState(await invoke<LauncherSettings>("delete_api_key", { apiKeyId }));
     } catch (reason) {
       setError(String(reason));
     } finally {
-      setBusy(false);
+      updateBusy(false);
     }
   }
 
@@ -539,6 +616,11 @@ function App() {
       } catch (reason) {
         setError(String(reason));
       }
+      return;
+    }
+    if (status.restartBlocked) {
+      const location = status.wslStoragePath || "当前 WSL 虚拟磁盘";
+      setError(`当前不适合自动启动或重启（${location}）。请先根据诊断信息检查磁盘空间、WSL 状态或重新解压完整安装包；启动器不会冒险修改环境。`);
       return;
     }
     if (status.state === "degraded") return runAction("restart_services");
@@ -556,6 +638,18 @@ function App() {
       setError(String(reason));
     }
   }
+
+  const bridgeDetail = status.bridgeHealthy
+    ? (status.bridgePid ? `PID ${status.bridgePid}` : "健康")
+    : status.bridgeRunning
+      ? (status.bridgePid ? `PID ${status.bridgePid}，健康检查失败` : "服务/端口存在，健康检查失败")
+      : "已停止";
+  const claudeDetail = status.claudeRunning
+    ? (status.claudePid ? `PID ${status.claudePid}` : "端口已监听")
+    : "已停止";
+  const storageDetail = status.wslStoragePath
+    ? `${status.wslStoragePath}${typeof status.wslStorageFreeGb === "number" ? ` · 宿主盘剩余 ${status.wslStorageFreeGb.toFixed(1)} GB` : ""}${typeof status.wslRootFreeGb === "number" ? ` · Linux 剩余 ${status.wslRootFreeGb.toFixed(1)} GB` : ""}`
+    : "未定位 WSL 虚拟磁盘";
 
   return (
     <main className="app-shell">
@@ -580,12 +674,35 @@ function App() {
         </button>
       </section>
 
-      <section className="health-grid" aria-label="环境检查">
-        <HealthItem label="WSL2" ok={status.wslInstalled} detail={status.distro || "未检测到"} />
-        <HealthItem label="运行时" ok={status.runtimeReady} detail={status.runtimeReady ? "已准备" : "需体检/修复"} />
-        <HealthItem label="Bridge" ok={status.bridgeHealthy} detail={status.bridgePid ? `PID ${status.bridgePid}` : "已停止"} />
-        <HealthItem label="Claude Science" ok={status.claudeRunning} detail={status.claudePid ? `PID ${status.claudePid}` : "已停止"} />
-        <HealthItem label="当前 API Key" ok={Boolean(activeKeyEntry)} detail={activeKeyEntry ? activeKeyProvider?.name || activeKeyEntry.label : "未添加"} />
+      <section className={`health-panel ${healthCollapsed ? "collapsed" : ""}`} aria-label="环境检查">
+        <div className="health-panel-head">
+          <div>
+            <strong>环境状态</strong>
+            <small>{healthCollapsed ? "6 项状态已收起" : "6 项状态 · 2 行 × 3 列"}</small>
+          </div>
+          <button
+            type="button"
+            aria-expanded={!healthCollapsed}
+            aria-controls="health-status-grid"
+            onClick={() => {
+              const next = !healthCollapsed;
+              setHealthCollapsed(next);
+              rememberHealthCollapsed(next);
+            }}
+          >
+            {healthCollapsed ? "展开" : "收起"}
+          </button>
+        </div>
+        {!healthCollapsed && (
+          <div className="health-grid" id="health-status-grid">
+            <HealthItem label="WSL2" ok={status.wslInstalled} detail={status.distro || "未检测到"} />
+            <HealthItem label="运行时" ok={status.runtimeReady} detail={status.runtimeReady ? "已准备" : "需体检/修复"} />
+            <HealthItem label="Bridge" ok={status.bridgeHealthy} detail={bridgeDetail} />
+            <HealthItem label="Claude Science" ok={status.claudeRunning} detail={claudeDetail} />
+            <HealthItem label="WSL 存储" ok={!status.storageWarning} detail={storageDetail} />
+            <HealthItem label="当前 API Key" ok={Boolean(activeKeyEntry)} detail={activeKeyEntry?.label || "未添加"} />
+          </div>
+        )}
       </section>
 
       {(error || status.warnings.length > 0) && (
@@ -650,7 +767,7 @@ function App() {
                   <span className="key-row-actions">
                     {active
                       ? <span className="active-key-label">使用中</span>
-                      : <button onClick={() => activateKey(entry.id)} disabled={busy}>使用</button>}
+                      : <button onClick={() => activateKey(entry.id)} disabled={busy || status.restartBlocked}>使用</button>}
                     <button onClick={() => deleteKey(entry.id)} disabled={busy || active}>删除</button>
                   </span>
                 </div>
@@ -731,6 +848,19 @@ function App() {
                         setAutoMapResult(undefined);
                         setDraftModelAliases([]);
                       }}
+                    />
+                  </label>
+                )}
+
+                {draftNeedsBaseUrl && (
+                  <label>
+                    中转名称
+                    <input
+                      value={draftDisplayName}
+                      maxLength={80}
+                      placeholder="可留空；自动使用“自定义中转 + 日期 + 序号”"
+                      spellCheck={false}
+                      onChange={(event) => setDraftDisplayName(event.currentTarget.value)}
                     />
                   </label>
                 )}
@@ -853,12 +983,12 @@ function App() {
                         setDraftModelAliases([]);
                       }}
                     />
-                    我确认这是自己选择的第三方中转，API Key 只发送到该域名。
+                    我已确认该中转服务域名，API Key 只发送到该地址。
                   </label>
                 )}
 
                 <div className="form-actions">
-                  <button className="primary-inline-button" onClick={applyDraftKey} disabled={busy || testingKey || autoMappingKey}>
+                  <button className="primary-inline-button" onClick={applyDraftKey} disabled={busy || testingKey || autoMappingKey || status.restartBlocked}>
                     {busy ? "正在保存…" : "保存并设为当前 Key"}
                   </button>
                   <button onClick={() => setShowKeyPicker(false)} disabled={busy || testingKey || autoMappingKey}>取消</button>
@@ -872,8 +1002,8 @@ function App() {
       <footer>
         <span>{status.linuxUser && status.distro ? `${status.linuxUser} · ${status.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
-          <button onClick={openDashboard} disabled={busy || !status.bridgeRunning}>配置面板</button>
-          <button onClick={() => runAction("restart_services")} disabled={busy || !status.wslInstalled}>重启</button>
+          <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
+          <button onClick={() => runAction("restart_services")} disabled={busy || !status.wslInstalled || status.restartBlocked}>重启</button>
           <button onClick={() => runAction("stop_services")} disabled={busy || (!status.bridgeRunning && !status.claudeRunning)}>停止</button>
         </div>
       </footer>
