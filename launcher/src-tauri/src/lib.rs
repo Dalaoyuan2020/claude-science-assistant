@@ -204,6 +204,8 @@ struct WslProbeStorage {
 struct WslProbeRuntime {
     bridge_pid: Option<u32>,
     claude_pid: Option<u32>,
+    bridge_source_path: Option<String>,
+    bridge_source_matches: Option<bool>,
     #[serde(default)]
     bridge_healthy: bool,
     #[serde(default)]
@@ -600,6 +602,17 @@ fn rounded_gb_from_kb(kb: u64) -> f64 {
     ((kb as f64 / 1024_f64.powi(2)) * 10.0).round() / 10.0
 }
 
+fn is_windows_system_drive(drive: Option<&str>) -> bool {
+    drive
+        .map(|value| {
+            value
+                .trim()
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case("C:")
+        })
+        .unwrap_or(false)
+}
+
 fn inspect_wsl_runtime(distro: &str, project_wsl: &str) -> Result<WslProbeReport, String> {
     let inspect_script = format!(
         "{}/skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh",
@@ -706,6 +719,7 @@ fn current_status() -> SystemStatus {
     let settings_storage_free_gb = windows_storage
         .settings_drive_free_bytes
         .map(rounded_gb_from_bytes);
+    let wsl_on_system_drive = is_windows_system_drive(windows_storage.wsl_drive.as_deref());
     let project_files_present = project_runtime_files_present();
     let project_wsl = project_root()
         .ok()
@@ -794,6 +808,7 @@ fn current_status() -> SystemStatus {
         || root_free_ratio.map(|ratio| ratio < 0.01).unwrap_or(false)
         || inode_free_ratio.map(|ratio| ratio < 0.01).unwrap_or(false);
     let storage_warning = storage_blocked
+        || wsl_on_system_drive
         || wsl_storage_free_gb.map(|free| free < 15.0).unwrap_or(false)
         || wsl_root_free_gb.map(|free| free < 15.0).unwrap_or(false)
         || settings_storage_free_gb
@@ -808,7 +823,23 @@ fn current_status() -> SystemStatus {
         warnings.push("Bridge process/service/port exists, but health check failed.".into());
     }
     if probe.runtime.bridge_health_responding && !bridge_healthy {
-        warnings.push("Port 9876 is answered by a Bridge from another or older CSA package directory; restart from this package to migrate it.".into());
+        let expected = project_wsl
+            .as_deref()
+            .map(|root| format!("{}/proxy.py", root.trim_end_matches('/')))
+            .unwrap_or_else(|| "unknown".into());
+        let actual = probe
+            .runtime
+            .bridge_source_path
+            .as_deref()
+            .unwrap_or("unknown");
+        let source_match = probe
+            .runtime
+            .bridge_source_matches
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        warnings.push(format!(
+            "Port 9876 is answered by a Bridge from another or older CSA package directory; expected {expected}, actual {actual}, source_match={source_match}. Restart from this package to migrate it."
+        ));
     }
     if bridge_running && !claude_running {
         warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
@@ -842,6 +873,15 @@ fn current_status() -> SystemStatus {
         warnings.push(
             "WSL root filesystem is mounted read-only. Do not restart or repair CSA until the host disk and WSL VHDX are healthy.".into(),
         );
+    }
+    if wsl_on_system_drive {
+        let location = windows_storage
+            .wsl_base_path
+            .as_deref()
+            .unwrap_or("C: (exact WSL storage path unavailable)");
+        warnings.push(format!(
+            "WSL virtual disk is located on the Windows system drive ({location}). Large experiments can exhaust C:. CSA will not move the distro automatically; do not move ext4.vhdx manually. Generate and review a machine-specific migration plan before any WSL Move/export/import operation."
+        ));
     }
     if let Some(free) = wsl_storage_free_gb.filter(|free| *free < 15.0) {
         let location = windows_storage
@@ -957,10 +997,27 @@ fn project_root() -> Result<PathBuf, String> {
             candidates.push(parent.to_path_buf());
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd);
+
+    if let Some(argv0) = std::env::args_os().next() {
+        let argv0 = PathBuf::from(argv0);
+        let argv0 = if argv0.is_absolute() {
+            argv0
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(argv0)
+        } else {
+            argv0
+        };
+        if let Some(parent) = argv0.parent() {
+            candidates.push(parent.to_path_buf());
+        }
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    if cfg!(debug_assertions) {
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd);
+        }
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    }
 
     candidates
         .iter()
@@ -3938,5 +3995,14 @@ mod tests {
             })),
             "http://127.0.0.1:9876/secret%20token/dashboard"
         );
+    }
+
+    #[test]
+    fn system_drive_detection_warns_only_for_windows_c_drive() {
+        assert!(is_windows_system_drive(Some("C:")));
+        assert!(is_windows_system_drive(Some("c:\\")));
+        assert!(!is_windows_system_drive(Some("D:")));
+        assert!(!is_windows_system_drive(Some("/mnt/c")));
+        assert!(!is_windows_system_drive(None));
     }
 }

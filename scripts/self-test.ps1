@@ -17,20 +17,29 @@ if (-not (Test-Path $Python)) {
 
   $venvDir = Join-Path $ProjectDir ".venv"
   $py = Get-Command py -ErrorAction SilentlyContinue
-  $python = Get-Command python -ErrorAction SilentlyContinue
+  $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
   if ($py) {
     & $py.Source -3 -m venv $venvDir
-  } elseif ($python) {
-    & $python.Source -m venv $venvDir
+  } elseif ($pythonCommand) {
+    & $pythonCommand.Source -m venv $venvDir
   } else {
     throw "Python not found. Install Python 3 or set PYTHON to python.exe."
   }
   if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment (exit $LASTEXITCODE)." }
-  $Python = (Resolve-Path -LiteralPath $defaultPython).Path
+  $Python = $defaultPython
+}
+
+$Python = (Resolve-Path -LiteralPath $Python).Path
+& $Python -c "import fastapi, httpx, starlette, uvicorn"
+$dependenciesReady = ($LASTEXITCODE -eq 0)
+if (-not $dependenciesReady) {
+  Write-Host "Python test dependencies are missing or incomplete; repairing the local venv."
   & $Python -m pip install --upgrade pip
   if ($LASTEXITCODE -ne 0) { throw "Failed to install pip (exit $LASTEXITCODE)." }
   & $Python -m pip install -r (Join-Path $ProjectDir "requirements.txt")
   if ($LASTEXITCODE -ne 0) { throw "Failed to install test requirements (exit $LASTEXITCODE)." }
+  & $Python -c "import fastapi, httpx, starlette, uvicorn"
+  if ($LASTEXITCODE -ne 0) { throw "Python requirements were installed but imports still fail (exit $LASTEXITCODE)." }
 }
 
 & $Python -m py_compile proxy.py setup-token.py forward-443.py

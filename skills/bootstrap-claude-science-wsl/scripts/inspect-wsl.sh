@@ -30,6 +30,7 @@ claude_pid="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {pr
 bridge_healthy=false
 bridge_health_responding=false
 bridge_source_matches=null
+bridge_source_path=""
 health_payload="$(curl -fsS --connect-timeout 0.4 --max-time 1 http://127.0.0.1:9876/health 2>/dev/null || true)"
 if [ -n "$health_payload" ]; then
   bridge_health_responding=true
@@ -41,8 +42,16 @@ if [ -n "$health_payload" ]; then
   fi
   health_state="foreign"
   if [ -n "$health_python" ]; then
+    bridge_source_path="$("$health_python" -c '
+import json, sys
+try:
+    health = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit
+print(str(health.get("source_path") or ""))
+' "$health_payload" 2>/dev/null || true)"
     health_state="$("$health_python" -c '
-import json, os, sys
+import json, os, re, sys
 try:
     health = json.loads(sys.argv[2])
 except Exception:
@@ -50,7 +59,18 @@ except Exception:
     raise SystemExit
 expected = os.path.realpath(sys.argv[1])
 actual = os.path.realpath(str(health.get("source_path") or ""))
-print("current" if health.get("status") == "ok" and actual == expected else "foreign")
+
+def comparison_key(path):
+    # DrvFs paths inherit Windows case-insensitive path identity even though
+    # Python is running inside Linux. Native Linux paths remain case-sensitive.
+    return path.casefold() if re.match(r"^/mnt/[a-zA-Z]/", path) else path
+
+print(
+    "current"
+    if health.get("status") == "ok"
+    and comparison_key(actual) == comparison_key(expected)
+    else "foreign"
+)
 ' "$project_dir/proxy.py" "$health_payload" 2>/dev/null || true)"
   fi
   if [ "$health_state" = current ]; then
@@ -126,6 +146,7 @@ printf '"bridge_pid":%s,' "${bridge_pid:-null}"
 printf '"claude_pid":%s,' "${claude_pid:-null}"
 printf '"bridge_healthy":%s,' "$bridge_healthy"
 printf '"bridge_health_responding":%s,' "$bridge_health_responding"
+printf '"bridge_source_path":%s,' "$(printf '%s' "$bridge_source_path" | json_string)"
 printf '"bridge_source_matches":%s,' "$bridge_source_matches"
 printf '"bridge_service_active":%s,' "$bridge_service_active"
 printf '"unit_matches_project":%s,' "$unit_matches_project"

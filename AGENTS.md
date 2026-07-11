@@ -40,6 +40,8 @@ The supported runtime path is:
 6. Choose `*_upstream_mode=anthropic` for native Anthropic endpoints; otherwise use `openai`.
 7. Preserve caller output budgets. Do not add a global `max_tokens` cap; use explicit per-model caps or the narrow 400/422 compatibility retry.
 8. Verify `/health`, `/v1/models`, `/v1/messages`, Bridge `source_path`, and config revision.
+9. Treat WSL storage inspection and WSL storage migration as separate capabilities. Do not claim or execute C-drive migration, Move, export/import, unregister, VHDX relocation, or rebuild while the migration plan remains `DESIGN ONLY / BUILD NO-GO`.
+10. A release is incomplete unless the GitHub asset contains the EXE, Bridge, scripts, Skill, docs, and locked vendor Linux binary, and the remotely downloaded ZIP matches its `.sha256` and clean source commit.
 
 ## Repository Map
 
