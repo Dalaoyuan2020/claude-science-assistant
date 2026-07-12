@@ -46,14 +46,18 @@ if (-not $dependenciesReady) {
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
 $MigrationPromptSource = Join-Path $ProjectDir "launcher\src\storageMigration.ts"
-if (-not (Test-Path -LiteralPath $MigrationPromptSource)) {
-  throw "Storage migration Prompt generator is missing."
-}
-$MigrationPromptText = Get-Content -LiteralPath $MigrationPromptSource -Raw -Encoding UTF8
-foreach ($pattern in @('invoke\s*\(', 'fetch\s*\(', 'child_process', 'execFile\s*\(', 'writeFile\s*\(')) {
-  if ($MigrationPromptText -match $pattern) {
-    throw "Storage migration Prompt generator must remain side-effect free; forbidden pattern: $pattern"
+$MigrationPromptDocument = Join-Path $ProjectDir "docs\prompts\csa-wsl-storage-migration-codex-prompt.zh-CN.md"
+if (Test-Path -LiteralPath $MigrationPromptSource) {
+  $MigrationPromptText = Get-Content -LiteralPath $MigrationPromptSource -Raw -Encoding UTF8
+  foreach ($pattern in @('invoke\s*\(', 'fetch\s*\(', 'child_process', 'execFile\s*\(', 'writeFile\s*\(')) {
+    if ($MigrationPromptText -match $pattern) {
+      throw "Storage migration Prompt generator must remain side-effect free; forbidden pattern: $pattern"
+    }
   }
+} elseif (Test-Path -LiteralPath $MigrationPromptDocument) {
+  $MigrationPromptText = Get-Content -LiteralPath $MigrationPromptDocument -Raw -Encoding UTF8
+} else {
+  throw "Storage migration Prompt generator/document is missing."
 }
 foreach ($marker in @('BUILD NO-GO', 'wsl --unregister', 'source_path', 'config revision')) {
   if (-not $MigrationPromptText.Contains($marker)) {
