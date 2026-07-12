@@ -55,6 +55,7 @@ The supported runtime path is:
 - `scripts/probe-provider-capabilities.ps1`: explicit, billable Provider text/output/tool/reasoning probe; never run during routine startup.
 - `skills/bootstrap-claude-science-wsl/`: read-only-first inspection, approved repair, and rollback flow.
 - `docs/v0.1-current-pc-verification.zh-CN.md`: current release-candidate evidence and remaining gates.
+- `docs/plans/wsl-storage-migration-context-checkpoint.zh-CN.md`: single source of truth for storage detection, warnings, the planned Codex Prompt UI, and the migration execution gate.
 - `docs/agent-runbook.md`: operational procedure, including legacy Windows-path notes.
 - `docs/troubleshooting.md`: failure modes and fixes.
 - `config.example.json`: public, sanitized config template.

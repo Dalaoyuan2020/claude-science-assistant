@@ -45,6 +45,23 @@ if (-not $dependenciesReady) {
 & $Python -m py_compile proxy.py setup-token.py forward-443.py
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
+$MigrationPromptSource = Join-Path $ProjectDir "launcher\src\storageMigration.ts"
+if (-not (Test-Path -LiteralPath $MigrationPromptSource)) {
+  throw "Storage migration Prompt generator is missing."
+}
+$MigrationPromptText = Get-Content -LiteralPath $MigrationPromptSource -Raw -Encoding UTF8
+foreach ($pattern in @('invoke\s*\(', 'fetch\s*\(', 'child_process', 'execFile\s*\(', 'writeFile\s*\(')) {
+  if ($MigrationPromptText -match $pattern) {
+    throw "Storage migration Prompt generator must remain side-effect free; forbidden pattern: $pattern"
+  }
+}
+foreach ($marker in @('BUILD NO-GO', 'wsl --unregister', 'source_path', 'config revision')) {
+  if (-not $MigrationPromptText.Contains($marker)) {
+    throw "Storage migration Prompt is missing required safety marker: $marker"
+  }
+}
+Write-Host "storage migration Prompt safety checks passed"
+
 $code = @'
 import importlib.util
 from pathlib import Path

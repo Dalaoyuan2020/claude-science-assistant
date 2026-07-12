@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { buildStorageMigrationPrompt, storageRecommendation } from "./storageMigration";
 import "./App.css";
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
@@ -257,6 +258,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
+  const [showMigrationAssistant, setShowMigrationAssistant] = useState(false);
+  const [migrationCopyState, setMigrationCopyState] = useState("");
   const refreshInFlight = useRef(false);
   const busyRef = useRef(false);
 
@@ -268,6 +271,8 @@ function App() {
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
   const summary = stateText[status.state];
+  const migrationRecommendation = useMemo(() => storageRecommendation(status), [status]);
+  const migrationPrompt = useMemo(() => buildStorageMigrationPrompt(status), [status]);
 
   const refresh = useCallback(async () => {
     if (refreshInFlight.current || busyRef.current) return;
@@ -639,6 +644,20 @@ function App() {
     }
   }
 
+  function openMigrationAssistant() {
+    setMigrationCopyState("");
+    setShowMigrationAssistant(true);
+  }
+
+  async function copyMigrationPrompt() {
+    try {
+      await navigator.clipboard.writeText(migrationPrompt);
+      setMigrationCopyState("Prompt 已复制，可以粘贴到 Codex。");
+    } catch {
+      setMigrationCopyState("自动复制失败，请在下方文本框中按 Ctrl+A、Ctrl+C 手动复制。");
+    }
+  }
+
   const bridgeDetail = status.bridgeHealthy
     ? (status.bridgePid ? `PID ${status.bridgePid}` : "健康")
     : status.bridgeRunning
@@ -699,7 +718,13 @@ function App() {
             <HealthItem label="运行时" ok={status.runtimeReady} detail={status.runtimeReady ? "已准备" : "需体检/修复"} />
             <HealthItem label="Bridge" ok={status.bridgeHealthy} detail={bridgeDetail} />
             <HealthItem label="Claude Science" ok={status.claudeRunning} detail={claudeDetail} />
-            <HealthItem label="WSL 存储" ok={!status.storageWarning} detail={storageDetail} />
+            <HealthItem
+              label="WSL 存储"
+              ok={!status.storageWarning}
+              detail={storageDetail}
+              actionLabel={migrationRecommendation.actionLabel}
+              onAction={openMigrationAssistant}
+            />
             <HealthItem label="当前 API Key" ok={Boolean(activeKeyEntry)} detail={activeKeyEntry?.label || "未添加"} />
           </div>
         )}
@@ -715,7 +740,54 @@ function App() {
               停止旧 Windows Bridge（PID {status.windowsBridgePid}）
             </button>
           )}
+          {status.storageWarning && (
+            <button className="notice-action" onClick={openMigrationAssistant} disabled={busy}>
+              {migrationRecommendation.actionLabel}：交给 Codex
+            </button>
+          )}
         </section>
+      )}
+
+      {showMigrationAssistant && (
+        <div className="migration-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.currentTarget === event.target) setShowMigrationAssistant(false);
+        }}>
+          <section className={`migration-dialog migration-${migrationRecommendation.kind}`} role="dialog" aria-modal="true" aria-labelledby="migration-dialog-title">
+            <div className="migration-dialog-head">
+              <div>
+                <span className="eyebrow">WSL 存储辅助迁移</span>
+                <h2 id="migration-dialog-title">{migrationRecommendation.title}</h2>
+                <p>{migrationRecommendation.detail}</p>
+              </div>
+              <button className="quiet-button" onClick={() => setShowMigrationAssistant(false)}>关闭</button>
+            </div>
+
+            <div className="migration-facts">
+              <div><span>发行版</span><strong>{status.distro || "未检测到"}</strong></div>
+              <div><span>当前位置</span><strong>{status.wslStoragePath || "未定位 VHDX"}</strong></div>
+              <div><span>宿主盘剩余</span><strong>{typeof status.wslStorageFreeGb === "number" ? `${status.wslStorageFreeGb.toFixed(1)} GB` : "未检测到"}</strong></div>
+              <div><span>Linux 剩余</span><strong>{typeof status.wslRootFreeGb === "number" ? `${status.wslRootFreeGb.toFixed(1)} GB` : "未检测到"}</strong></div>
+            </div>
+
+            <div className="migration-reasons">
+              <strong>为什么出现这个建议</strong>
+              {migrationRecommendation.reasons.map((reason) => <p key={reason}>• {reason}</p>)}
+            </div>
+
+            <div className="migration-boundary">
+              启动器只生成本机化 Prompt，不会停止 WSL、移动 VHDX、修改注册表或执行 unregister。迁移与 CSA 增量升级是两条独立流程。
+            </div>
+
+            <label className="migration-prompt-label" htmlFor="migration-prompt">
+              复制下面内容给 Codex
+            </label>
+            <textarea id="migration-prompt" value={migrationPrompt} readOnly spellCheck={false} />
+            <div className="migration-actions">
+              {migrationCopyState && <span aria-live="polite">{migrationCopyState}</span>}
+              <button className="primary-inline-button" onClick={copyMigrationPrompt}>复制 Prompt</button>
+            </div>
+          </section>
+        </div>
       )}
 
       <section className="kit-section">
@@ -1011,11 +1083,18 @@ function App() {
   );
 }
 
-function HealthItem({ label, ok, detail }: { label: string; ok: boolean; detail: string }) {
+function HealthItem({ label, ok, detail, actionLabel, onAction }: {
+  label: string;
+  ok: boolean;
+  detail: string;
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
   return (
     <div className="health-item">
       <span className={`health-check ${ok ? "ok" : ""}`}>{ok ? "✓" : "—"}</span>
-      <div><strong>{label}</strong><small>{detail}</small></div>
+      <div className="health-item-copy"><strong>{label}</strong><small>{detail}</small></div>
+      {actionLabel && onAction && <button className="health-item-action" onClick={onAction}>{actionLabel}</button>}
     </div>
   );
 }

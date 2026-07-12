@@ -3,6 +3,8 @@ param(
   [ValidateSet("debug", "release")]
   [string]$Profile = "debug",
   [string]$OutputDir = "",
+  [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')]
+  [string]$PackageQualifier = "",
   [switch]$SkipBuild
 )
 
@@ -55,7 +57,8 @@ if (-not (Test-Path -LiteralPath $ExePath)) {
   throw "Launcher exe not found: $ExePath"
 }
 
-$PackageName = "claude-science-assistant-v$Version-$Profile-portable"
+$QualifiedVersion = if ($PackageQualifier) { "v$Version-$PackageQualifier" } else { "v$Version" }
+$PackageName = "claude-science-assistant-$QualifiedVersion-$Profile-portable"
 $PackageRoot = Join-Path $OutputDir $PackageName
 $ZipPath = Join-Path $OutputDir "$PackageName.zip"
 $ShaPath = Join-Path $OutputDir "$PackageName.zip.sha256"
@@ -73,6 +76,7 @@ if (Test-Path -LiteralPath $ShaPath) {
 New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "docs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "docs") "prompts") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "docs") "plans") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "skills") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "scripts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "static") | Out-Null
@@ -113,6 +117,14 @@ Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-clean-pc-
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "provider-access-matrix.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "provider-access-matrix.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "troubleshooting.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "troubleshooting.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $ProjectDir "docs") "prompts") "csa-install-or-upgrade-agent-prompt.zh-CN.md") -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "docs") "prompts") "csa-install-or-upgrade-agent-prompt.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $ProjectDir "docs") "prompts") "csa-wsl-storage-migration-codex-prompt.zh-CN.md") -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "docs") "prompts") "csa-wsl-storage-migration-codex-prompt.zh-CN.md")
+foreach ($file in @(
+  "wsl-storage-migration-context-checkpoint.zh-CN.md",
+  "wsl-storage-migration-plan.zh-CN.md",
+  "wsl-storage-migration-review-result.zh-CN.md"
+)) {
+  Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $ProjectDir "docs") "plans") $file) -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "docs") "plans") $file)
+}
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "skills") "bootstrap-claude-science-wsl") -Destination (Join-Path (Join-Path $PackageRoot "skills") "bootstrap-claude-science-wsl") -Recurse
 $BundledClaudeDir = Join-Path (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") "linux-x64"
 $BundledClaudeBin = Join-Path $BundledClaudeDir "claude-science"
@@ -160,6 +172,7 @@ $Manifest = [ordered]@{
   schemaVersion = 1
   product = "CSA - Claude Science Assistant"
   version = $Version
+  packageQualifier = $PackageQualifier
   profile = $Profile
   packageName = $PackageName
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
@@ -197,7 +210,11 @@ $Manifest = [ordered]@{
     "docs/v0.1-clean-pc-acceptance.zh-CN.md",
     "docs/provider-access-matrix.zh-CN.md",
     "docs/troubleshooting.md",
-    "docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md"
+    "docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md",
+    "docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md",
+    "docs/plans/wsl-storage-migration-context-checkpoint.zh-CN.md",
+    "docs/plans/wsl-storage-migration-plan.zh-CN.md",
+    "docs/plans/wsl-storage-migration-review-result.zh-CN.md"
   )
   security = [ordered]@{
     includesSecrets = $false
@@ -233,7 +250,7 @@ $Readme = @(
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
-  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
+  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
   "",
   "This package does not include API keys, OAuth tokens, control tokens, or user config."
 ) -join [Environment]::NewLine
