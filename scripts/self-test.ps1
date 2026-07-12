@@ -37,7 +37,11 @@ if (-not $dependenciesReady) {
   & $Python -m pip install --upgrade pip
   if ($LASTEXITCODE -ne 0) { throw "Failed to install pip (exit $LASTEXITCODE)." }
   & $Python -m pip install -r (Join-Path $ProjectDir "requirements.txt")
-  if ($LASTEXITCODE -ne 0) { throw "Failed to install test requirements (exit $LASTEXITCODE)." }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "Configured pip index did not provide the locked requirements; retrying this command against official PyPI without changing pip configuration."
+    & $Python -m pip install --index-url https://pypi.org/simple -r (Join-Path $ProjectDir "requirements.txt")
+  }
+  if ($LASTEXITCODE -ne 0) { throw "Failed to install test requirements from the configured index and official PyPI (exit $LASTEXITCODE)." }
   & $Python -c "import fastapi, httpx, starlette, uvicorn"
   if ($LASTEXITCODE -ne 0) { throw "Python requirements were installed but imports still fail (exit $LASTEXITCODE)." }
 }
