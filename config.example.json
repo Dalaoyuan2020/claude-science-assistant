@@ -40,5 +40,6 @@
   "reasoning_content_policy": "never",
   "inline_image_policy": "auto",
   "proxy_host": "127.0.0.1",
-  "proxy_port": 9876
+  "proxy_port": 9876,
+  "anthropic_bearer_backends": []
 }
