@@ -18,6 +18,8 @@ Quick start:
 from __future__ import annotations
 
 import asyncio
+import codecs
+import hashlib
 import hmac
 from io import BytesIO
 import json
@@ -27,6 +29,8 @@ import base64
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -85,6 +89,9 @@ class Config:
         "custom_model_pattern": "",
         "reasoning_content_policy": "never",
         "inline_image_policy": "auto",
+        "connect_diagnostic_tap_enabled": False,
+        "connect_tap_enabled": False,
+        "connect_tap_workspace": "",
         "proxy_host": "127.0.0.1",
         "proxy_port": 9876,
     }
@@ -116,6 +123,9 @@ class Config:
         "custom_model_pattern": "CUSTOM_MODEL_PATTERN",
         "reasoning_content_policy": "REASONING_CONTENT_POLICY",
         "inline_image_policy": "INLINE_IMAGE_POLICY",
+        "connect_diagnostic_tap_enabled": "CONNECT_DIAGNOSTIC_TAP_ENABLED",
+        "connect_tap_enabled": "CONNECT_TAP_ENABLED",
+        "connect_tap_workspace": "CONNECT_TAP_WORKSPACE",
         "proxy_host": "PROXY_HOST",
         "proxy_port": "PROXY_PORT",
     }
@@ -143,6 +153,8 @@ class Config:
             try:
                 if key in self.JSON_KEYS:
                     value = json.loads(value)
+                elif key in {"connect_diagnostic_tap_enabled", "connect_tap_enabled"}:
+                    value = str(value).strip().lower() in {"1", "true", "yes", "on"}
                 elif key in {"proxy_port", "default_max_tokens_cap"}:
                     value = int(value)
             except Exception:
@@ -244,6 +256,12 @@ class Config:
     def reasoning_content_policy(self) -> str: return self._data["reasoning_content_policy"]
     @property
     def inline_image_policy(self) -> str: return self._data["inline_image_policy"]
+    @property
+    def connect_diagnostic_tap_enabled(self) -> bool: return bool(self._data.get("connect_diagnostic_tap_enabled"))
+    @property
+    def connect_tap_enabled(self) -> bool: return bool(self._data.get("connect_tap_enabled"))
+    @property
+    def connect_tap_workspace(self) -> str: return str(self._data.get("connect_tap_workspace") or "")
     @property
     def proxy_host(self) -> str: return self._data["proxy_host"]
     @property
@@ -612,6 +630,13 @@ def model_list_for_config(cfg: Config) -> list[dict]:
 # ---------------------------------------------------------------------------
 MAX_LOG_ENTRIES = 200
 request_log: list[dict] = []
+CSA_DIAGNOSTIC_MARKER_RE = re.compile(r"^\s*(\[CSA#([A-Za-z0-9._:-]{1,64})\])")
+CSA_CONNECT_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CSA_ARTIFACT_MARKER_RE = re.compile(
+    r"\{\{artifact:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\}\}"
+)
+_connect_tap_lock = threading.Lock()
+_connect_tap_inflight: set[str] = set()
 
 
 def log_request(backend: str, model: str, stream: bool, status: str):
@@ -625,6 +650,346 @@ def log_request(backend: str, model: str, stream: bool, status: str):
     request_log.append(entry)
     if len(request_log) > MAX_LOG_ENTRIES:
         request_log.pop(0)
+
+
+def _append_request_log(entry: dict):
+    request_log.append(entry)
+    if len(request_log) > MAX_LOG_ENTRIES:
+        request_log.pop(0)
+
+
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
+def connect_diagnostic_marker(body: dict) -> str:
+    if not config.connect_diagnostic_tap_enabled:
+        return ""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        match = CSA_DIAGNOSTIC_MARKER_RE.match(_message_text(message.get("content")))
+        return match.group(1) if match else ""
+    return ""
+
+
+def connect_tap_message_id(body: dict) -> str:
+    if not config.connect_tap_enabled:
+        return ""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        match = CSA_DIAGNOSTIC_MARKER_RE.match(_message_text(message.get("content")))
+        if not match:
+            return ""
+        message_id = match.group(2)
+        return message_id if CSA_CONNECT_MESSAGE_ID_RE.fullmatch(message_id) else ""
+    return ""
+
+
+def anthropic_response_text(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    return "".join(
+        block.get("text", "")
+        for block in data.get("content", [])
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    )
+
+
+class DiagnosticSSETextAggregator:
+    """Collect visible Anthropic text deltas without changing forwarded SSE."""
+
+    def __init__(self):
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._buffer = ""
+        self._parts: list[str] = []
+        self._message_stopped = False
+
+    def feed(self, chunk):
+        if isinstance(chunk, bytes):
+            text = self._decoder.decode(chunk, final=False)
+        else:
+            text = str(chunk or "")
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._consume_line(line.rstrip("\r"))
+
+    def _consume_line(self, line: str):
+        if not line.startswith("data:"):
+            return
+        payload = line[5:].lstrip()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict) and data.get("type") == "message_stop":
+            self._message_stopped = True
+        delta = data.get("delta") if isinstance(data, dict) else None
+        if (
+            isinstance(data, dict)
+            and data.get("type") == "content_block_delta"
+            and isinstance(delta, dict)
+            and delta.get("type") == "text_delta"
+            and isinstance(delta.get("text"), str)
+        ):
+            self._parts.append(delta["text"])
+
+    def finish(self) -> str:
+        self._buffer += self._decoder.decode(b"", final=True)
+        if self._buffer:
+            self._consume_line(self._buffer.rstrip("\r"))
+            self._buffer = ""
+        return "".join(self._parts)
+
+    @property
+    def message_stopped(self) -> bool:
+        return self._message_stopped
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def log_connect_diagnostic_tap(marker: str, response_text: str, *, stream: bool, status: str = "success"):
+    if not marker or not config.connect_diagnostic_tap_enabled:
+        return
+    digest = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+    _append_request_log({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "backend": "diagnostic",
+        "model": "connect-tap",
+        "stream": stream,
+        "status": status,
+        "marker": marker,
+        "response_chars": len(response_text),
+        "response_sha256": digest,
+    })
+    print(
+        f"[proxy] connect diagnostic marker={marker} response_chars={len(response_text)} "
+        f"response_sha256={digest}",
+        flush=True,
+    )
+
+
+def _connect_tap_paths(message_id: str) -> tuple[Path, Path]:
+    workspace = Path(config.connect_tap_workspace).expanduser()
+    if not workspace.is_absolute():
+        raise ValueError("connect workspace must be absolute")
+    bridge_root = workspace / ".csa" / "connect" / "v1"
+    return bridge_root / "ack" / f"{message_id}.json", bridge_root / "outbox" / f"{message_id}.json"
+
+
+def _claimed_connect_ack(message_id: str) -> tuple[str, Optional[Path]]:
+    try:
+        ack_path, outbox_path = _connect_tap_paths(message_id)
+        ack = json.loads(ack_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "skipped_ack_missing", None
+    if not isinstance(ack, dict) or ack.get("messageId") != message_id:
+        return "skipped_ack_mismatch", None
+    ack_status = str(ack.get("status") or "")
+    if ack_status in {"replied", "needs_local_approval"}:
+        return "skipped_final", None
+    if ack_status not in {"claimed", "submitted", "delivery_unknown"}:
+        return "skipped_not_claimed", None
+    return "claimed", outbox_path
+
+
+def _write_connect_snapshot(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+        temp_path = None
+        os.chmod(path, 0o600)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def connect_reply_artifacts(response_text: str) -> tuple[str, list[str]]:
+    references: list[str] = []
+    seen: set[str] = set()
+    for match in CSA_ARTIFACT_MARKER_RE.finditer(response_text):
+        reference = match.group(1).lower()
+        if reference not in seen:
+            seen.add(reference)
+            references.append(reference)
+    visible_text = CSA_ARTIFACT_MARKER_RE.sub("", response_text)
+    visible_text = re.sub(r"[ \t]+\n", "\n", visible_text).strip()
+    if references and not visible_text:
+        visible_text = "图片已生成。"
+    return visible_text, references
+
+
+def write_connect_tap_progress(message_id: str, response_text: str, sequence: int) -> str:
+    if not config.connect_tap_enabled or not message_id:
+        return "disabled"
+    text, _ = connect_reply_artifacts(response_text)
+    if not text or sequence <= 0:
+        return "skipped_empty"
+    status, outbox_path = _claimed_connect_ack(message_id)
+    if status != "claimed" or outbox_path is None:
+        return status
+    progress_path = outbox_path.with_name(f"{message_id}.{sequence:08d}.progress.json")
+    if progress_path.exists() or outbox_path.exists():
+        return "skipped_existing"
+    _write_connect_snapshot(progress_path, {
+        "schemaVersion": 1,
+        "messageId": message_id,
+        "status": "",
+        "text": text,
+        "sequence": sequence,
+        "final": False,
+        "createdAt": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+    })
+    return "written"
+
+
+def write_connect_tap_outbox(message_id: str, response_text: str, sequence: int = 1) -> str:
+    if not config.connect_tap_enabled or not message_id:
+        return "disabled"
+    if not response_text.strip():
+        return "skipped_empty"
+
+    with _connect_tap_lock:
+        if message_id in _connect_tap_inflight:
+            return "skipped_inflight"
+        _connect_tap_inflight.add(message_id)
+
+    temp_path: Optional[Path] = None
+    try:
+        _, outbox_path = _connect_tap_paths(message_id)
+        if outbox_path.exists():
+            return "skipped_existing"
+        status, claimed_outbox_path = _claimed_connect_ack(message_id)
+        if status != "claimed" or claimed_outbox_path is None:
+            return status
+        outbox_path = claimed_outbox_path
+
+        visible_text, artifact_refs = connect_reply_artifacts(response_text)
+        if not visible_text:
+            return "skipped_empty"
+        payload = {
+            "schemaVersion": 1,
+            "messageId": message_id,
+            "status": "replied",
+            "text": visible_text,
+            "sequence": max(1, sequence),
+            "final": True,
+            "createdAt": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        }
+        if artifact_refs:
+            payload["artifactRefs"] = artifact_refs
+        with _connect_tap_lock:
+            if outbox_path.exists():
+                return "skipped_existing"
+            _write_connect_snapshot(outbox_path, payload)
+        return "written"
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        with _connect_tap_lock:
+            _connect_tap_inflight.discard(message_id)
+
+
+def complete_connect_taps(
+    message_id: str,
+    diagnostic_marker: str,
+    response_text: str,
+    *,
+    stream: bool,
+    progress_sequence: int = 1,
+):
+    log_connect_diagnostic_tap(diagnostic_marker, response_text, stream=stream)
+    if not message_id or not config.connect_tap_enabled:
+        return
+    digest = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+    try:
+        status = write_connect_tap_outbox(message_id, response_text, progress_sequence)
+    except Exception as error:
+        status = f"error_{type(error).__name__}"
+    _append_request_log({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "backend": "connect",
+        "model": "connect-tap",
+        "stream": stream,
+        "status": status,
+        "message_id": message_id,
+        "response_chars": len(response_text),
+        "response_sha256": digest,
+    })
+    print(
+        f"[proxy] connect tap message_id={message_id} status={status} "
+        f"response_chars={len(response_text)} response_sha256={digest}",
+        flush=True,
+    )
+
+
+class ConnectProgressEmitter:
+    """Persist paragraph-sized cumulative snapshots without delaying the SSE."""
+
+    def __init__(self, message_id: str):
+        self.message_id = message_id
+        self.sequence = 0
+        self.last_chars = 0
+        self.last_emit_at = time.monotonic()
+
+    def maybe_emit(self, response_text: str) -> None:
+        text = response_text.strip()
+        if not self.message_id or not config.connect_tap_enabled or len(text) <= self.last_chars:
+            return
+        delta = text[self.last_chars:]
+        elapsed = time.monotonic() - self.last_emit_at
+        paragraph_ready = "\n\n" in delta and len(delta.strip()) >= 20
+        size_ready = len(text) - self.last_chars >= 240
+        time_ready = elapsed >= 1.2 and len(text) - self.last_chars >= 40
+        if not (paragraph_ready or size_ready or time_ready):
+            return
+        self.sequence += 1
+        status = write_connect_tap_progress(self.message_id, text[:3400], self.sequence)
+        if status == "written":
+            self.last_chars = len(text)
+            self.last_emit_at = time.monotonic()
+
+    def final_sequence(self) -> int:
+        return self.sequence + 1
 
 
 def redact_proxy_auth_path(path: str) -> str:
@@ -1995,6 +2360,8 @@ async def messages_api(request: Request):
     body, json_error = await read_json_object(request)
     if json_error:
         return json_error
+    diagnostic_marker = connect_diagnostic_marker(body)
+    connect_message_id = connect_tap_message_id(body)
     original_model = body.get("model", "claude-sonnet-4-5")
 
     try:
@@ -2016,6 +2383,9 @@ async def messages_api(request: Request):
 
         if stream:
             async def native_stream_gen():
+                diagnostic = DiagnosticSSETextAggregator() if diagnostic_marker or connect_message_id else None
+                progress = ConnectProgressEmitter(connect_message_id) if connect_message_id else None
+                tap_completed = False
                 try:
                     async with client.stream("POST", url, json=native_body, headers=headers) as backend_resp:
                         if backend_resp.status_code != 200:
@@ -2032,7 +2402,28 @@ async def messages_api(request: Request):
                         log_request(backend["backend"], backend["model"], True, "success")
                         async for chunk in backend_resp.aiter_bytes():
                             if chunk:
+                                if diagnostic:
+                                    diagnostic.feed(chunk)
+                                    if progress:
+                                        progress.maybe_emit(diagnostic.text)
+                                    if diagnostic.message_stopped and not tap_completed:
+                                        complete_connect_taps(
+                                            connect_message_id,
+                                            diagnostic_marker,
+                                            diagnostic.finish(),
+                                            stream=True,
+                                            progress_sequence=progress.final_sequence() if progress else 1,
+                                        )
+                                        tap_completed = True
                                 yield chunk
+                        if diagnostic and not tap_completed:
+                            complete_connect_taps(
+                                connect_message_id,
+                                diagnostic_marker,
+                                diagnostic.finish(),
+                                stream=True,
+                                progress_sequence=progress.final_sequence() if progress else 1,
+                            )
                 except Exception as e:
                     log_request(backend["backend"], backend["model"], True, "error")
                     safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
@@ -2053,6 +2444,12 @@ async def messages_api(request: Request):
             data = resp.json()
             if isinstance(data, dict) and data.get("type") == "message":
                 data["model"] = original_model
+            complete_connect_taps(
+                connect_message_id,
+                diagnostic_marker,
+                anthropic_response_text(data),
+                stream=False,
+            )
             return JSONResponse(data)
         except Exception as e:
             log_request(backend["backend"], backend["model"], False, "error")
@@ -2070,6 +2467,9 @@ async def messages_api(request: Request):
 
     if stream:
         async def stream_gen():
+            diagnostic = DiagnosticSSETextAggregator() if diagnostic_marker or connect_message_id else None
+            progress = ConnectProgressEmitter(connect_message_id) if connect_message_id else None
+            tap_completed = False
             try:
                 request_body = openai_body
                 for attempt in range(2):
@@ -2078,7 +2478,28 @@ async def messages_api(request: Request):
                             log_request(backend["backend"], backend["model"], True, "success")
                             events = translate_stream(backend_resp, original_model, request_id, tool_name_lookup)
                             async for event in stream_events_with_heartbeat(events):
+                                if diagnostic:
+                                    diagnostic.feed(event)
+                                    if progress:
+                                        progress.maybe_emit(diagnostic.text)
+                                    if diagnostic.message_stopped and not tap_completed:
+                                        complete_connect_taps(
+                                            connect_message_id,
+                                            diagnostic_marker,
+                                            diagnostic.finish(),
+                                            stream=True,
+                                            progress_sequence=progress.final_sequence() if progress else 1,
+                                        )
+                                        tap_completed = True
                                 yield event
+                            if diagnostic and not tap_completed:
+                                complete_connect_taps(
+                                    connect_message_id,
+                                    diagnostic_marker,
+                                    diagnostic.finish(),
+                                    stream=True,
+                                    progress_sequence=progress.final_sequence() if progress else 1,
+                                )
                             return
                         try:
                             error_text = (await backend_resp.aread()).decode("utf-8", errors="replace")[:500]
@@ -2117,7 +2538,14 @@ async def messages_api(request: Request):
                 safe_msg = f"Backend returned {resp.status_code}: {err_text}".encode("ascii", errors="replace").decode("ascii")
                 return JSONResponse({"type": "error", "error": {"type": "api_error", "message": safe_msg}}, status_code=resp.status_code)
             log_request(backend["backend"], backend["model"], False, "success")
-            return JSONResponse(openai_to_anthropic_response(resp.json(), original_model, request_id, tool_name_lookup))
+            data = openai_to_anthropic_response(resp.json(), original_model, request_id, tool_name_lookup)
+            complete_connect_taps(
+                connect_message_id,
+                diagnostic_marker,
+                anthropic_response_text(data),
+                stream=False,
+            )
+            return JSONResponse(data)
         except Exception as e:
             log_request(backend["backend"], backend["model"], False, "error")
             safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
@@ -2325,7 +2753,8 @@ async def api_update_config(request: Request):
         "deepseek_upstream_mode", "openai_upstream_mode", "custom_upstream_mode",
         "proxy_auth_token", "proxy_auth_mode", "outbound_proxy_url",
         "deepseek_model_pattern", "openai_model_pattern", "custom_model_pattern",
-        "reasoning_content_policy", "inline_image_policy",
+        "reasoning_content_policy", "inline_image_policy", "connect_diagnostic_tap_enabled",
+        "connect_tap_enabled", "connect_tap_workspace",
     }
     update_data = {k: v for k, v in body.items() if k in allowed_keys}
     # Reject masked API keys (bullet character U+2022)
@@ -2568,6 +2997,9 @@ async def health():
         "outbound_proxy_configured": bool((config.outbound_proxy_url or "").strip()),
         "outbound_proxy_url": mask_url_credentials(config.outbound_proxy_url),
         "inline_image_policy": config.inline_image_policy,
+        "connect_diagnostic_tap_enabled": config.connect_diagnostic_tap_enabled,
+        "connect_tap_enabled": config.connect_tap_enabled,
+        "connect_tap_workspace_configured": bool(config.connect_tap_workspace.strip()),
         "proxy_dir": str(PROXY_DIR),
         "source_path": str(Path(__file__).resolve()),
         "config_revision": str(config.get("_csa_revision", "") or ""),

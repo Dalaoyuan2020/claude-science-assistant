@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import importlib.util
 import json
+import tempfile
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -48,6 +50,220 @@ def config_values(**values):
         yield
     finally:
         proxy.config._data.update(old)
+
+
+@contextmanager
+def temporary_path():
+    with tempfile.TemporaryDirectory() as directory:
+        yield Path(directory)
+
+
+def test_connect_diagnostic_marker_is_default_off_and_reads_latest_user_text_only():
+    body = {
+        "messages": [
+            {"role": "user", "content": "[CSA#old] old"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": [{"type": "text", "text": "[CSA#test1] probe"}]},
+        ]
+    }
+
+    with config_values(connect_diagnostic_tap_enabled=False):
+        assert proxy.connect_diagnostic_marker(body) == ""
+    with config_values(connect_diagnostic_tap_enabled=True):
+        assert proxy.connect_diagnostic_marker(body) == "[CSA#test1]"
+        assert proxy.connect_diagnostic_marker({"messages": [{"role": "user", "content": "prefix [CSA#test1]"}]}) == ""
+
+
+def test_connect_diagnostic_sse_aggregator_handles_split_utf8_and_ignores_non_text_deltas():
+    aggregator = proxy.DiagnosticSSETextAggregator()
+    payload = (
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"收到"}}\n\n'
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"secret"}}\n\n'
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" OK"}}\n\n'
+        'event: message_stop\n'
+        'data: {"type":"message_stop"}\n\n'
+    ).encode("utf-8")
+    split = payload.index("收".encode("utf-8")) + 1
+    aggregator.feed(payload[:split])
+    aggregator.feed(payload[split:])
+
+    assert aggregator.message_stopped is True
+    assert aggregator.finish() == "收到 OK"
+
+
+def test_connect_diagnostic_log_contains_only_marker_length_and_hash():
+    old_entries = list(proxy.request_log)
+    try:
+        proxy.request_log.clear()
+        with config_values(connect_diagnostic_tap_enabled=True):
+            proxy.log_connect_diagnostic_tap("[CSA#test1]", "M0-TEST1-OK.", stream=True)
+        assert len(proxy.request_log) == 1
+        entry = proxy.request_log[0]
+        assert entry["marker"] == "[CSA#test1]"
+        assert entry["response_chars"] == len("M0-TEST1-OK.")
+        assert entry["response_sha256"] == hashlib.sha256(b"M0-TEST1-OK.").hexdigest()
+        assert "response_text" not in entry
+        assert "M0-TEST1-OK." not in json.dumps(entry)
+    finally:
+        proxy.request_log[:] = old_entries
+
+
+def test_connect_tap_marker_is_default_off_and_requires_leading_marker():
+    body = {"messages": [{"role": "user", "content": "[CSA#123e4567-e89b-12d3-a456-426614174000] hello"}]}
+
+    with config_values(connect_tap_enabled=False):
+        assert proxy.connect_tap_message_id(body) == ""
+    with config_values(connect_tap_enabled=True):
+        assert proxy.connect_tap_message_id(body) == "123e4567-e89b-12d3-a456-426614174000"
+        assert proxy.connect_tap_message_id({"messages": [{"role": "user", "content": "hello [CSA#fake]"}]}) == ""
+
+
+def test_connect_tap_requires_matching_claimed_ack():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174001"
+        bridge_root = tmp_path / ".csa" / "connect" / "v1"
+        (bridge_root / "ack").mkdir(parents=True)
+
+        with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+            assert proxy.write_connect_tap_outbox(message_id, "reply") == "skipped_ack_missing"
+            (bridge_root / "ack" / f"{message_id}.json").write_text(
+                json.dumps({"messageId": "different", "status": "claimed"}),
+                encoding="utf-8",
+            )
+            assert proxy.write_connect_tap_outbox(message_id, "reply") == "skipped_ack_mismatch"
+            (bridge_root / "ack" / f"{message_id}.json").write_text(
+                json.dumps({"messageId": message_id, "status": "queued"}),
+                encoding="utf-8",
+            )
+            assert proxy.write_connect_tap_outbox(message_id, "reply") == "skipped_not_claimed"
+
+        assert not (bridge_root / "outbox" / f"{message_id}.json").exists()
+
+
+def test_connect_tap_accepts_active_delivery_ack_states():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174099"
+        bridge_root = tmp_path / ".csa" / "connect" / "v1"
+        ack_dir = bridge_root / "ack"
+        ack_dir.mkdir(parents=True)
+
+        with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+            for status in ("submitted", "delivery_unknown"):
+                outbox = bridge_root / "outbox" / f"{message_id}.json"
+                if outbox.exists():
+                    outbox.unlink()
+                (ack_dir / f"{message_id}.json").write_text(
+                    json.dumps({"schemaVersion": 1, "messageId": message_id, "status": status}),
+                    encoding="utf-8",
+                )
+                assert proxy.write_connect_tap_outbox(message_id, f"reply-{status}") == "written"
+
+
+def test_connect_tap_atomically_writes_once_for_claimed_message():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174002"
+        bridge_root = tmp_path / ".csa" / "connect" / "v1"
+        ack_dir = bridge_root / "ack"
+        ack_dir.mkdir(parents=True)
+        (ack_dir / f"{message_id}.json").write_text(
+            json.dumps({"schemaVersion": 1, "messageId": message_id, "status": "claimed"}),
+            encoding="utf-8",
+        )
+
+        with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+            assert proxy.write_connect_tap_outbox(message_id, "first reply") == "written"
+            assert proxy.write_connect_tap_outbox(message_id, "second reply") == "skipped_existing"
+
+        outbox = bridge_root / "outbox" / f"{message_id}.json"
+        payload = json.loads(outbox.read_text(encoding="utf-8"))
+        assert payload["schemaVersion"] == 1
+        assert payload["messageId"] == message_id
+        assert payload["status"] == "replied"
+        assert payload["text"] == "first reply"
+        assert not list(outbox.parent.glob("*.tmp"))
+
+
+def test_connect_tap_writes_ordered_progress_then_final_snapshot():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174004"
+        bridge_root = tmp_path / ".csa" / "connect" / "v1"
+        ack_dir = bridge_root / "ack"
+        ack_dir.mkdir(parents=True)
+        (ack_dir / f"{message_id}.json").write_text(
+            json.dumps({"schemaVersion": 1, "messageId": message_id, "status": "claimed"}),
+            encoding="utf-8",
+        )
+
+        with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+            assert proxy.write_connect_tap_progress(message_id, "first paragraph", 1) == "written"
+            assert proxy.write_connect_tap_progress(message_id, "first paragraph\n\nsecond paragraph", 2) == "written"
+            assert proxy.write_connect_tap_outbox(message_id, "complete response", 3) == "written"
+
+        outbox = bridge_root / "outbox"
+        progress_files = sorted(outbox.glob(f"{message_id}.*.progress.json"))
+        assert len(progress_files) == 2
+        assert json.loads(progress_files[0].read_text(encoding="utf-8"))["sequence"] == 1
+        assert json.loads(progress_files[1].read_text(encoding="utf-8"))["sequence"] == 2
+        final = json.loads((outbox / f"{message_id}.json").read_text(encoding="utf-8"))
+        assert final["sequence"] == 3
+        assert final["final"] is True
+        assert final["text"] == "complete response"
+
+
+def test_connect_tap_extracts_artifacts_and_hides_internal_markers():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174005"
+        artifact_id = "54809de1-8d3d-4e54-87c2-d882159c2d69"
+        bridge_root = tmp_path / ".csa" / "connect" / "v1"
+        ack_dir = bridge_root / "ack"
+        ack_dir.mkdir(parents=True)
+        (ack_dir / f"{message_id}.json").write_text(
+            json.dumps({"schemaVersion": 1, "messageId": message_id, "status": "claimed"}),
+            encoding="utf-8",
+        )
+
+        marker = "{{artifact:" + artifact_id + "}}"
+        response = f"图表已经生成。\n\n{marker}\n{marker}"
+        with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+            assert proxy.write_connect_tap_outbox(message_id, response, 2) == "written"
+
+        payload = json.loads((bridge_root / "outbox" / f"{message_id}.json").read_text(encoding="utf-8"))
+        assert payload["text"] == "图表已经生成。"
+        assert payload["artifactRefs"] == [artifact_id]
+        assert "{{artifact:" not in payload["text"]
+
+
+def test_connect_tap_artifact_only_reply_gets_visible_placeholder():
+    artifact_id = "868ecfcf-7dc8-41d0-b773-4042d318b947"
+    text, references = proxy.connect_reply_artifacts("{{artifact:" + artifact_id + "}}")
+    assert text == "图片已生成。"
+    assert references == [artifact_id]
+
+
+def test_connect_tap_log_never_contains_response_text():
+    with temporary_path() as tmp_path:
+        message_id = "123e4567-e89b-12d3-a456-426614174003"
+        ack_dir = tmp_path / ".csa" / "connect" / "v1" / "ack"
+        ack_dir.mkdir(parents=True)
+        (ack_dir / f"{message_id}.json").write_text(
+            json.dumps({"messageId": message_id, "status": "claimed"}),
+            encoding="utf-8",
+        )
+        old_entries = list(proxy.request_log)
+        try:
+            proxy.request_log.clear()
+            with config_values(connect_tap_enabled=True, connect_tap_workspace=str(tmp_path)):
+                proxy.complete_connect_taps(message_id, "", "private response body", stream=False)
+            entry = proxy.request_log[-1]
+            assert entry["status"] == "written"
+            assert entry["response_chars"] == len("private response body")
+            assert "private response body" not in json.dumps(entry)
+            assert "response_text" not in entry
+        finally:
+            proxy.request_log[:] = old_entries
 
 
 def test_tool_schema_root_type_is_object():

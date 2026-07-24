@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "CSA Claude Science Page Connector",
+  "version": "0.1.1",
+  "description": "A minimal page connector that lets CSA Desktop reliably deliver messages to the local Claude Science page.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:9882/*",
+    "http://localhost:9882/*",
+    "http://localhost:8765/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "action": {
+    "default_title": "CSA Connector",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:8765/*", "http://127.0.0.1:8765/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

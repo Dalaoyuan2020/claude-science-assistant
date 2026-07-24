@@ -58,6 +58,16 @@ The supported runtime path is:
 - `docs/plans/wsl-storage-migration-context-checkpoint.zh-CN.md`: single source of truth for storage detection, warnings, the planned Codex Prompt UI, and the migration execution gate.
 - `docs/agent-runbook.md`: operational procedure, including legacy Windows-path notes.
 - `docs/troubleshooting.md`: failure modes and fixes.
+- `docs/connect-gateway-implementation.zh-CN.md`: current TG-first Connect data flow and safety boundary.
+- `docs/plans/csa-connect-message-media-v3-plan.zh-CN.md`: implemented Connect message/media plan; the remaining gate is real Telegram-image-to-Chrome preview acceptance.
+
+Connect invariants: external chat text is data, never a shell command; the Bridge tap
+must remain default-off and require a matching claimed ack; duplicate platform events
+must not create a second model turn or reply. Do not add media support by embedding
+base64 or host filesystem paths in prompts, SQLite, logs, or frontend state. Outbound
+artifacts must be resolved read-only from Claude Science's managed artifact index,
+validated against the managed root, MIME, magic bytes, size, request time, and SHA-256,
+then sent through a per-artifact delivery ledger that stops on delivery uncertainty.
 - `config.example.json`: public, sanitized config template.
 
 ## Success Criteria

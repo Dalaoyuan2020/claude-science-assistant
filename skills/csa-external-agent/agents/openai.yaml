@@ -1,0 +1,4 @@
+interface:
+  display_name: "CSA External Agent"
+  short_description: "Request a safe host-side diagnosis through CSA"
+  default_prompt: "Prepare a redacted manual-approval request for the CSA Subagent Hub, then tell me the request ID and how to read the result."

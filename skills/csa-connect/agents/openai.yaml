@@ -1,0 +1,4 @@
+interface:
+  display_name: "CSA Connect"
+  short_description: "Receive paired chats and reply safely in the current research context"
+  default_prompt: "Check the current workspace CSA Connect queue, claim the next message, answer in context, and send a safe reply."

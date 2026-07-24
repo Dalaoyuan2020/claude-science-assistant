@@ -1,17 +1,24 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
+
+mod connect;
 
 #[cfg(windows)]
 use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
 // Reasoning models such as GLM-5.2 can spend the first dozens of tokens in
 // reasoning_content. A tiny cap returns HTTP 200 with an empty final answer and
@@ -107,6 +114,72 @@ fn command_output_with_timeout(
         status,
         stdout,
         stderr,
+    })
+}
+
+fn command_output_with_input_timeout(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label}启动失败：{error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{label}无法写入标准输入"))?;
+    stdin
+        .write_all(input)
+        .map_err(|error| format!("{label}写入输入失败：{error}"))?;
+    drop(stdin);
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}无法读取标准输出"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}无法读取错误输出"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{label}在 {} 秒内没有响应，已停止",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{label}状态读取失败：{error}"));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
     })
 }
 
@@ -350,6 +423,215 @@ struct ApiKeyAutoMapResult {
     fast_model: String,
     aliases: Vec<StoredModelAlias>,
     models: Vec<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalAgentRunResult {
+    ok: bool,
+    tool: String,
+    exit_code: Option<i32>,
+    duration_ms: u128,
+    stdout: String,
+    stderr: String,
+    result_text: Option<String>,
+    session_id: Option<String>,
+    resume_command: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentRequest {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    task_kind: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    requested_action: Option<String>,
+    #[serde(default)]
+    approval_mode: Option<String>,
+    #[serde(default)]
+    policy_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentInboxItem {
+    request_id: String,
+    file_name: String,
+    file_path: String,
+    modified_ms: u64,
+    request: Option<SubagentRequest>,
+    parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentRunResult {
+    run_id: String,
+    request_id: String,
+    result_dir: String,
+    result_json_path: String,
+    agent: ExternalAgentRunResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentSessionReplyResult {
+    run_id: String,
+    request_id: Option<String>,
+    parent_run_id: Option<String>,
+    result_dir: String,
+    result_json_path: String,
+    agent: ExternalAgentRunResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentOutboxResult {
+    schema_version: u32,
+    request_id: String,
+    status: String,
+    latest_run_id: String,
+    session_id: Option<String>,
+    result_path: String,
+    summary: String,
+    next_action: String,
+    updated_at: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentRunHistoryItem {
+    run_id: String,
+    kind: String,
+    request_id: Option<String>,
+    parent_run_id: Option<String>,
+    result_dir: String,
+    result_json_path: String,
+    modified_ms: u64,
+    agent: ExternalAgentRunResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalSessionLaunchResult {
+    session_id: String,
+    command: String,
+    cwd: String,
+    terminal: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionMessage {
+    id: String,
+    session_id: String,
+    role: String,
+    kind: String,
+    content: String,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionHistory {
+    session_id: String,
+    file_path: String,
+    modified_ms: u64,
+    messages: Vec<ClaudeSessionMessage>,
+    total_messages: usize,
+    has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResearchOsState {
+    #[serde(default)]
+    repositories: Vec<SkillRepository>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillRepository {
+    id: String,
+    source: String,
+    local_path: String,
+    created_at: u64,
+    last_synced_at: u64,
+    last_commit: String,
+    #[serde(default)]
+    skills: Vec<SkillFeedItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillFeedItem {
+    id: String,
+    repository_id: String,
+    name: String,
+    description: String,
+    relative_path: String,
+    modified_ms: u64,
+    fingerprint: String,
+    is_new: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillFrontMatter {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredConnectSettings {
+    #[serde(default)]
+    encrypted_feishu_webhook: String,
+    #[serde(default)]
+    encrypted_telegram_bot_token: String,
+    #[serde(default)]
+    telegram_chat_id: String,
+    #[serde(default)]
+    feishu_updated_at: u64,
+    #[serde(default)]
+    telegram_updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectChannelSummary {
+    id: String,
+    configured: bool,
+    detail: String,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectState {
+    feishu: ConnectChannelSummary,
+    telegram: ConnectChannelSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectTestResult {
+    ok: bool,
+    channel: String,
     message: String,
 }
 
@@ -935,8 +1217,6 @@ fn current_status() -> SystemStatus {
         "degraded"
     } else if !runtime_ready && !bridge_running && !claude_running {
         "notInstalled"
-    } else if bridge_running && windows_bridge_pid.is_some() {
-        "degraded"
     } else if bridge_running || claude_running {
         "degraded"
     } else {
@@ -1048,6 +1328,26 @@ fn settings_path() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .ok_or_else(|| "无法定位用户配置目录".to_string())?;
     Ok(base.join("ClaudeScienceAssistant").join("settings.json"))
+}
+
+fn research_os_root() -> Result<PathBuf, String> {
+    let parent = settings_path()?
+        .parent()
+        .ok_or_else(|| "Research OS 配置路径无父目录".to_string())?
+        .to_path_buf();
+    Ok(parent.join("research-os"))
+}
+
+fn research_os_settings_path() -> Result<PathBuf, String> {
+    Ok(research_os_root()?.join("repositories.json"))
+}
+
+fn connect_settings_path() -> Result<PathBuf, String> {
+    let parent = settings_path()?
+        .parent()
+        .ok_or_else(|| "Connect 配置路径无父目录".to_string())?
+        .to_path_buf();
+    Ok(parent.join("connect.json"))
 }
 
 struct PreparedAtomicWrite {
@@ -1406,8 +1706,19 @@ fn validate_display_name(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+#[cfg(test)]
 fn custom_relay_label_for_date(
     settings: &LauncherSettings,
+    requested_name: &str,
+    date: &str,
+) -> Result<String, String> {
+    provider_entry_label_for_date(settings, "custom", "自定义中转", requested_name, date)
+}
+
+fn provider_entry_label_for_date(
+    settings: &LauncherSettings,
+    provider_id: &str,
+    provider_name: &str,
     requested_name: &str,
     date: &str,
 ) -> Result<String, String> {
@@ -1415,11 +1726,11 @@ fn custom_relay_label_for_date(
     if !requested_name.is_empty() {
         return Ok(requested_name);
     }
-    let prefix = format!("自定义中转 {date} #");
+    let prefix = format!("{provider_name} {date} #");
     let highest = settings
         .api_keys
         .iter()
-        .filter(|entry| entry.provider_id == "custom")
+        .filter(|entry| entry.provider_id == provider_id)
         .filter_map(|entry| entry.label.strip_prefix(&prefix))
         .filter_map(|sequence| sequence.parse::<u32>().ok())
         .max()
@@ -1427,8 +1738,18 @@ fn custom_relay_label_for_date(
     Ok(format!("{prefix}{:02}", highest.saturating_add(1)))
 }
 
-fn custom_relay_label(settings: &LauncherSettings, requested_name: &str) -> Result<String, String> {
-    custom_relay_label_for_date(settings, requested_name, &current_local_date())
+fn provider_entry_label(
+    settings: &LauncherSettings,
+    provider: &ProviderPreset,
+    requested_name: &str,
+) -> Result<String, String> {
+    provider_entry_label_for_date(
+        settings,
+        &provider.id,
+        &provider.name,
+        requested_name,
+        &current_local_date(),
+    )
 }
 
 fn validate_base_url(value: &str) -> Result<String, String> {
@@ -2364,6 +2685,1737 @@ fn redact_secret_text(text: &str, secret: &str) -> String {
     text.replace(secret, "[redacted-api-key]")
 }
 
+fn truncate_agent_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    format!("{head}\n\n[output truncated by CSA launcher]")
+}
+
+fn redact_agent_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let sensitive_markers = [
+        "api_key",
+        "apikey",
+        "authorization",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token=",
+        "token:",
+        "token ",
+        "cookie",
+        "password",
+        "private_key",
+        "secret",
+        "bearer ",
+        "sk-",
+    ];
+    if !sensitive_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return line.to_string();
+    }
+    if let Some((prefix, _)) = line.split_once('=') {
+        return format!("{}=[redacted]", prefix.trim_end());
+    }
+    if let Some((prefix, _)) = line.split_once(':') {
+        return format!("{}: [redacted]", prefix.trim_end());
+    }
+    "[redacted-sensitive-line]".to_string()
+}
+
+fn redact_agent_output(text: &str) -> String {
+    let cleaned = clean_diagnostic_text(text);
+    let redacted = cleaned
+        .lines()
+        .map(redact_agent_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_agent_text(&redacted, 16_000)
+}
+
+fn redact_session_content(text: &str) -> String {
+    let redacted = text
+        .replace('\0', "")
+        .lines()
+        .map(redact_agent_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate_agent_text(redacted.trim(), 12_000)
+}
+
+fn safe_claude_session_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() < 8 || value.len() > 128 {
+        return Err("Claude session id is invalid.".to_string());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("Claude session id contains unsupported characters.".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn claude_resume_command(session_id: &str) -> String {
+    format!("claude --resume {session_id} -p \"<message>\"")
+}
+
+fn new_claude_session_id() -> String {
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = (now as u64) ^ ((now >> 64) as u64) ^ u64::from(std::process::id()) ^ counter;
+    let mix = |mut value: u64| {
+        value = value.wrapping_add(0x9e3779b97f4a7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    };
+    let value = (u128::from(mix(seed)) << 64) | u128::from(mix(seed ^ counter.rotate_left(17)));
+    let mut bytes = value.to_be_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn headed_claude_launch_script(
+    claude_cli: &Path,
+    root: &Path,
+    prompt_path: &Path,
+    session_id: &str,
+    session_name: &str,
+) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n$prompt = Get-Content -Raw -LiteralPath '{}'\nSet-Location -LiteralPath '{}'\n& '{}' --session-id '{}' --name '{}' --permission-mode plan $prompt\nWrite-Host ''\nWrite-Host 'CSA saved this session. You can continue here or resume it later from the launcher.'\nRead-Host 'Press Enter to close this window'\n",
+        powershell_single_quote(&prompt_path.display().to_string()),
+        powershell_single_quote(&root.display().to_string()),
+        powershell_single_quote(&claude_cli.display().to_string()),
+        powershell_single_quote(session_id),
+        powershell_single_quote(session_name),
+    )
+}
+
+fn launch_headed_claude_session(
+    session_id: &str,
+    session_name: &str,
+    prompt_path: &Path,
+    launch_script_path: &Path,
+) -> Result<String, String> {
+    let claude_cli = PathBuf::from(resolve_claude_cli()?);
+    let root = project_root()?;
+    let script =
+        headed_claude_launch_script(&claude_cli, &root, prompt_path, session_id, session_name);
+    write_text_file_atomic(launch_script_path, &script)?;
+
+    #[cfg(windows)]
+    {
+        let mut powershell = Command::new("powershell.exe");
+        powershell
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .current_dir(&root)
+            .args([
+                "-NoLogo",
+                "-NoExit",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(launch_script_path);
+        powershell
+            .spawn()
+            .map_err(|error| format!("Unable to open the headed Claude Code session: {error}"))?;
+        Ok("PowerShell".to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (session_id, session_name, prompt_path, launch_script_path);
+        Err("Headed Claude Code sessions are currently supported on Windows only.".to_string())
+    }
+}
+
+fn parse_claude_json_stdout(stdout_raw: &str) -> (Option<String>, Option<String>) {
+    let trimmed = stdout_raw.trim_start_matches('\u{feff}').trim();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return (None, None);
+    };
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("sessionId"))
+        .and_then(|item| item.as_str())
+        .and_then(|item| safe_claude_session_id(item).ok());
+    let result_text = value
+        .get("result")
+        .or_else(|| value.get("message"))
+        .and_then(|item| item.as_str())
+        .map(redact_agent_output)
+        .filter(|item| !item.trim().is_empty());
+    (session_id, result_text)
+}
+
+fn claude_native_exe_for_candidate(candidate: &str) -> Option<String> {
+    let path = PathBuf::from(candidate);
+    let parent = path.parent()?;
+    let native = parent
+        .join("node_modules")
+        .join("@anthropic-ai")
+        .join("claude-code")
+        .join("bin")
+        .join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+    if native.is_file() {
+        Some(native.display().to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_claude_cli() -> Result<String, String> {
+    let lookup_program = if cfg!(windows) { "where.exe" } else { "which" };
+    let mut command = background_command(lookup_program);
+    command.arg("claude");
+    let output =
+        command_output_with_timeout(command, Duration::from_secs(5), "Claude Code CLI 检查")?;
+    if !output.status.success() {
+        return Err(
+            "没有在 PATH 中找到 claude CLI。请先安装并登录 Claude Code，再回到面板重试。"
+                .to_string(),
+        );
+    }
+    let candidates = output_text(&output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err("没有在 PATH 中找到可执行的 claude CLI。".to_string());
+    }
+    if let Some(native) = candidates
+        .iter()
+        .find_map(|candidate| claude_native_exe_for_candidate(candidate))
+    {
+        return Ok(native);
+    }
+    if cfg!(windows) {
+        if let Some(exe) = candidates
+            .iter()
+            .find(|item| item.to_ascii_lowercase().ends_with(".exe"))
+        {
+            return Ok(exe.clone());
+        }
+        if let Some(cmd) = candidates
+            .iter()
+            .find(|item| item.to_ascii_lowercase().ends_with(".cmd"))
+        {
+            return Ok(cmd.clone());
+        }
+    }
+    Ok(candidates[0].clone())
+}
+
+fn run_claude_agent_once(
+    claude_cli: &str,
+    prompt: &str,
+    json_output: bool,
+    resume_session_id: Option<&str>,
+) -> Result<(Output, u128), String> {
+    let root = project_root()?;
+    let started = Instant::now();
+    let mut command = background_command(claude_cli);
+    command.current_dir(root);
+    if let Some(session_id) = resume_session_id {
+        command.args(["--resume", session_id]);
+    }
+    command.args(["-p", prompt]);
+    if json_output {
+        command.args(["--output-format", "json"]);
+    }
+    let output =
+        command_output_with_timeout(command, Duration::from_secs(120), "外部 Claude Code Agent")?;
+    Ok((output, started.elapsed().as_millis()))
+}
+
+fn should_retry_agent_without_json(output: &Output) -> bool {
+    if output.status.success() || !output.stdout.is_empty() {
+        return false;
+    }
+    let text = format!(
+        "{}\n{}",
+        decode_console_output(&output.stderr),
+        decode_console_output(&output.stdout)
+    )
+    .to_ascii_lowercase();
+    text.contains("output-format")
+        || text.contains("unknown option")
+        || text.contains("unknown argument")
+        || text.contains("invalid option")
+}
+
+fn run_external_agent_task_impl(prompt: String) -> Result<ExternalAgentRunResult, String> {
+    run_external_agent_task_with_resume_impl(prompt, None)
+}
+
+fn run_external_agent_task_with_resume_impl(
+    prompt: String,
+    resume_session_id: Option<String>,
+) -> Result<ExternalAgentRunResult, String> {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("请先选择任务或填写 Prompt，再启动外部 Agent。".to_string());
+    }
+    if prompt.chars().count() > 24_000 {
+        return Err("当前 Prompt 过长，可能超过 Windows 命令行限制。请先复制 Prompt 手动运行 Claude Code，或缩短任务说明后重试。".to_string());
+    }
+
+    let resume_session_id = resume_session_id
+        .map(|value| safe_claude_session_id(&value))
+        .transpose()?;
+    let claude_cli = resolve_claude_cli()?;
+    let (mut output, mut duration_ms) =
+        run_claude_agent_once(&claude_cli, &prompt, true, resume_session_id.as_deref())?;
+    if should_retry_agent_without_json(&output) {
+        let (fallback_output, fallback_duration_ms) =
+            run_claude_agent_once(&claude_cli, &prompt, false, resume_session_id.as_deref())?;
+        output = fallback_output;
+        duration_ms += fallback_duration_ms;
+    }
+
+    let ok = output.status.success();
+    let exit_code = output.status.code();
+    let stdout_raw = decode_console_output(&output.stdout);
+    let stderr_raw = decode_console_output(&output.stderr);
+    let (parsed_session_id, result_text) = parse_claude_json_stdout(&stdout_raw);
+    let session_id = parsed_session_id.or(resume_session_id);
+    let resume_command = session_id.as_deref().map(claude_resume_command);
+    let stdout = redact_agent_output(&stdout_raw);
+    let stderr = redact_agent_output(&stderr_raw);
+    let message = if ok {
+        "外部 Claude Code 已完成，结果已写入下方输出区。".to_string()
+    } else {
+        format!(
+            "外部 Claude Code 退出码为 {}。请查看 stdout/stderr 后决定是否复制 Prompt 手动继续。",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    };
+
+    Ok(ExternalAgentRunResult {
+        ok,
+        tool: "claude".to_string(),
+        exit_code,
+        duration_ms,
+        stdout,
+        stderr,
+        result_text,
+        session_id,
+        resume_command,
+        message,
+    })
+}
+
+#[tauri::command]
+async fn run_external_agent_task(prompt: String) -> Result<ExternalAgentRunResult, String> {
+    run_blocking(move || run_external_agent_task_impl(prompt)).await
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn subagent_inbox_dir() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("reports").join("csa-agent-inbox"))
+}
+
+fn subagent_runs_dir() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("reports").join("csa-agent-runs"))
+}
+
+fn subagent_outbox_dir() -> Result<PathBuf, String> {
+    Ok(project_root()?.join("reports").join("csa-agent-outbox"))
+}
+
+fn safe_subagent_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value == "." || value == ".." || value.chars().count() > 96 {
+        return Err("Subagent request id is invalid.".to_string());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        return Err(
+            "Subagent request id may only contain ASCII letters, numbers, '.', '-' and '_'."
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn write_text_file_atomic(path: &Path, content: &str) -> Result<(), String> {
+    prepare_atomic_write(path, content)?.commit()
+}
+
+fn build_subagent_outbox_result(
+    request_id: &str,
+    run_id: &str,
+    agent: &ExternalAgentRunResult,
+) -> Result<SubagentOutboxResult, String> {
+    let request_id = safe_subagent_id(request_id)?;
+    let run_id = safe_optional_subagent_run_id(Some(run_id.to_string()))?
+        .ok_or_else(|| "Subagent run id is missing.".to_string())?;
+    let completed = agent.ok
+        && agent
+            .result_text
+            .as_deref()
+            .or_else(|| (!agent.stdout.trim().is_empty()).then_some(agent.stdout.as_str()))
+            .is_some();
+    let status = if completed {
+        "completed"
+    } else if agent.ok {
+        "running"
+    } else {
+        "failed"
+    };
+    let summary_source = agent
+        .result_text
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!agent.stdout.trim().is_empty()).then_some(agent.stdout.as_str()))
+        .or_else(|| (!agent.stderr.trim().is_empty()).then_some(agent.stderr.as_str()))
+        .unwrap_or(agent.message.as_str());
+    let summary = truncate_agent_text(&redact_agent_output(summary_source), 4_000);
+    let next_action = match status {
+        "completed" => "read_result",
+        "running" => "wait_for_result",
+        _ => "review_failure",
+    };
+    Ok(SubagentOutboxResult {
+        schema_version: 1,
+        request_id,
+        status: status.to_string(),
+        latest_run_id: run_id.clone(),
+        session_id: agent.session_id.clone(),
+        result_path: format!("reports/csa-agent-runs/{run_id}/result.json"),
+        summary,
+        next_action: next_action.to_string(),
+        updated_at: unix_millis(),
+    })
+}
+
+fn write_subagent_outbox(
+    request_id: &str,
+    run_id: &str,
+    agent: &ExternalAgentRunResult,
+) -> Result<PathBuf, String> {
+    let value = build_subagent_outbox_result(request_id, run_id, agent)?;
+    let outbox = subagent_outbox_dir()?;
+    fs::create_dir_all(&outbox)
+        .map_err(|error| format!("Unable to create Subagent outbox directory: {error}"))?;
+    let path = outbox.join(format!("{}.json", value.request_id));
+    let encoded = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Unable to serialize Subagent outbox result: {error}"))?;
+    write_text_file_atomic(&path, &(encoded + "\n"))?;
+    Ok(path)
+}
+
+fn subagent_modified_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+fn subagent_item_from_path(path: &Path) -> Option<SubagentInboxItem> {
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return None;
+    }
+    let request_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)?;
+    let file_name = path.file_name()?.to_string_lossy().to_string();
+    let modified_ms = subagent_modified_ms(path);
+    match fs::read_to_string(path) {
+        Ok(content) if content.len() > 128 * 1024 => Some(SubagentInboxItem {
+            request_id,
+            file_name,
+            file_path: path.display().to_string(),
+            modified_ms,
+            request: None,
+            parse_error: Some("request file is larger than 128 KiB".to_string()),
+        }),
+        Ok(content) => {
+            match serde_json::from_str::<SubagentRequest>(content.trim_start_matches('\u{feff}')) {
+                Ok(request) => Some(SubagentInboxItem {
+                    request_id,
+                    file_name,
+                    file_path: path.display().to_string(),
+                    modified_ms,
+                    request: Some(request),
+                    parse_error: None,
+                }),
+                Err(error) => Some(SubagentInboxItem {
+                    request_id,
+                    file_name,
+                    file_path: path.display().to_string(),
+                    modified_ms,
+                    request: None,
+                    parse_error: Some(error.to_string()),
+                }),
+            }
+        }
+        Err(error) => Some(SubagentInboxItem {
+            request_id,
+            file_name,
+            file_path: path.display().to_string(),
+            modified_ms,
+            request: None,
+            parse_error: Some(error.to_string()),
+        }),
+    }
+}
+
+fn list_subagent_requests_impl() -> Result<Vec<SubagentInboxItem>, String> {
+    let inbox = subagent_inbox_dir()?;
+    fs::create_dir_all(&inbox).map_err(|error| format!("无法创建 Subagent 收件箱目录：{error}"))?;
+    let mut items = fs::read_dir(&inbox)
+        .map_err(|error| format!("无法读取 Subagent 收件箱：{error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| subagent_item_from_path(&entry.path()))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .modified_ms
+            .cmp(&left.modified_ms)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    items.truncate(100);
+    Ok(items)
+}
+
+#[tauri::command]
+async fn list_subagent_requests() -> Result<Vec<SubagentInboxItem>, String> {
+    run_blocking(list_subagent_requests_impl).await
+}
+
+fn request_value(value: &Option<String>, fallback: &str) -> String {
+    let cleaned = value
+        .as_deref()
+        .unwrap_or("")
+        .replace(['\r', '\n', '\0'], " ")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn build_subagent_prompt(request_id: &str, request: &SubagentRequest) -> String {
+    let note = redact_agent_output(request.note.as_deref().unwrap_or(""));
+    [
+        "你是 CSA Subagent Host Runner，正在处理一个从沙盒投递到宿主机面板的任务。",
+        "默认只读：不要删除、移动、安装、上传、修改代理/DNS/hosts/证书、防火墙、系统服务、WSL、VHDX 或注册表。",
+        "不要输出 API Key、token、cookie、私钥、完整 .env、完整聊天记录或浏览器数据。",
+        "本轮目标是诊断、规划、生成可执行建议；需要真实写入/安装/迁移时必须明确列为“等待用户批准”。",
+        "",
+        "任务元数据：",
+        &format!("- requestId: {request_id}"),
+        &format!("- source: {}", request_value(&request.source, "sandbox")),
+        &format!("- taskKind: {}", request_value(&request.task_kind, "custom")),
+        &format!("- title: {}", request_value(&request.title, "untitled")),
+        &format!("- cwd: {}", request_value(&request.cwd, "unknown")),
+        &format!(
+            "- requestedAction: {}",
+            request_value(&request.requested_action, "diagnose")
+        ),
+        &format!(
+            "- approvalMode: {}",
+            request_value(&request.approval_mode, "manual")
+        ),
+        &format!("- policyId: {}", request_value(&request.policy_id, "none")),
+        &format!("- createdAt: {}", request_value(&request.created_at, "unknown")),
+        "",
+        "沙盒提交的脱敏说明：",
+        if note.trim().is_empty() {
+            "(empty)"
+        } else {
+            note.trim()
+        },
+        "",
+        "请按以下结构输出：",
+        "A. 结论：可解决 / 需要更多信息 / 当前不应执行。",
+        "B. 证据：你只读检查到或根据任务元数据判断出的事实。",
+        "C. 下一步计划：按最小风险顺序列出。",
+        "D. 需要用户批准的命令：如果没有就写“无”。",
+        "E. 可以回写给沙盒的结果摘要。",
+    ]
+    .join("\n")
+}
+
+fn read_subagent_request(request_id: &str) -> Result<(PathBuf, SubagentRequest), String> {
+    let request_id = safe_subagent_id(request_id)?;
+    let path = subagent_inbox_dir()?.join(format!("{request_id}.json"));
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("无法读取 Subagent request {request_id}：{error}"))?;
+    let request = serde_json::from_str::<SubagentRequest>(content.trim_start_matches('\u{feff}'))
+        .map_err(|error| format!("Subagent request {request_id} JSON 无效：{error}"))?;
+    Ok((path, request))
+}
+
+fn run_subagent_request_impl(
+    request_id: String,
+    prompt_override: String,
+) -> Result<SubagentRunResult, String> {
+    let request_id = safe_subagent_id(&request_id)?;
+    let (request_path, request) = read_subagent_request(&request_id)?;
+    let prompt = if prompt_override.trim().is_empty() {
+        build_subagent_prompt(&request_id, &request)
+    } else {
+        prompt_override.trim().to_string()
+    };
+    let run_id = format!("{request_id}-{}", unix_millis());
+    let result_dir = subagent_runs_dir()?.join(&run_id);
+    fs::create_dir_all(&result_dir)
+        .map_err(|error| format!("无法创建 Subagent run 目录：{error}"))?;
+
+    let request_json = fs::read_to_string(&request_path).unwrap_or_else(|_| "{}".to_string());
+    write_text_file_atomic(&result_dir.join("request.json"), &request_json)?;
+    let prompt_path = result_dir.join("prompt.md");
+    write_text_file_atomic(&prompt_path, &prompt)?;
+
+    let session_id = new_claude_session_id();
+    let launch_script_path = result_dir.join("launch-session.ps1");
+    let session_name = format!("CSA {}", short_run_prefix(&request_id));
+    let launched_at = unix_millis();
+    let agent = match launch_headed_claude_session(
+        &session_id,
+        &session_name,
+        &prompt_path,
+        &launch_script_path,
+    ) {
+        Ok(terminal) => ExternalAgentRunResult {
+            ok: true,
+            tool: "claude".to_string(),
+            exit_code: None,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            result_text: None,
+            session_id: Some(session_id.clone()),
+            resume_command: Some(claude_resume_command(&session_id)),
+            message: format!(
+                "Headed Claude Code session opened in {terminal}; local transcript collection is active."
+            ),
+        },
+        Err(error) => ExternalAgentRunResult {
+            ok: false,
+            tool: "claude".to_string(),
+            exit_code: None,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: redact_agent_output(&error),
+            result_text: None,
+            session_id: Some(session_id.clone()),
+            resume_command: Some(claude_resume_command(&session_id)),
+            message: "Unable to open the headed Claude Code session; details were written to result.json."
+                .to_string(),
+        },
+    };
+    write_text_file_atomic(&result_dir.join("stdout.txt"), &agent.stdout)?;
+    write_text_file_atomic(&result_dir.join("stderr.txt"), &agent.stderr)?;
+
+    let result = SubagentRunResult {
+        run_id,
+        request_id,
+        result_dir: result_dir.display().to_string(),
+        result_json_path: result_dir.join("result.json").display().to_string(),
+        agent,
+    };
+    let result_json = serde_json::to_string_pretty(&result)
+        .map_err(|error| format!("无法序列化 Subagent run 结果：{error}"))?;
+    write_text_file_atomic(&result_dir.join("result.json"), &(result_json + "\n"))?;
+    write_subagent_outbox(&result.request_id, &result.run_id, &result.agent)?;
+    if result.agent.ok {
+        watch_headed_subagent_result(result.clone(), launched_at);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn run_subagent_request(
+    request_id: String,
+    prompt_override: String,
+) -> Result<SubagentRunResult, String> {
+    run_blocking(move || run_subagent_request_impl(request_id, prompt_override)).await
+}
+
+fn safe_optional_subagent_id(value: Option<String>) -> Result<Option<String>, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => safe_subagent_id(&value).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn safe_optional_subagent_run_id(value: Option<String>) -> Result<Option<String>, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            let value = value.trim();
+            if value.len() > 160
+                || !value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+            {
+                return Err("Subagent run id is invalid.".to_string());
+            }
+            Ok(Some(value.to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn short_run_prefix(value: &str) -> String {
+    let mut prefix = value.chars().take(60).collect::<String>();
+    while prefix.ends_with(['.', '-', '_']) {
+        prefix.pop();
+    }
+    if prefix.is_empty() {
+        "session".to_string()
+    } else {
+        prefix
+    }
+}
+
+fn continue_subagent_session_impl(
+    session_id: String,
+    message: String,
+    request_id: Option<String>,
+    parent_run_id: Option<String>,
+) -> Result<SubagentSessionReplyResult, String> {
+    let session_id = safe_claude_session_id(&session_id)?;
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Err("Please enter a message before continuing the Subagent session.".to_string());
+    }
+    if message.chars().count() > 24_000 {
+        return Err("Subagent continuation message is too long.".to_string());
+    }
+
+    let request_id = safe_optional_subagent_id(request_id)?;
+    let parent_run_id = safe_optional_subagent_run_id(parent_run_id)?;
+    let prefix = request_id
+        .as_deref()
+        .or(parent_run_id.as_deref())
+        .map(short_run_prefix)
+        .unwrap_or_else(|| "session".to_string());
+    let run_id = format!("continue-{prefix}-{}", unix_millis());
+    let result_dir = subagent_runs_dir()?.join(&run_id);
+    fs::create_dir_all(&result_dir)
+        .map_err(|error| format!("Unable to create Subagent continuation directory: {error}"))?;
+    write_text_file_atomic(&result_dir.join("message.md"), &message)?;
+    write_text_file_atomic(&result_dir.join("session.txt"), &session_id)?;
+
+    let mut agent =
+        match run_external_agent_task_with_resume_impl(message, Some(session_id.clone())) {
+            Ok(result) => result,
+            Err(error) => ExternalAgentRunResult {
+                ok: false,
+                tool: "claude".to_string(),
+                exit_code: None,
+                duration_ms: 0,
+                stdout: String::new(),
+                stderr: redact_agent_output(&error),
+                result_text: None,
+                session_id: Some(session_id.clone()),
+                resume_command: Some(claude_resume_command(&session_id)),
+                message: "External Agent continuation failed. Details were written to result.json."
+                    .to_string(),
+            },
+        };
+    if agent.session_id.is_none() {
+        agent.session_id = Some(session_id.clone());
+    }
+    if agent.resume_command.is_none() {
+        agent.resume_command = Some(claude_resume_command(&session_id));
+    }
+    write_text_file_atomic(&result_dir.join("stdout.txt"), &agent.stdout)?;
+    write_text_file_atomic(&result_dir.join("stderr.txt"), &agent.stderr)?;
+
+    let result = SubagentSessionReplyResult {
+        run_id,
+        request_id,
+        parent_run_id,
+        result_dir: result_dir.display().to_string(),
+        result_json_path: result_dir.join("result.json").display().to_string(),
+        agent,
+    };
+    let result_json = serde_json::to_string_pretty(&result)
+        .map_err(|error| format!("Unable to serialize Subagent continuation result: {error}"))?;
+    write_text_file_atomic(&result_dir.join("result.json"), &(result_json + "\n"))?;
+    if let Some(request_id) = result.request_id.as_deref() {
+        write_subagent_outbox(request_id, &result.run_id, &result.agent)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn continue_subagent_session(
+    session_id: String,
+    message: String,
+    request_id: Option<String>,
+    parent_run_id: Option<String>,
+) -> Result<SubagentSessionReplyResult, String> {
+    run_blocking(move || {
+        continue_subagent_session_impl(session_id, message, request_id, parent_run_id)
+    })
+    .await
+}
+
+fn subagent_history_item_from_result(
+    result_path: &Path,
+    request_id_filter: &str,
+) -> Option<SubagentRunHistoryItem> {
+    let content = fs::read_to_string(result_path).ok()?;
+    let modified_ms = subagent_modified_ms(result_path);
+    if let Ok(mut result) =
+        serde_json::from_str::<SubagentRunResult>(content.trim_start_matches('\u{feff}'))
+    {
+        if result.request_id == request_id_filter {
+            let _ = sync_headed_subagent_result(&mut result, result_path, None);
+            return Some(SubagentRunHistoryItem {
+                run_id: result.run_id,
+                kind: "run".to_string(),
+                request_id: Some(result.request_id),
+                parent_run_id: None,
+                result_dir: result.result_dir,
+                result_json_path: result.result_json_path,
+                modified_ms,
+                agent: result.agent,
+            });
+        }
+    }
+    if let Ok(result) =
+        serde_json::from_str::<SubagentSessionReplyResult>(content.trim_start_matches('\u{feff}'))
+    {
+        if result.request_id.as_deref() == Some(request_id_filter) {
+            return Some(SubagentRunHistoryItem {
+                run_id: result.run_id,
+                kind: "continue".to_string(),
+                request_id: result.request_id,
+                parent_run_id: result.parent_run_id,
+                result_dir: result.result_dir,
+                result_json_path: result.result_json_path,
+                modified_ms,
+                agent: result.agent,
+            });
+        }
+    }
+    None
+}
+
+fn list_subagent_run_history_impl(
+    request_id: String,
+) -> Result<Vec<SubagentRunHistoryItem>, String> {
+    let request_id = safe_subagent_id(&request_id)?;
+    let runs = subagent_runs_dir()?;
+    fs::create_dir_all(&runs).map_err(|error| format!("无法创建 Subagent runs 目录：{error}"))?;
+    let mut items = fs::read_dir(&runs)
+        .map_err(|error| format!("无法读取 Subagent runs 目录：{error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("result.json"))
+        .filter(|path| path.is_file())
+        .filter_map(|path| subagent_history_item_from_result(&path, &request_id))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.modified_ms
+            .cmp(&right.modified_ms)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+    });
+    items.truncate(200);
+    Ok(items)
+}
+
+#[tauri::command]
+async fn list_subagent_run_history(
+    request_id: String,
+) -> Result<Vec<SubagentRunHistoryItem>, String> {
+    run_blocking(move || list_subagent_run_history_impl(request_id)).await
+}
+
+fn launch_external_claude_session_impl(
+    session_id: String,
+) -> Result<ExternalSessionLaunchResult, String> {
+    let session_id = safe_claude_session_id(&session_id)?;
+    let claude_cli = resolve_claude_cli()?;
+    let root = project_root()?;
+
+    #[cfg(windows)]
+    let terminal = {
+        let mut windows_terminal = Command::new("wt.exe");
+        windows_terminal
+            .args(["-w", "0", "new-tab", "-d"])
+            .arg(&root)
+            .arg(&claude_cli)
+            .args(["--resume", &session_id]);
+        match windows_terminal.spawn() {
+            Ok(_) => "Windows Terminal".to_string(),
+            Err(wt_error) => {
+                let quoted_cli = claude_cli.replace('\'', "''");
+                let quoted_session = session_id.replace('\'', "''");
+                let script = format!("& '{quoted_cli}' --resume '{quoted_session}'");
+                let mut powershell = Command::new("powershell.exe");
+                powershell
+                    .creation_flags(CREATE_NEW_CONSOLE)
+                    .current_dir(&root)
+                    .args(["-NoLogo", "-NoExit", "-NoProfile", "-Command", &script]);
+                powershell.spawn().map_err(|error| {
+                    format!(
+                        "无法打开外部 Claude Code 会话。Windows Terminal: {wt_error}; PowerShell: {error}"
+                    )
+                })?;
+                "PowerShell".to_string()
+            }
+        }
+    };
+
+    #[cfg(not(windows))]
+    let terminal = {
+        return Err("当前版本仅支持在 Windows 中打开外部 Claude Code 终端。".to_string());
+    };
+
+    Ok(ExternalSessionLaunchResult {
+        session_id: session_id.clone(),
+        command: format!("claude --resume {session_id}"),
+        cwd: root.display().to_string(),
+        terminal: terminal.clone(),
+        message: format!("已在 {terminal} 中打开 Claude Code 会话。"),
+    })
+}
+
+#[tauri::command]
+async fn launch_external_claude_session(
+    session_id: String,
+) -> Result<ExternalSessionLaunchResult, String> {
+    run_blocking(move || launch_external_claude_session_impl(session_id)).await
+}
+
+fn claude_projects_root() -> Result<PathBuf, String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| "无法定位当前用户目录。".to_string())?;
+    Ok(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+fn find_claude_session_file(session_id: &str) -> Result<PathBuf, String> {
+    let session_id = safe_claude_session_id(session_id)?;
+    let root = claude_projects_root()?;
+    let file_name = format!("{session_id}.jsonl");
+    let direct = root.join(&file_name);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let entries = fs::read_dir(&root)
+        .map_err(|error| format!("无法读取 Claude Code 会话目录 {}：{error}", root.display()))?;
+    for entry in entries.filter_map(Result::ok).take(2_000) {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let candidate = project_dir.join(&file_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "没有找到 Claude Code session {session_id} 的本地聊天记录。"
+    ))
+}
+
+fn claude_message_text(message: &serde_json::Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            if let Some(text) = part.as_str() {
+                return Some(text.to_string());
+            }
+            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
+                return part
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
+            None
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_claude_session_messages(session_id: &str, content: &str) -> Vec<ClaudeSessionMessage> {
+    let mut messages = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("isSidechain").and_then(|item| item.as_bool()) == Some(true) {
+            continue;
+        }
+        let event_type = value
+            .get("type")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        if event_type != "user" && event_type != "assistant" {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(|item| item.as_str())
+            .unwrap_or(event_type);
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let content = redact_session_content(&claude_message_text(message));
+        if content.trim().is_empty() {
+            continue;
+        }
+        let id = value
+            .get("uuid")
+            .or_else(|| message.get("id"))
+            .and_then(|item| item.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{session_id}-{line_index}"));
+        messages.push(ClaudeSessionMessage {
+            id,
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            kind: "text".to_string(),
+            content,
+            created_at: value
+                .get("timestamp")
+                .and_then(|item| item.as_str())
+                .map(str::to_string),
+        });
+    }
+    messages.reverse();
+    messages
+}
+
+fn read_claude_session_tail(path: &Path) -> Result<(String, bool), String> {
+    const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("无法打开 Claude Code session {}：{error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("无法读取 Claude Code session 大小：{error}"))?
+        .len();
+    let truncated = length > MAX_SESSION_BYTES;
+    if truncated {
+        file.seek(SeekFrom::Start(length - MAX_SESSION_BYTES))
+            .map_err(|error| format!("无法定位 Claude Code session 尾部：{error}"))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取 Claude Code session：{error}"))?;
+    let mut content = String::from_utf8_lossy(&bytes).to_string();
+    if truncated {
+        if let Some(first_newline) = content.find('\n') {
+            content = content[first_newline + 1..].to_string();
+        }
+    }
+    Ok((content, truncated))
+}
+
+fn read_claude_session_history_impl(
+    session_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ClaudeSessionHistory, String> {
+    let session_id = safe_claude_session_id(&session_id)?;
+    let path = find_claude_session_file(&session_id)?;
+    let modified_ms = subagent_modified_ms(&path);
+    let (content, source_truncated) = read_claude_session_tail(&path)?;
+    let messages = parse_claude_session_messages(&session_id, &content);
+    let total_messages = messages.len();
+    let offset = offset.unwrap_or_default().min(total_messages);
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let end = offset.saturating_add(limit).min(total_messages);
+    let page = messages[offset..end].to_vec();
+    Ok(ClaudeSessionHistory {
+        session_id,
+        file_path: path.display().to_string(),
+        modified_ms,
+        messages: page,
+        total_messages,
+        has_more: end < total_messages || source_truncated,
+    })
+}
+
+fn sync_headed_subagent_result(
+    result: &mut SubagentRunResult,
+    result_path: &Path,
+    launched_at: Option<u128>,
+) -> Result<bool, String> {
+    let Some(session_id) = result.agent.session_id.clone() else {
+        return Ok(false);
+    };
+    let session_path = match find_claude_session_file(&session_id) {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let (content, _) = read_claude_session_tail(&session_path)?;
+    let messages = parse_claude_session_messages(&session_id, &content);
+    let Some(latest_assistant) = messages.iter().find(|message| message.role == "assistant") else {
+        return Ok(false);
+    };
+    if result.agent.result_text.as_deref() == Some(latest_assistant.content.as_str()) {
+        return Ok(false);
+    }
+
+    result.agent.ok = true;
+    result.agent.result_text = Some(latest_assistant.content.clone());
+    result.agent.message =
+        "Latest Claude Code answer collected from the local session transcript.".to_string();
+    if let Some(started) = launched_at {
+        result.agent.duration_ms = unix_millis().saturating_sub(started);
+    }
+    let encoded = serde_json::to_string_pretty(result)
+        .map_err(|error| format!("Unable to serialize headed session result: {error}"))?;
+    write_text_file_atomic(result_path, &(encoded + "\n"))?;
+    write_subagent_outbox(&result.request_id, &result.run_id, &result.agent)?;
+    Ok(true)
+}
+
+fn watch_headed_subagent_result(mut result: SubagentRunResult, launched_at: u128) {
+    thread::spawn(move || {
+        let result_path = PathBuf::from(&result.result_json_path);
+        let started = Instant::now();
+        let mut last_change = Instant::now();
+        let mut collected = false;
+        while started.elapsed() < Duration::from_secs(8 * 60 * 60) {
+            if sync_headed_subagent_result(&mut result, &result_path, Some(launched_at))
+                .unwrap_or(false)
+            {
+                collected = true;
+                last_change = Instant::now();
+            }
+            if collected && last_change.elapsed() > Duration::from_secs(30 * 60) {
+                break;
+            }
+            if !collected && started.elapsed() > Duration::from_secs(10 * 60) {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+#[tauri::command]
+async fn read_claude_session_history(
+    session_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ClaudeSessionHistory, String> {
+    run_blocking(move || read_claude_session_history_impl(session_id, offset, limit)).await
+}
+
+fn load_research_os_state() -> ResearchOsState {
+    let Ok(path) = research_os_settings_path() else {
+        return ResearchOsState::default();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return ResearchOsState::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn persist_research_os_state(state: &ResearchOsState) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|error| format!("无法序列化 Research OS 配置：{error}"))?;
+    write_text_file_atomic(&research_os_settings_path()?, &(body + "\n"))
+}
+
+fn safe_skill_repository_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("Skill 仓库 ID 无效".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn validate_skill_repository_source(value: &str) -> Result<String, String> {
+    let source = value.trim();
+    if source.is_empty() || source.len() > 2_048 || source.contains(['\r', '\n', '\0']) {
+        return Err("请输入有效的 Git 仓库地址".to_string());
+    }
+    let path = Path::new(source);
+    let supported = source.starts_with("https://")
+        || source.starts_with("ssh://")
+        || source.starts_with("git@")
+        || path.is_absolute();
+    if !supported {
+        return Err("首版支持 HTTPS、SSH 或本机绝对路径 Git 仓库".to_string());
+    }
+    Ok(source.to_string())
+}
+
+fn git_output(command: Command, timeout: Duration, label: &str) -> Result<String, String> {
+    let output = command_output_with_timeout(command, timeout, label)?;
+    if !output.status.success() {
+        return Err(format!("{label}失败：{}", command_error_text(&output)));
+    }
+    Ok(decode_console_output(&output.stdout).trim().to_string())
+}
+
+fn verify_system_git() -> Result<(), String> {
+    let mut command = background_command("git");
+    command.arg("--version");
+    git_output(command, Duration::from_secs(10), "系统 Git 检查").map(|_| ())
+}
+
+fn git_clone_skill_repository(source: &str, destination: &Path) -> Result<(), String> {
+    let mut command = background_command("git");
+    command
+        .args(["clone", "--depth", "1", "--"])
+        .arg(source)
+        .arg(destination);
+    git_output(command, Duration::from_secs(120), "Skill 仓库浅克隆").map(|_| ())
+}
+
+fn git_pull_skill_repository(destination: &Path) -> Result<(), String> {
+    let mut command = background_command("git");
+    command
+        .arg("-C")
+        .arg(destination)
+        .args(["pull", "--ff-only"]);
+    git_output(command, Duration::from_secs(120), "Skill 仓库更新").map(|_| ())
+}
+
+fn git_current_commit(destination: &Path) -> Result<String, String> {
+    let mut command = background_command("git");
+    command
+        .arg("-C")
+        .arg(destination)
+        .args(["rev-parse", "--short=12", "HEAD"]);
+    git_output(command, Duration::from_secs(10), "读取 Skill 仓库版本")
+}
+
+fn tracked_skill_paths(destination: &Path) -> Result<Vec<String>, String> {
+    let mut command = background_command("git");
+    command.arg("-C").arg(destination).args(["ls-files", "-z"]);
+    let output = git_output(command, Duration::from_secs(15), "扫描 Skill 仓库文件")?;
+    let mut paths = output
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .filter(|value| {
+            Path::new(value).file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        })
+        .filter(|value| {
+            Path::new(value)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.truncate(500);
+    Ok(paths)
+}
+
+fn short_text(value: &str, max_chars: usize) -> String {
+    value
+        .replace(['\r', '\n', '\0'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn parse_skill_metadata(content: &str, relative_path: &str) -> (String, String) {
+    let normalized = content.replace("\r\n", "\n");
+    let front_matter = normalized.strip_prefix("---\n").and_then(|rest| {
+        rest.find("\n---\n")
+            .and_then(|end| serde_yaml::from_str::<SkillFrontMatter>(&rest[..end]).ok())
+    });
+    let fallback_name = Path::new(relative_path)
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Skill");
+    let heading = normalized
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# "))
+        .unwrap_or(fallback_name);
+    let name = front_matter
+        .as_ref()
+        .and_then(|value| value.name.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(heading)
+        .to_string();
+    let description = front_matter
+        .as_ref()
+        .and_then(|value| value.description.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            normalized.lines().find_map(|line| {
+                let line = line.trim();
+                (!line.is_empty() && !line.starts_with('#') && line != "---" && !line.contains(":"))
+                    .then(|| line.to_string())
+            })
+        })
+        .unwrap_or_else(|| "未提供说明".to_string());
+    (short_text(&name, 80), short_text(&description, 240))
+}
+
+fn stable_text_fingerprint(content: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn scan_skill_repository(
+    repository_id: &str,
+    destination: &Path,
+    previous: &[SkillFeedItem],
+) -> Result<Vec<SkillFeedItem>, String> {
+    let previous_fingerprints = previous
+        .iter()
+        .map(|item| (item.relative_path.as_str(), item.fingerprint.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut skills = Vec::new();
+    for relative_path in tracked_skill_paths(destination)? {
+        let path = destination.join(Path::new(&relative_path));
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() <= 256 * 1024 => metadata,
+            _ => continue,
+        };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let fingerprint = stable_text_fingerprint(&content);
+        let is_new = previous_fingerprints.get(relative_path.as_str()).copied()
+            != Some(fingerprint.as_str());
+        let (name, description) = parse_skill_metadata(&content, &relative_path);
+        let path_fingerprint = stable_text_fingerprint(&relative_path);
+        skills.push(SkillFeedItem {
+            id: format!("{repository_id}-{path_fingerprint}"),
+            repository_id: repository_id.to_string(),
+            name,
+            description,
+            relative_path,
+            modified_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or_default(),
+            fingerprint,
+            is_new,
+        });
+    }
+    skills.sort_by(|left, right| {
+        right
+            .modified_ms
+            .cmp(&left.modified_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(skills)
+}
+
+fn list_skill_repositories_impl() -> Result<ResearchOsState, String> {
+    Ok(load_research_os_state())
+}
+
+#[tauri::command]
+async fn list_skill_repositories() -> Result<ResearchOsState, String> {
+    run_blocking(list_skill_repositories_impl).await
+}
+
+fn add_skill_repository_impl(source: String) -> Result<ResearchOsState, String> {
+    let source = validate_skill_repository_source(&source)?;
+    verify_system_git()?;
+    let mut state = load_research_os_state();
+    if state.repositories.iter().any(|item| item.source == source) {
+        return Err("这个 Skill 仓库已经添加".to_string());
+    }
+    let repository_id = format!("repo-{}", unix_millis());
+    let root = research_os_root()?;
+    let destination = root.join("repositories").join(&repository_id);
+    fs::create_dir_all(destination.parent().unwrap_or(&root))
+        .map_err(|error| format!("无法创建 Skill 仓库目录：{error}"))?;
+    git_clone_skill_repository(&source, &destination)?;
+    let skills = scan_skill_repository(&repository_id, &destination, &[])?;
+    let now = unix_millis().min(u128::from(u64::MAX)) as u64;
+    state.repositories.push(SkillRepository {
+        id: repository_id,
+        source,
+        local_path: destination.display().to_string(),
+        created_at: now,
+        last_synced_at: now,
+        last_commit: git_current_commit(&destination)?,
+        skills,
+    });
+    state
+        .repositories
+        .sort_by_key(|item| std::cmp::Reverse(item.last_synced_at));
+    persist_research_os_state(&state)?;
+    Ok(state)
+}
+
+#[tauri::command]
+async fn add_skill_repository(source: String) -> Result<ResearchOsState, String> {
+    run_blocking(move || add_skill_repository_impl(source)).await
+}
+
+fn sync_skill_repository_impl(repository_id: String) -> Result<ResearchOsState, String> {
+    let repository_id = safe_skill_repository_id(&repository_id)?;
+    verify_system_git()?;
+    let mut state = load_research_os_state();
+    let repository = state
+        .repositories
+        .iter_mut()
+        .find(|item| item.id == repository_id)
+        .ok_or_else(|| "没有找到这个 Skill 仓库".to_string())?;
+    let destination = PathBuf::from(&repository.local_path);
+    let expected_root = research_os_root()?.join("repositories");
+    if !destination.starts_with(&expected_root) || !destination.join(".git").is_dir() {
+        return Err("Skill 仓库本地目录无效，请重新添加仓库".to_string());
+    }
+    git_pull_skill_repository(&destination)?;
+    repository.skills = scan_skill_repository(&repository.id, &destination, &repository.skills)?;
+    repository.last_commit = git_current_commit(&destination)?;
+    repository.last_synced_at = unix_millis().min(u128::from(u64::MAX)) as u64;
+    state
+        .repositories
+        .sort_by_key(|item| std::cmp::Reverse(item.last_synced_at));
+    persist_research_os_state(&state)?;
+    Ok(state)
+}
+
+#[tauri::command]
+async fn sync_skill_repository(repository_id: String) -> Result<ResearchOsState, String> {
+    run_blocking(move || sync_skill_repository_impl(repository_id)).await
+}
+
+fn load_connect_settings() -> StoredConnectSettings {
+    let Ok(path) = connect_settings_path() else {
+        return StoredConnectSettings::default();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return StoredConnectSettings::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn persist_connect_settings(settings: &StoredConnectSettings) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("无法序列化 Connect 配置：{error}"))?;
+    write_text_file_atomic(&connect_settings_path()?, &(body + "\n"))
+}
+
+fn connect_state(settings: &StoredConnectSettings) -> ConnectState {
+    let telegram_detail = if settings.encrypted_telegram_bot_token.is_empty() {
+        "Bot Token + Chat ID".to_string()
+    } else {
+        let suffix = settings
+            .telegram_chat_id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        format!("Bot Token 已加密 · Chat ID …{suffix}")
+    };
+    ConnectState {
+        feishu: ConnectChannelSummary {
+            id: "feishu".to_string(),
+            configured: !settings.encrypted_feishu_webhook.is_empty(),
+            detail: if settings.encrypted_feishu_webhook.is_empty() {
+                "Incoming Webhook".to_string()
+            } else {
+                "Webhook 已使用 Windows 当前用户加密".to_string()
+            },
+            updated_at: settings.feishu_updated_at,
+        },
+        telegram: ConnectChannelSummary {
+            id: "telegram".to_string(),
+            configured: !settings.encrypted_telegram_bot_token.is_empty()
+                && !settings.telegram_chat_id.is_empty(),
+            detail: telegram_detail,
+            updated_at: settings.telegram_updated_at,
+        },
+    }
+}
+
+fn validate_feishu_webhook(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() > 2_048 || value.contains(['\r', '\n', '\0']) {
+        return Err("飞书 Webhook 地址无效".to_string());
+    }
+    let lower = value.to_ascii_lowercase();
+    let valid = lower.starts_with("https://open.feishu.cn/open-apis/bot/v2/hook/")
+        || lower.starts_with("https://open.larksuite.com/open-apis/bot/v2/hook/");
+    if !valid || value.rsplit('/').next().unwrap_or("").len() < 8 {
+        return Err("只接受飞书或 Lark 官方 Incoming Webhook HTTPS 地址".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn validate_telegram_bot_token(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let Some((bot_id, secret)) = value.split_once(':') else {
+        return Err("Telegram Bot Token 格式无效".to_string());
+    };
+    if value.len() > 256
+        || bot_id.is_empty()
+        || !bot_id.chars().all(|ch| ch.is_ascii_digit())
+        || secret.len() < 10
+        || !secret
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err("Telegram Bot Token 格式无效".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn validate_telegram_chat_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let numeric = value
+        .strip_prefix('-')
+        .unwrap_or(value)
+        .chars()
+        .all(|ch| ch.is_ascii_digit());
+    let username = value
+        .strip_prefix('@')
+        .map(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .unwrap_or(false);
+    if value.is_empty() || value.len() > 128 || (!numeric && !username) {
+        return Err("Telegram Chat ID 应为数字 ID 或 @channel_name".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn run_connect_powershell(script: &str, payload: &serde_json::Value) -> Result<String, String> {
+    let input = serde_json::to_vec(payload)
+        .map_err(|error| format!("无法序列化 Connect 测试请求：{error}"))?;
+    let script = format!(
+        "$utf8=New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $OutputEncoding=$utf8; {script}"
+    );
+    let mut command = background_command("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let output = command_output_with_input_timeout(
+        command,
+        &input,
+        Duration::from_secs(20),
+        "Connect 测试消息",
+    )?;
+    if !output.status.success() {
+        return Err(command_error_text(&output));
+    }
+    Ok(output_text(&output))
+}
+
+fn get_connect_state_impl() -> Result<ConnectState, String> {
+    Ok(connect_state(&load_connect_settings()))
+}
+
+#[tauri::command]
+async fn get_connect_state() -> Result<ConnectState, String> {
+    run_blocking(get_connect_state_impl).await
+}
+
+fn save_feishu_connection_impl(webhook_url: String) -> Result<ConnectState, String> {
+    let webhook_url = validate_feishu_webhook(&webhook_url)?;
+    let mut settings = load_connect_settings();
+    settings.encrypted_feishu_webhook = protect_api_key(&webhook_url)?;
+    settings.feishu_updated_at = unix_millis().min(u128::from(u64::MAX)) as u64;
+    persist_connect_settings(&settings)?;
+    Ok(connect_state(&settings))
+}
+
+#[tauri::command]
+async fn save_feishu_connection(webhook_url: String) -> Result<ConnectState, String> {
+    run_blocking(move || save_feishu_connection_impl(webhook_url)).await
+}
+
+fn save_telegram_connection_impl(
+    bot_token: String,
+    chat_id: String,
+) -> Result<ConnectState, String> {
+    let bot_token = validate_telegram_bot_token(&bot_token)?;
+    let chat_id = validate_telegram_chat_id(&chat_id)?;
+    let mut settings = load_connect_settings();
+    settings.encrypted_telegram_bot_token = protect_api_key(&bot_token)?;
+    settings.telegram_chat_id = chat_id;
+    settings.telegram_updated_at = unix_millis().min(u128::from(u64::MAX)) as u64;
+    persist_connect_settings(&settings)?;
+    Ok(connect_state(&settings))
+}
+
+#[tauri::command]
+async fn save_telegram_connection(
+    bot_token: String,
+    chat_id: String,
+) -> Result<ConnectState, String> {
+    run_blocking(move || save_telegram_connection_impl(bot_token, chat_id)).await
+}
+
+fn test_connect_channel_impl(channel: String) -> Result<ConnectTestResult, String> {
+    let settings = load_connect_settings();
+    let test_text = "CSA 连接测试成功。此通道当前只发送任务状态通知，不接收远程命令。";
+    match channel.as_str() {
+        "feishu" => {
+            let webhook = unprotect_api_key(&settings.encrypted_feishu_webhook)?;
+            if webhook.is_empty() {
+                return Err("请先配置飞书 Webhook".to_string());
+            }
+            let payload = serde_json::json!({ "url": webhook, "text": test_text });
+            let script = r#"$p=[Console]::In.ReadToEnd() | ConvertFrom-Json; $body=@{msg_type='text';content=@{text=$p.text}} | ConvertTo-Json -Depth 5 -Compress; $r=Invoke-RestMethod -Uri $p.url -Method Post -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 15; if($null -ne $r.code -and [int]$r.code -ne 0){throw ('Feishu API code '+$r.code)}; [Console]::Out.Write('ok')"#;
+            run_connect_powershell(script, &payload)
+                .map_err(|error| redact_secret_text(&error, &webhook))?;
+            Ok(ConnectTestResult {
+                ok: true,
+                channel,
+                message: "飞书测试消息已发送".to_string(),
+            })
+        }
+        "telegram" => {
+            let token = unprotect_api_key(&settings.encrypted_telegram_bot_token)?;
+            if token.is_empty() || settings.telegram_chat_id.is_empty() {
+                return Err("请先配置 Telegram Bot Token 和 Chat ID".to_string());
+            }
+            let payload = serde_json::json!({
+                "token": token,
+                "chatId": settings.telegram_chat_id,
+                "text": test_text
+            });
+            let script = r#"$p=[Console]::In.ReadToEnd() | ConvertFrom-Json; $url='https://api.telegram.org/bot'+$p.token+'/sendMessage'; $body=@{chat_id=$p.chatId;text=$p.text} | ConvertTo-Json -Compress; $r=Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 15; if(-not $r.ok){throw 'Telegram API rejected the message'}; [Console]::Out.Write('ok')"#;
+            run_connect_powershell(script, &payload)
+                .map_err(|error| redact_secret_text(&error, &token))?;
+            Ok(ConnectTestResult {
+                ok: true,
+                channel,
+                message: "Telegram 测试消息已发送".to_string(),
+            })
+        }
+        _ => Err("未知 Connect 通道".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn test_connect_channel(channel: String) -> Result<ConnectTestResult, String> {
+    run_blocking(move || test_connect_channel_impl(channel)).await
+}
+
+fn clear_connect_channel_impl(channel: String) -> Result<ConnectState, String> {
+    let mut settings = load_connect_settings();
+    match channel.as_str() {
+        "feishu" => {
+            settings.encrypted_feishu_webhook.clear();
+            settings.feishu_updated_at = 0;
+        }
+        "telegram" => {
+            settings.encrypted_telegram_bot_token.clear();
+            settings.telegram_chat_id.clear();
+            settings.telegram_updated_at = 0;
+        }
+        _ => return Err("未知 Connect 通道".to_string()),
+    }
+    persist_connect_settings(&settings)?;
+    Ok(connect_state(&settings))
+}
+
+#[tauri::command]
+async fn clear_connect_channel(channel: String) -> Result<ConnectState, String> {
+    run_blocking(move || clear_connect_channel_impl(channel)).await
+}
+
+fn create_demo_subagent_request_impl() -> Result<SubagentInboxItem, String> {
+    let inbox = subagent_inbox_dir()?;
+    fs::create_dir_all(&inbox).map_err(|error| format!("无法创建 Subagent 收件箱目录：{error}"))?;
+    let request_id = format!("demo-{}", unix_millis());
+    let request = serde_json::json!({
+        "schemaVersion": 1,
+        "source": "launcher-demo",
+        "taskKind": "dataset",
+        "title": "Demo: dataset download diagnosis",
+        "cwd": project_root()?.display().to_string(),
+        "note": "This is a read-only demo request. Diagnose what the host runner should check before downloading a dataset outside the sandbox.",
+        "requestedAction": "diagnose",
+        "approvalMode": "manual",
+        "policyId": "manual-only",
+        "createdAt": current_local_date()
+    });
+    let path = inbox.join(format!("{request_id}.json"));
+    let body = serde_json::to_string_pretty(&request)
+        .map_err(|error| format!("无法序列化 demo request：{error}"))?;
+    write_text_file_atomic(&path, &(body + "\n"))?;
+    subagent_item_from_path(&path).ok_or_else(|| "无法读取刚创建的 demo request".to_string())
+}
+
+#[tauri::command]
+async fn create_demo_subagent_request() -> Result<SubagentInboxItem, String> {
+    run_blocking(create_demo_subagent_request_impl).await
+}
+
 fn test_api_key_impl(
     selected_provider_id: String,
     api_key: String,
@@ -2976,8 +5028,8 @@ fn save_api_key_impl(
     }
     let patch =
         bridge_config_patch_for_api_key(&settings, clean_key, &stored_model, &sanitized_aliases)?;
-    let label = if selected_provider_id == "custom" {
-        custom_relay_label(&settings, &display_name)?
+    let label = if provider.trust.starts_with("untrusted") {
+        provider_entry_label(&settings, &provider, &display_name)?
     } else {
         provider.name
     };
@@ -3134,17 +5186,19 @@ async fn start_services() -> Result<SystemStatus, String> {
 fn stop_services_raw(distro: &str) -> Result<(), String> {
     let script = r#"
 systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
-for pid in $(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}'); do
+for pid in $(ps -eo pid=,args= | awk '/\/patched\/claude-science serve/ && !/awk/ {print $1}'); do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
   kill "$pid" 2>/dev/null || true
 done
 for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
   if [ -r "/proc/$pid/cmdline" ]; then
     cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
     case "$cmd" in *"/proxy.py"*) kill "$pid" 2>/dev/null || true;; esac
   fi
 done
-deadline=$((SECONDS + 5))
-while [ "$SECONDS" -lt "$deadline" ]; do
+deadline=$(($(date +%s) + 5))
+while [ "$(date +%s)" -lt "$deadline" ]; do
   if ! curl -fsS --connect-timeout 0.3 --max-time 0.6 http://127.0.0.1:9876/health >/dev/null 2>&1 \
     && ! ss -ltn 2>/dev/null | grep -qE ':(8765|8766) '; then
     exit 0
@@ -3154,7 +5208,19 @@ done
 echo "CSA services did not stop within 5 seconds." >&2
 exit 1
 "#;
-    let output = run_wsl_with_timeout(distro, &["sh", "-lc", script], Duration::from_secs(10))?;
+    let mut command = background_command("wsl.exe");
+    command
+        .arg("--distribution")
+        .arg(distro)
+        .arg("--")
+        .arg("sh")
+        .arg("-s");
+    let output = command_output_with_input_timeout(
+        command,
+        script.as_bytes(),
+        Duration::from_secs(10),
+        "停止 CSA 服务",
+    )?;
     if !output.status.success() {
         return Err(format!("停止服务失败：{}", command_error_text(&output)));
     }
@@ -3305,6 +5371,56 @@ async fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+            let show = MenuItem::with_id(app, "show", "打开 CSA", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let mut tray = TrayIconBuilder::new()
+                .menu(&menu)
+                .tooltip("CSA - Claude Science Assistant")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        let _ = connect::stop_connect_gateway_impl();
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+            thread::spawn(connect::start_connect_gateway_if_configured);
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_system_status,
             start_services,
@@ -3320,7 +5436,43 @@ pub fn run() {
             activate_api_key,
             test_api_key,
             auto_map_api_key,
-            delete_api_key
+            delete_api_key,
+            run_external_agent_task,
+            list_subagent_requests,
+            list_subagent_run_history,
+            launch_external_claude_session,
+            read_claude_session_history,
+            list_skill_repositories,
+            add_skill_repository,
+            sync_skill_repository,
+            get_connect_state,
+            save_feishu_connection,
+            save_telegram_connection,
+            test_connect_channel,
+            clear_connect_channel,
+            connect::get_connect_runtime_state,
+            connect::save_feishu_bot,
+            connect::start_feishu_registration,
+            connect::poll_feishu_registration,
+            connect::save_telegram_bot,
+            connect::clear_connect_bot,
+            connect::start_connect_gateway,
+            connect::stop_connect_gateway,
+            connect::generate_connect_pairing_code,
+            connect::generate_browser_extension_pairing_code,
+            connect::get_browser_extension_install_info,
+            connect::clear_browser_extension_pairing,
+            connect::list_connect_routes,
+            connect::bind_connect_route,
+            connect::send_connect_local_message,
+            connect::dispatch_connect_pending,
+            connect::list_connect_history,
+            connect::clear_connect_history,
+            connect::install_connect_skill,
+            connect::get_connector_setup,
+            run_subagent_request,
+            continue_subagent_session,
+            create_demo_subagent_request
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude Science Assistant");
@@ -3874,6 +6026,39 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_builtin_relays_use_provider_date_and_next_sequence() {
+        let make_entry = |provider_id: &str, label: &str| StoredApiKey {
+            id: next_api_key_id(),
+            provider_id: provider_id.into(),
+            label: label.into(),
+            base_url: String::new(),
+            model: String::new(),
+            custom_confirmed: provider_id == "builtin-relay",
+            model_aliases: Vec::new(),
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let settings = LauncherSettings {
+            api_keys: vec![
+                make_entry("builtin-relay", "项目方自建中转 2026-07-11 #01"),
+                make_entry("builtin-relay", "项目方自建中转 2026-07-11 #02"),
+                make_entry("custom", "项目方自建中转 2026-07-11 #99"),
+            ],
+            ..LauncherSettings::default()
+        };
+        assert_eq!(
+            provider_entry_label_for_date(
+                &settings,
+                "builtin-relay",
+                "项目方自建中转",
+                "",
+                "2026-07-11"
+            )
+            .unwrap(),
+            "项目方自建中转 2026-07-11 #03"
+        );
+    }
+
+    #[test]
     fn custom_relay_name_rejects_control_characters() {
         let settings = LauncherSettings::default();
         assert!(custom_relay_label_for_date(&settings, "坏\n名称", "2026-07-11").is_err());
@@ -3881,8 +6066,8 @@ mod tests {
 
     #[test]
     fn api_key_test_budget_supports_reasoning_models() {
-        assert!(API_KEY_TEST_INITIAL_MAX_TOKENS >= 256);
-        assert!(API_KEY_TEST_RETRY_MAX_TOKENS >= API_KEY_TEST_INITIAL_MAX_TOKENS * 4);
+        const { assert!(API_KEY_TEST_INITIAL_MAX_TOKENS >= 256) };
+        const { assert!(API_KEY_TEST_RETRY_MAX_TOKENS >= API_KEY_TEST_INITIAL_MAX_TOKENS * 4) };
     }
 
     #[test]
@@ -3995,6 +6180,243 @@ mod tests {
             })),
             "http://127.0.0.1:9876/secret%20token/dashboard"
         );
+    }
+
+    #[test]
+    fn claude_session_parser_returns_latest_text_messages() {
+        let jsonl = r#"{"type":"user","uuid":"user-1","timestamp":"2026-07-16T00:00:00Z","message":{"role":"user","content":"check environment\nAPI_KEY=secret"}}
+{"type":"assistant","uuid":"assistant-1","timestamp":"2026-07-16T00:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"environment ready"}]}}"#;
+        let messages = parse_claude_session_messages("session-123", jsonl);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "environment ready");
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("API_KEY=[redacted]"));
+    }
+
+    #[test]
+    fn claude_session_parser_skips_invalid_and_sidechain_events() {
+        let jsonl = r#"not-json
+{"type":"attachment","uuid":"attachment-1"}
+{"type":"assistant","uuid":"sidechain-1","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"skip me"}]}}
+{"type":"assistant","uuid":"tool-only","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        assert!(parse_claude_session_messages("session-123", jsonl).is_empty());
+    }
+
+    #[test]
+    fn headed_session_ids_are_valid_unique_v4_uuids() {
+        let first = new_claude_session_id();
+        let second = new_claude_session_id();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 36);
+        assert_eq!(&first[14..15], "4");
+        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
+        assert!(safe_claude_session_id(&first).is_ok());
+    }
+
+    #[test]
+    fn headed_launch_script_reads_prompt_file_and_stays_in_plan_mode() {
+        let script = headed_claude_launch_script(
+            Path::new("C:\\Tools\\claude.exe"),
+            Path::new("C:\\workspace"),
+            Path::new("C:\\runs\\prompt.md"),
+            "123e4567-e89b-42d3-a456-426614174000",
+            "CSA environment-check",
+        );
+        assert!(script.contains("Get-Content -Raw -LiteralPath"));
+        assert!(script.contains("--session-id '123e4567-e89b-42d3-a456-426614174000'"));
+        assert!(script.contains("--permission-mode plan"));
+        assert!(script.contains("Read-Host 'Press Enter to close this window'"));
+        assert!(!script.contains("dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn subagent_request_ids_reject_path_traversal_and_shell_characters() {
+        assert!(safe_subagent_id("dataset-check-01").is_ok());
+        for value in ["..", "../request", "request/child", "request;whoami", ""] {
+            assert!(
+                safe_subagent_id(value).is_err(),
+                "accepted unsafe id: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_prompt_enforces_manual_approval_and_redacts_credentials() {
+        let request = SubagentRequest {
+            schema_version: Some(1),
+            source: Some("sandbox".into()),
+            task_kind: Some("environment".into()),
+            title: Some("Dependency diagnosis".into()),
+            cwd: Some("C:\\workspace".into()),
+            note: Some("API_KEY=do-not-leak\nTOKEN=also-private\nPackage import failed".into()),
+            requested_action: Some("diagnose".into()),
+            approval_mode: Some("manual".into()),
+            policy_id: Some("manual-only".into()),
+            created_at: Some("2026-07-24T00:00:00Z".into()),
+        };
+        let prompt = build_subagent_prompt("environment-check-01", &request);
+        assert!(prompt.contains("等待用户批准"));
+        assert!(prompt.contains("approvalMode: manual"));
+        assert!(prompt.contains("API_KEY=[redacted]"));
+        assert!(!prompt.contains("do-not-leak"));
+        assert!(prompt.contains("TOKEN=[redacted]"));
+        assert!(!prompt.contains("also-private"));
+    }
+
+    #[test]
+    fn subagent_outbox_has_stable_relative_result_and_redacted_summary() {
+        let running_agent = ExternalAgentRunResult {
+            ok: true,
+            tool: "claude".into(),
+            exit_code: None,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            result_text: None,
+            session_id: Some("123e4567-e89b-42d3-a456-426614174000".into()),
+            resume_command: None,
+            message: "Session opened".into(),
+        };
+        let running = build_subagent_outbox_result(
+            "environment-check-01",
+            "environment-check-01-1784000000000",
+            &running_agent,
+        )
+        .unwrap();
+        assert_eq!(running.status, "running");
+        assert_eq!(running.next_action, "wait_for_result");
+        assert_eq!(
+            running.result_path,
+            "reports/csa-agent-runs/environment-check-01-1784000000000/result.json"
+        );
+        assert!(!running.result_path.contains("C:\\"));
+
+        let mut completed_agent = running_agent;
+        completed_agent.result_text =
+            Some("API_KEY=do-not-leak\nTOKEN=also-private\nDiagnosis complete".into());
+        let completed = build_subagent_outbox_result(
+            "environment-check-01",
+            "environment-check-01-1784000000001",
+            &completed_agent,
+        )
+        .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.next_action, "read_result");
+        assert!(completed.summary.contains("API_KEY=[redacted]"));
+        assert!(!completed.summary.contains("do-not-leak"));
+        assert!(completed.summary.contains("TOKEN=[redacted]"));
+        assert!(!completed.summary.contains("also-private"));
+    }
+
+    #[test]
+    fn skill_metadata_parser_reads_yaml_front_matter() {
+        let content = r#"---
+name: literature-review
+description: Review papers with a reproducible evidence table.
+---
+# Ignored heading
+"#;
+        let (name, description) = parse_skill_metadata(content, "skills/review/SKILL.md");
+        assert_eq!(name, "literature-review");
+        assert_eq!(
+            description,
+            "Review papers with a reproducible evidence table."
+        );
+    }
+
+    #[test]
+    fn skill_metadata_parser_falls_back_to_heading_and_folder() {
+        let (heading, description) = parse_skill_metadata(
+            "# Dataset Inspector\n\nChecks local datasets.",
+            "data/SKILL.md",
+        );
+        assert_eq!(heading, "Dataset Inspector");
+        assert_eq!(description, "Checks local datasets.");
+        let (folder, _) = parse_skill_metadata("", "skills/gpu-check/SKILL.md");
+        assert_eq!(folder, "gpu-check");
+    }
+
+    #[test]
+    fn skill_repository_source_rejects_ambiguous_or_insecure_values() {
+        assert!(validate_skill_repository_source("https://github.com/org/skills.git").is_ok());
+        assert!(validate_skill_repository_source("git@github.com:org/skills.git").is_ok());
+        assert!(validate_skill_repository_source("http://example.com/skills.git").is_err());
+        assert!(validate_skill_repository_source("../skills").is_err());
+        assert!(
+            validate_skill_repository_source("https://example.com/a.git\n--upload-pack=x").is_err()
+        );
+    }
+
+    #[test]
+    fn skill_repository_scan_reads_only_git_tracked_skill_files() {
+        if verify_system_git().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "csa-skill-scan-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        let tracked = root.join("skills").join("tracked").join("SKILL.md");
+        let untracked = root.join("skills").join("untracked").join("SKILL.md");
+        fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+        fs::create_dir_all(untracked.parent().unwrap()).unwrap();
+        fs::write(
+            &tracked,
+            "---\nname: tracked-skill\ndescription: Safe tracked skill.\n---\n",
+        )
+        .unwrap();
+        fs::write(&untracked, "# Untracked\n").unwrap();
+        let mut init = background_command("git");
+        init.arg("-C").arg(&root).arg("init");
+        git_output(init, Duration::from_secs(10), "测试 Git 初始化").unwrap();
+        let mut add = background_command("git");
+        add.arg("-C")
+            .arg(&root)
+            .args(["add", "--", "skills/tracked/SKILL.md"]);
+        git_output(add, Duration::from_secs(10), "测试 Git add").unwrap();
+
+        let first = scan_skill_repository("repo-test", &root, &[]).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "tracked-skill");
+        assert!(first[0].is_new);
+        let second = scan_skill_repository("repo-test", &root, &first).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].is_new);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connect_validators_accept_only_expected_official_endpoints() {
+        assert!(validate_feishu_webhook(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/12345678-abcd"
+        )
+        .is_ok());
+        assert!(
+            validate_feishu_webhook("https://example.com/open-apis/bot/v2/hook/secret").is_err()
+        );
+        assert!(validate_telegram_bot_token("123456789:ABCdef_123456789-xyz").is_ok());
+        assert!(validate_telegram_bot_token("not-a-token").is_err());
+        assert!(validate_telegram_chat_id("-1001234567890").is_ok());
+        assert!(validate_telegram_chat_id("@csa_updates").is_ok());
+        assert!(validate_telegram_chat_id("hello world").is_err());
+    }
+
+    #[test]
+    fn connect_state_never_serializes_encrypted_credentials() {
+        let settings = StoredConnectSettings {
+            encrypted_feishu_webhook: "cipher-feishu".to_string(),
+            encrypted_telegram_bot_token: "cipher-telegram".to_string(),
+            telegram_chat_id: "-1001234567890".to_string(),
+            feishu_updated_at: 1,
+            telegram_updated_at: 2,
+        };
+        let json = serde_json::to_string(&connect_state(&settings)).unwrap();
+        assert!(!json.contains("cipher-feishu"));
+        assert!(!json.contains("cipher-telegram"));
+        assert!(!json.contains("-1001234567890"));
+        assert!(json.contains("…7890"));
     }
 
     #[test]
