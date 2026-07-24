@@ -78,6 +78,19 @@ fi
 
 run mkdir -p "$STATE_DIR" "$HOME/.claude-science/logs"
 
+for skill_name in csa-connect csa-external-agent; do
+  skill_source="$PROJECT_DIR/skills/$skill_name"
+  if [ -f "$skill_source/SKILL.md" ]; then
+    skill_target="$HOME/.claude-science/skills/$skill_name"
+    run mkdir -p "$skill_target"
+    run cp -R "$skill_source/." "$skill_target/"
+    run chmod -R u+rwX,go-rwx "$skill_target"
+    if [ -d "$skill_target/scripts" ]; then
+      run chmod 700 "$skill_target/scripts"/*.sh
+    fi
+  fi
+done
+
 if [ -f "$BUNDLED_CLAUDE_BIN" ]; then
   say "Bundled Claude Science Linux binary found; it will be installed as the locked product-managed runtime binary."
   run mkdir -p "$MANAGED_CLAUDE_DIR"

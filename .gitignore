@@ -16,6 +16,13 @@ certs/
 logs/
 *.log
 .daemon-model-patch.json
+reports/csa-feasibility/
+reports/csa-agent-inbox/
+reports/csa-agent-runs/
+reports/csa-agent-outbox/
+reports/release-readiness/
+reports/csa-connect-return/
+reports/csa-connect-message-v3/
 
 # Python
 __pycache__/
@@ -31,10 +38,15 @@ dist/
 launcher/dist/
 launcher/src-tauri/target/
 launcher/src-tauri/target-validation/
+launcher/src-tauri/target-*/
+connect-gateway/.gocache/
 
 # Local captured/bundled third-party runtime binaries.
 # Keep these out of the source repo; publish portable ZIPs as GitHub Release assets instead.
 vendor/claude-science/linux-x64/claude-science
+vendor/csa-connect/linux-x64/csa-connect
+vendor/csa-connect/linux-x64/csa-connect.sha256
+vendor/csa-connect/linux-x64/manifest.json
 vendor/**/*.rar
 vendor/**/*.zip
 vendor/**/*.7z

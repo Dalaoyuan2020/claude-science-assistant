@@ -3,6 +3,7 @@ param(
   [ValidateSet("debug", "release")]
   [string]$Profile = "debug",
   [string]$OutputDir = "",
+  [string]$TargetRoot = "",
   [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')]
   [string]$PackageQualifier = "",
   [switch]$SkipBuild
@@ -25,6 +26,11 @@ $TauriVersion = (Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\tau
 if ($Version -ne $PackageVersion -or $Version -ne $TauriVersion) {
   throw "Launcher versions disagree: Cargo=$Version package=$PackageVersion tauri=$TauriVersion"
 }
+$ReleaseDocName = "github-release-v$Version.md"
+$ReleaseDocPath = Join-Path (Join-Path $ProjectDir "docs") $ReleaseDocName
+if (-not (Test-Path -LiteralPath $ReleaseDocPath)) {
+  throw "Release notes are required for launcher v${Version}: $ReleaseDocPath"
+}
 if ($Profile -eq "release" -and $SkipBuild) {
   throw "Release packaging must compile the launcher; -SkipBuild is allowed only for debug packages."
 }
@@ -35,6 +41,10 @@ if (-not $OutputDir) {
 $OutputDir = (New-Item -ItemType Directory -Force -Path $OutputDir).FullName
 
 if (-not $SkipBuild) {
+  & (Join-Path $ScriptDir "build-connect-gateway.ps1")
+  if ($LASTEXITCODE -ne 0) {
+    throw "Connect Gateway build failed with exit code $LASTEXITCODE"
+  }
   Push-Location $LauncherDir
   try {
     if ($Profile -eq "debug") {
@@ -51,7 +61,12 @@ if (-not $SkipBuild) {
 }
 
 $TargetProfile = if ($Profile -eq "debug") { "debug" } else { "release" }
-$TargetDir = Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "target") $TargetProfile
+if ($TargetRoot) {
+  $ResolvedTargetRoot = (Resolve-Path -LiteralPath $TargetRoot).Path
+} else {
+  $ResolvedTargetRoot = Join-Path (Join-Path $LauncherDir "src-tauri") "target"
+}
+$TargetDir = Join-Path $ResolvedTargetRoot $TargetProfile
 $ExePath = Join-Path $TargetDir "claude-science-assistant.exe"
 if (-not (Test-Path -LiteralPath $ExePath)) {
   throw "Launcher exe not found: $ExePath"
@@ -82,6 +97,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "scripts") | O
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "static") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "tests") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "vendor") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "extensions") | Out-Null
 
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PackageRoot "claude-science-assistant.exe")
 foreach ($file in @("proxy.py", "setup-token.py", "forward-443.py", "requirements.txt", "config.example.json")) {
@@ -100,6 +116,9 @@ foreach ($file in @(
   "collect-acceptance-evidence.ps1",
   "collect-acceptance-evidence.bat",
   "verify-proxy.ps1",
+  "verify-v0.2-package.ps1",
+  "create-subagent-request.ps1",
+  "create-subagent-request.sh",
   "probe-provider-capabilities.ps1",
   "doctor.ps1",
   "uninstall.ps1"
@@ -108,8 +127,15 @@ foreach ($file in @(
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "quick-start.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "quick-start.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "architecture-and-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "architecture-and-product-plan.zh-CN.md")
-Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.3.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.3.md")
+Copy-Item -LiteralPath $ReleaseDocPath -Destination (Join-Path (Join-Path $PackageRoot "docs") $ReleaseDocName)
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "connect-gateway-implementation.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "connect-gateway-implementation.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "connect-live-test-guide.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "connect-live-test-guide.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "csa-ui-subagent-acceptance-tests.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "csa-ui-subagent-acceptance-tests.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "subagent-hub-usable-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "subagent-hub-usable-product-plan.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.2-new-features-acceptance.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.2-new-features-acceptance.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.2-technology-and-release-review.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.2-technology-and-release-review.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.2-install-upgrade-release-guide.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.2-install-upgrade-release-guide.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.3-update-record.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.3-update-record.zh-CN.md")
@@ -126,6 +152,9 @@ foreach ($file in @(
   Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $ProjectDir "docs") "plans") $file) -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "docs") "plans") $file)
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "skills") "bootstrap-claude-science-wsl") -Destination (Join-Path (Join-Path $PackageRoot "skills") "bootstrap-claude-science-wsl") -Recurse
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "skills") "csa-connect") -Destination (Join-Path (Join-Path $PackageRoot "skills") "csa-connect") -Recurse
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "skills") "csa-external-agent") -Destination (Join-Path (Join-Path $PackageRoot "skills") "csa-external-agent") -Recurse
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "extensions") "csa-claude-science-connector") -Destination (Join-Path (Join-Path $PackageRoot "extensions") "csa-claude-science-connector") -Recurse
 $BundledClaudeDir = Join-Path (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") "linux-x64"
 $BundledClaudeBin = Join-Path $BundledClaudeDir "claude-science"
 $BundledClaudeManifest = Join-Path $BundledClaudeDir "manifest.json"
@@ -133,6 +162,7 @@ if (-not (Test-Path -LiteralPath $BundledClaudeBin)) {
   throw "Bundled Claude Science Linux binary is required but missing: $BundledClaudeBin"
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") -Destination (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "vendor") "csa-connect") -Destination (Join-Path (Join-Path $PackageRoot "vendor") "csa-connect") -Recurse
 Get-ChildItem -LiteralPath (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse -File |
   Where-Object { $_.Extension -in @(".rar", ".zip", ".7z") } |
   Remove-Item -Force
@@ -140,6 +170,17 @@ $BundledClaudeInfo = Get-Content -LiteralPath $BundledClaudeManifest -Raw -Encod
 $BundledClaudeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BundledClaudeBin).Hash.ToLowerInvariant()
 if ([string]$BundledClaudeInfo.sha256 -ne $BundledClaudeHash) {
   throw "Bundled Claude Science hash does not match manifest.json."
+}
+$BundledConnectDir = Join-Path (Join-Path (Join-Path $ProjectDir "vendor") "csa-connect") "linux-x64"
+$BundledConnectBin = Join-Path $BundledConnectDir "csa-connect"
+$BundledConnectManifest = Join-Path $BundledConnectDir "manifest.json"
+if (-not (Test-Path -LiteralPath $BundledConnectBin) -or -not (Test-Path -LiteralPath $BundledConnectManifest)) {
+  throw "Bundled CSA Connect Gateway is required but missing."
+}
+$BundledConnectInfo = Get-Content -LiteralPath $BundledConnectManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+$BundledConnectHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BundledConnectBin).Hash.ToLowerInvariant()
+if ([string]$BundledConnectInfo.sha256 -ne $BundledConnectHash) {
+  throw "Bundled CSA Connect Gateway hash does not match manifest.json."
 }
 
 $ExampleConfig = Get-Content -LiteralPath (Join-Path $ProjectDir "config.example.json") -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -184,6 +225,9 @@ $Manifest = [ordered]@{
   acceptanceHelperBat = "scripts/acceptance-v0.1.bat"
   evidenceHelper = "scripts/collect-acceptance-evidence.ps1"
   evidenceHelperBat = "scripts/collect-acceptance-evidence.bat"
+  packageVerifier = "scripts/verify-v0.2-package.ps1"
+  subagentRequestPowerShell = "scripts/create-subagent-request.ps1"
+  subagentRequestBash = "scripts/create-subagent-request.sh"
   statusProbe = "scripts/status-probe.ps1"
   quickStartBats = @(
     "1-run-acceptance-preview.bat",
@@ -198,12 +242,31 @@ $Manifest = [ordered]@{
     version = $BundledClaudeInfo.version
     platform = $BundledClaudeInfo.platform
   }
+  bundledConnectGateway = [ordered]@{
+    path = "vendor/csa-connect/linux-x64/csa-connect"
+    manifest = "vendor/csa-connect/linux-x64/manifest.json"
+    sha256 = $BundledConnectHash
+    version = $BundledConnectInfo.version
+    platform = $BundledConnectInfo.platform
+  }
   skill = "skills/bootstrap-claude-science-wsl/SKILL.md"
+  skills = @(
+    "skills/bootstrap-claude-science-wsl/SKILL.md",
+    "skills/csa-connect/SKILL.md",
+    "skills/csa-external-agent/SKILL.md"
+  )
   docs = @(
     "docs/quick-start.zh-CN.md",
     "docs/architecture-and-product-plan.zh-CN.md",
-    "docs/github-release-v0.1.3.md",
+    "docs/$ReleaseDocName",
     "docs/green-book-integration.zh-CN.md",
+    "docs/connect-gateway-implementation.zh-CN.md",
+    "docs/connect-live-test-guide.zh-CN.md",
+    "docs/csa-ui-subagent-acceptance-tests.zh-CN.md",
+    "docs/subagent-hub-usable-product-plan.zh-CN.md",
+    "docs/v0.2-new-features-acceptance.zh-CN.md",
+    "docs/v0.2-technology-and-release-review.zh-CN.md",
+    "docs/v0.2-install-upgrade-release-guide.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
     "docs/v0.1.3-update-record.zh-CN.md",
@@ -250,7 +313,7 @@ $Readme = @(
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
-  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
+  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/v0.2-install-upgrade-release-guide.zh-CN.md, docs/v0.2-new-features-acceptance.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, and manifest.json.",
   "",
   "This package does not include API keys, OAuth tokens, control tokens, or user config."
 ) -join [Environment]::NewLine

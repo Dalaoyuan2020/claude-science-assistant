@@ -1,0 +1,61 @@
+* { box-sizing: border-box; }
+body {
+  width: 320px;
+  margin: 0;
+  color: #233129;
+  background: #f6f8f7;
+  font: 13px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main { padding: 14px; }
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+header strong { font-size: 14px; }
+#statusBadge {
+  border-radius: 999px;
+  padding: 4px 7px;
+  color: #79541d;
+  background: #fff3d9;
+  font-size: 11px;
+  font-weight: 800;
+}
+#statusBadge.ready { color: #165b32; background: #dff2e5; }
+#statusBadge.error { color: #8c332e; background: #f7dfdc; }
+p { margin: 12px 0; color: #59665e; }
+label {
+  display: block;
+  margin-bottom: 6px;
+  color: #415047;
+  font-size: 11px;
+  font-weight: 800;
+}
+.pair-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+input {
+  min-width: 0;
+  border: 1px solid #cbd5cd;
+  border-radius: 6px;
+  padding: 8px 9px;
+  color: #1f2c25;
+  background: #fff;
+  outline: none;
+}
+button {
+  border: 1px solid #cbd5cd;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #34443a;
+  background: #fff;
+  cursor: pointer;
+  font-weight: 800;
+}
+form button { color: #fff; border-color: #195d3a; background: #195d3a; }
+#disconnectButton { width: 100%; margin-top: 10px; color: #8c332e; }
+small {
+  display: block;
+  margin-top: 10px;
+  color: #778279;
+  font-size: 11px;
+}

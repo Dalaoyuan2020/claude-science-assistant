@@ -25,6 +25,7 @@
   "custom_model_pattern": "",
   "reasoning_content_policy": "never",
   "inline_image_policy": "auto",
+  "connect_diagnostic_tap_enabled": false,
   "proxy_host": "127.0.0.1",
   "proxy_port": 9876
 }

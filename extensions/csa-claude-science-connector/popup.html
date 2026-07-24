@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CSA Connector</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <strong>CSA Connector</strong>
+        <span id="statusBadge">读取中</span>
+      </header>
+      <p id="statusText">正在检查桌面端连接。</p>
+      <form id="pairForm">
+        <label for="pairCode">配对码</label>
+        <div class="pair-row">
+          <input id="pairCode" name="pairCode" autocomplete="off" spellcheck="false" />
+          <button type="submit">配对</button>
+        </div>
+      </form>
+      <button id="disconnectButton" type="button">断开</button>
+      <small>插件只负责页面定位与投递，不执行本地命令。</small>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

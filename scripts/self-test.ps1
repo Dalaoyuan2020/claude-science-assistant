@@ -30,8 +30,15 @@ if (-not (Test-Path $Python)) {
 }
 
 $Python = (Resolve-Path -LiteralPath $Python).Path
-& $Python -c "import fastapi, httpx, starlette, uvicorn"
-$dependenciesReady = ($LASTEXITCODE -eq 0)
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+try {
+  & $Python -c "import fastapi, httpx, starlette, uvicorn" 2>$null
+  $dependencyProbeExit = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $previousErrorAction
+}
+$dependenciesReady = ($dependencyProbeExit -eq 0)
 if (-not $dependenciesReady) {
   Write-Host "Python test dependencies are missing or incomplete; repairing the local venv."
   & $Python -m pip install --upgrade pip
