@@ -39,9 +39,9 @@ CSA v0.2.0 把启动器从单纯的本机运行环境管理器扩展为轻量科
 
 详细步骤见 `docs/v0.2-install-upgrade-release-guide.zh-CN.md`。
 
-## RC 验收说明
+## 验收状态
 
-`v0.2.0-rc.1` 已通过自动测试、真实 Claude Code 两轮续聊、Gateway/MCP 与 Bridge 本机链路测试。正式稳定版发布前仍需完成真人 Telegram 文本和图片闭环复验。飞书需要在实际企业租户内单独验收。
+`v0.2.0` 已通过自动测试、真实 Claude Code 两轮续聊、Gateway/MCP、Bridge 本机链路、包内哈希和只读升级预检；Telegram 文本与图片闭环已经用户确认。飞书仍需在实际企业租户内单独配置和验收。
 
 ## 安全边界
 

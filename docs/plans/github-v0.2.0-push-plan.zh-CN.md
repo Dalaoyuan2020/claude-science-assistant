@@ -1,17 +1,17 @@
-# CSA v0.2.0-rc.1 GitHub 推送计划
+# CSA v0.2.0 GitHub 正式发布计划
 
 日期：2026-07-24
-状态：`LOCAL RC GO / PUBLIC RELEASE NO-GO`
+状态：`APPROVED FOR v0.2.0 STABLE RELEASE`
 
 ## 1. 当前判定
 
-本地功能、真实运行时、release 构建、ZIP 哈希、包内验收和只读升级预检均已通过。当前候选包可以在本机测试，但不能直接上传为公开 Release，原因是：
+本地功能、真实运行时、release 构建、ZIP 哈希、包内验收和只读升级预检均已通过。用户于 2026-07-24 确认 Telegram 文本与图片链路并授权直接合并 `main`、发布正式 `v0.2.0`。正式资产必须满足：
 
-1. 工作树包含大量未提交的 Connect、Subagent、UI、Bridge 和文档改动。
-2. 当前候选 `manifest.json.sourceTreeDirty=true`，无法证明资产对应唯一提交。
-3. 真人 Telegram 唯一文本与图片闭环需要对最终干净构建再复验一次。
+1. 从最终 `main` 干净提交构建，`manifest.json.sourceTreeDirty=false`。
+2. ZIP 与 `.sha256` 同时上传，并从 GitHub 回下载复核。
+3. Release 资产不得复用本地脏工作树生成的 RC 包。
 
-## 2. 候选资产
+## 2. 历史候选资产
 
 ```text
 dist/candidate-v0.2.0-rc1-20260724/
@@ -19,7 +19,7 @@ dist/candidate-v0.2.0-rc1-20260724/
   claude-science-assistant-v0.2.0-rc.1-release-portable.zip.sha256
 ```
 
-该资产仅用于本地候选验证。提交后必须重新构建，不能把当前 ZIP 改名后上传。
+该资产仅用于本地候选验证，不能改名后上传。正式 Release 必须从最终 `main` 重新构建无 qualifier 的资产。
 
 ## 3. 提交范围审查
 
@@ -77,7 +77,7 @@ scripts/self-test.ps1
 skills/bootstrap-claude-science-wsl/scripts/bootstrap-wsl-runtime.sh
 docs/v0.2-*.md
 docs/github-release-v0.2.0.md
-docs/plans/github-v0.2.0-rc1-push-plan.zh-CN.md
+docs/plans/github-v0.2.0-push-plan.zh-CN.md
 README.md
 .gitignore
 ```
@@ -103,7 +103,7 @@ PR 必须附：
 
 - Connect 与 Subagent 架构摘要。
 - `reports/release-readiness/` 证据结论，不上传含本机路径的原始报告。
-- 自动测试结果与待人工 Telegram 验收清单。
+- 自动测试结果与 Telegram 验收结论。
 - 安全边界和回退步骤。
 
 ## 5. 干净构建门
@@ -114,7 +114,7 @@ PR 合并后，在最终 `main` 提交执行：
 git status --short
 $env:CARGO_BUILD_JOBS = "1"
 .\scripts\verify-new-features.ps1 -LiveConnectRuntime -VerifyProxy
-.\scripts\package-launcher-portable.ps1 -Profile release -PackageQualifier rc.1
+.\scripts\package-launcher-portable.ps1 -Profile release
 ```
 
 如果上游 Claude Code 可用，再加 `-LiveExternalAgent`。它有 120 秒单轮超时，不会无限等待。
@@ -123,14 +123,14 @@ $env:CARGO_BUILD_JOBS = "1"
 
 ```text
 manifest.version = 0.2.0
-manifest.packageQualifier = rc.1
+manifest.packageQualifier = 空
 manifest.sourceCommit = 最终 main commit
 manifest.sourceTreeDirty = false
 ```
 
 任一项不满足，停止发布。
 
-## 6. 人工验收门
+## 6. 发布后烟雾测试
 
 使用最终干净 ZIP 解压到新目录，按以下顺序：
 
@@ -141,21 +141,21 @@ manifest.sourceTreeDirty = false
 5. 提交 Subagent Demo，批准、完成、读取 outbox，再恢复 session 追问一次。
 6. 退出新包并打开旧包，确认回退路径可用；随后恢复新包。
 
-## 7. 草稿 Release
+## 7. 正式 Release
 
-1. 创建注释标签 `v0.2.0-rc.1`。
-2. 创建 GitHub Draft、勾选 Pre-release。
+1. 创建注释标签 `v0.2.0`。
+2. 创建 GitHub Draft，不勾选 Pre-release。
 3. 使用 `docs/github-release-v0.2.0.md` 作为正文。
 4. 上传 ZIP 与 `.sha256`，不上传解压目录、`.venv`、本机 evidence 或配置文件。
 5. 从 GitHub 草稿回下载两个资产并复核 SHA-256。
-6. 回下载验收通过后公开 RC。
+6. 回下载验收通过后公开正式 Release，并设置为 Latest。
 
-## 8. 稳定版
+## 8. 发布完成标准
 
-RC 验收完成且没有阻断性问题后，在干净 `main` 上不带 qualifier 重建：
+正式包必须由干净 `main` 在不带 qualifier 的情况下构建：
 
 ```powershell
 .\scripts\package-launcher-portable.ps1 -Profile release
 ```
 
-创建 `v0.2.0` 正式标签与非预发布 Release。RC 资产保留用于追溯，不静默覆盖。
+`main`、`v0.2.0` 标签、Release 源码提交和 `manifest.sourceCommit` 必须一致；ZIP 与 `.sha256` 回下载复核后才算发布完成。历史 RC 资产保留用于追溯，不静默覆盖。
