@@ -8,6 +8,23 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 [![Downloads](https://img.shields.io/github/downloads/Dalaoyuan2020/claude-science-assistant/total?label=downloads)](https://github.com/Dalaoyuan2020/claude-science-assistant/releases)
 [![License](https://img.shields.io/badge/license-MIT-111827)](LICENSE)
 
+## 当前版本
+
+CSA 目前提供两条清晰的版本线。普通用户可以选择稳定核心版；需要远程连接和沙盒外 Agent 的用户可以选择功能完整版。
+
+| 版本 | 适合谁 | 主要能力 | 下载 |
+| --- | --- | --- | --- |
+| **v0.1.4 稳定核心版** | 优先考虑启动、API Key 与运行时稳定性 | 基于 v0.1.3-r2，内置已验证的 Claude Science 0.1.25；修复 API Key 切换；增加官方版本检查和安全升级/回退 Prompt | [Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.4) · [ZIP](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.4/claude-science-assistant-v0.1.4-release-portable.zip) · [SHA-256](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.4/claude-science-assistant-v0.1.4-release-portable.zip.sha256) |
+| **v0.2.0 功能完整版** | 需要 Telegram/飞书、Connect 与 Subagent | 在启动器与 Bridge 基础上增加本地消息网关、浏览器连接器、图片回传和外部 Agent 协作 | [Latest Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.2.0) |
+
+### v0.1.4 更新了什么
+
+- **Claude Science 运行时升级**：锁定并校验官方 Linux x64 `0.1.25`，受管实例关闭未验证的后台自动更新。
+- **API Key 切换修复**：切换 Key 时只事务化重启 Bridge，不再停止 Claude Science daemon 或打断当前会话；失败会回滚两侧配置。
+- **版本检查**：读取 Claude Science 官方 `latest` / `stable` 索引，并区分“官方最新”与“CSA 已验证推荐版”。
+- **安全升级与回退**：启动器生成交给本地 Codex 的升级/回退 Prompt，先做哈希校验、SQLite 备份和隔离验证，不静默替换真实运行时。
+- **发布验证**：Rust、Bridge、真实代理链路、便携包结构和 GitHub 回下载 SHA-256 均已通过。
+
 ## v0.2.0 新功能
 
 v0.2.0 新增两条本地优先链路：Connect 可把本人 Telegram/飞书私聊路由到当前 Claude Science 工作区并回传文本或受管 artifact 图片；Subagent 可让沙盒提交脱敏请求，经本地人工批准后交给 Claude Code plan 会话处理，并通过稳定 outbox 回读结果。
@@ -20,7 +37,7 @@ v0.2.0 新增两条本地优先链路：Connect 可把本人 Telegram/飞书私�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.3 已在 Windows 11 10.0.22631 + Ubuntu-24.04 完成端到端验证；309/其他差异环境尚未完成本版本 DeepSeek thinking 全链路复测。
+> 验证边界：v0.1.4 已在 Windows 11 10.0.22631 + Ubuntu-24.04 完成运行时升级、Bridge/API Key 切换、真实代理链路和发布包复测；其他差异环境仍建议先运行只读体检。
 
 [下载最新版](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/latest) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
@@ -173,7 +190,10 @@ Claude Science 侧通常会请求类似 `claude-sonnet-*`、`claude-opus-*`、`c
 
 ### 1. 下载
 
-只从 GitHub Releases 下载官方包：
+只从 GitHub Releases 下载官方包。优先稳定核心能力请选择 v0.1.4；需要 Connect 与 Subagent 请选择 v0.2.0：
+
+- `claude-science-assistant-v0.1.4-release-portable.zip`
+- `claude-science-assistant-v0.1.4-release-portable.zip.sha256`
 
 - `claude-science-assistant-v0.2.0-release-portable.zip`
 - `claude-science-assistant-v0.2.0-release-portable.zip.sha256`
@@ -294,7 +314,7 @@ CSA 当前是便携版，不需要卸载旧版，也不要卸载 WSL、Ubuntu �
 | --- | --- |
 | <img src="docs/assets/contact/wechat-personal.png" alt="个人微信二维码" width="260"> | <img src="docs/assets/contact/wechat-group.jpg" alt="Claude Science 绿皮书答疑群二维码" width="260"> |
 
-> 群二维码可能会过期；如果群二维码失效，请先添加个人微信获取新的入群方式。
+> 当前群二维码预计在 2026 年 8 月 15 日前有效；如果二维码失效，请先添加个人微信获取新的入群方式。
 
 ## 安全与隐私边界
 
