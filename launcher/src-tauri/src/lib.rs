@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +19,20 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // makes a valid Key look broken.
 const API_KEY_TEST_INITIAL_MAX_TOKENS: u32 = 256;
 const API_KEY_TEST_RETRY_MAX_TOKENS: u32 = 1024;
+
+const CLAUDE_SCIENCE_RELEASE_BASE: &str = "https://storage.googleapis.com/operon-dist-cf94a20e-f71c-413c-bd00-9e12b1fedf59/operon-releases";
+const CLAUDE_SCIENCE_CHANGELOG_URL: &str = "https://claude.com/docs/claude-science/changelog";
+const BUNDLED_CLAUDE_SCIENCE_VERSION: &str = "0.1.25";
+const BUNDLED_CLAUDE_SCIENCE_SHA8: &str = "b7190511";
+
+// Provider changes update the WSL Bridge config and restart its listener. Keep
+// the whole write/restart/verify transaction single-flight to prevent a second
+// click from racing the first transaction's rollback.
+static BRIDGE_CONFIG_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn bridge_config_transition_lock() -> &'static Mutex<()> {
+    BRIDGE_CONFIG_TRANSITION.get_or_init(|| Mutex::new(()))
+}
 
 #[cfg(windows)]
 #[link(name = "Kernel32")]
@@ -147,6 +162,38 @@ struct SystemStatus {
     storage_blocked: bool,
     restart_blocked: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeReleaseSummary {
+    version: String,
+    sha8: String,
+    build_date: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeUpdateStatus {
+    bundled_version: String,
+    bundled_sha8: String,
+    recommended_version: String,
+    latest: RuntimeReleaseSummary,
+    stable: RuntimeReleaseSummary,
+    update_available: bool,
+    checked_at_unix: u64,
+    release_notes_url: String,
+    note: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficialRuntimeManifest {
+    version: String,
+    sha8: String,
+    #[serde(rename = "buildDate", default)]
+    build_date: String,
+    #[serde(default)]
+    sha256: serde_json::Value,
 }
 
 #[derive(Debug, Default)]
@@ -2181,6 +2228,7 @@ fn restart_bridge_after_config(
         &[
             "env",
             "CSA_FORCE_RESTART=1",
+            "CSA_BRIDGE_ONLY=1",
             "PROXY_PORT=9876",
             "bash",
             &start_script,
@@ -2866,6 +2914,9 @@ fn commit_launcher_settings_with_bridge(
     settings: &LauncherSettings,
     patch: Option<serde_json::Value>,
 ) -> Result<(), String> {
+    let _transition = bridge_config_transition_lock()
+        .lock()
+        .map_err(|_| "Bridge 配置切换锁异常，请重新启动 CSA 后再试".to_string())?;
     // Pre-write and fsync Windows settings before touching WSL. This catches a
     // full APPDATA drive without leaving Bridge on a different active Key.
     let prepared_settings = prepare_launcher_settings(settings)?;
@@ -3072,6 +3123,209 @@ async fn get_system_status() -> Result<SystemStatus, String> {
     run_blocking(|| Ok(current_status())).await
 }
 
+fn valid_release_sha8(value: &str) -> bool {
+    value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn checked_release_text(output: Output, max_bytes: usize) -> Result<String, String> {
+    if !output.status.success() {
+        return Err(clean_diagnostic_text(&command_error_text(&output)));
+    }
+    if output.stdout.len() > max_bytes {
+        return Err("Claude Science 官方版本索引响应过大".into());
+    }
+    if output.stdout.contains(&0) {
+        return Err("Claude Science 官方版本索引包含无效内容".into());
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "Claude Science 官方版本索引不是 UTF-8 文本".to_string())?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Claude Science 官方版本索引为空".into());
+    }
+    Ok(text)
+}
+
+fn fetch_official_release_text(relative_path: &str, max_bytes: usize) -> Result<String, String> {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.contains("..")
+        || !relative_path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return Err("官方版本索引路径无效".into());
+    }
+
+    let url = format!("{CLAUDE_SCIENCE_RELEASE_BASE}/{relative_path}");
+    let mut command = background_command("curl.exe");
+    command.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "4",
+        "--max-time",
+        "12",
+        "--max-filesize",
+        "65536",
+        &url,
+    ]);
+    let windows_result =
+        command_output_with_timeout(command, Duration::from_secs(15), "检查官方版本")
+            .and_then(|output| checked_release_text(output, max_bytes));
+    if let Ok(text) = windows_result.as_ref() {
+        return Ok(text.clone());
+    }
+
+    let wsl_result = discover_distros()
+        .ok()
+        .and_then(|distros| preferred_distro(&distros))
+        .ok_or_else(|| "没有可用于版本检查的 WSL 发行版".to_string())
+        .and_then(|distro| {
+            run_wsl_with_timeout(
+                &distro,
+                &[
+                    "curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--proto",
+                    "=https",
+                    "--connect-timeout",
+                    "4",
+                    "--max-time",
+                    "12",
+                    "--max-filesize",
+                    "65536",
+                    &url,
+                ],
+                Duration::from_secs(15),
+            )
+        })
+        .and_then(|output| checked_release_text(output, max_bytes));
+    wsl_result.map_err(|wsl_error| {
+        let windows_error = windows_result
+            .err()
+            .unwrap_or_else(|| "Windows HTTPS 检查失败".into());
+        format!(
+            "无法读取 Claude Science 官方版本索引（Windows：{windows_error}；WSL：{wsl_error}）"
+        )
+    })
+}
+
+fn linux_x64_sha256(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("linux-x64")
+        .or_else(|| value.get("linux_x64"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn parse_official_release_manifest(
+    pointer: &str,
+    manifest_text: &str,
+) -> Result<RuntimeReleaseSummary, String> {
+    if !valid_release_sha8(pointer) {
+        return Err("官方版本指针格式无效".into());
+    }
+    let manifest: OfficialRuntimeManifest = serde_json::from_str(manifest_text)
+        .map_err(|error| format!("Claude Science 官方 manifest 解析失败：{error}"))?;
+    if manifest.sha8 != pointer {
+        return Err("Claude Science 官方 manifest 与版本指针不一致".into());
+    }
+    if manifest.version.trim().is_empty()
+        || !manifest
+            .version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return Err("Claude Science 官方 manifest 版本号无效".into());
+    }
+    if let Some(checksum) = linux_x64_sha256(&manifest.sha256) {
+        if !valid_sha256(checksum) {
+            return Err("Claude Science 官方 manifest 的 Linux x64 校验值无效".into());
+        }
+    }
+    Ok(RuntimeReleaseSummary {
+        version: manifest.version,
+        sha8: manifest.sha8,
+        build_date: manifest.build_date,
+    })
+}
+
+fn release_version_parts(value: &str) -> Option<Vec<u32>> {
+    let parts = value
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn release_is_newer(candidate: &str, current: &str) -> bool {
+    let (Some(mut candidate), Some(mut current)) = (
+        release_version_parts(candidate),
+        release_version_parts(current),
+    ) else {
+        return false;
+    };
+    let width = candidate.len().max(current.len());
+    candidate.resize(width, 0);
+    current.resize(width, 0);
+    candidate > current
+}
+
+fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
+    let latest_pointer = fetch_official_release_text("latest", 128)?.to_ascii_lowercase();
+    let stable_pointer = fetch_official_release_text("stable", 128)?.to_ascii_lowercase();
+    if !valid_release_sha8(&latest_pointer) || !valid_release_sha8(&stable_pointer) {
+        return Err("Claude Science 官方版本指针格式无效".into());
+    }
+
+    let latest_manifest =
+        fetch_official_release_text(&format!("{latest_pointer}/manifest.json"), 64 * 1024)?;
+    let stable_manifest = if latest_pointer == stable_pointer {
+        latest_manifest.clone()
+    } else {
+        fetch_official_release_text(&format!("{stable_pointer}/manifest.json"), 64 * 1024)?
+    };
+    let latest = parse_official_release_manifest(&latest_pointer, &latest_manifest)?;
+    let stable = parse_official_release_manifest(&stable_pointer, &stable_manifest)?;
+    let update_available = release_is_newer(&stable.version, BUNDLED_CLAUDE_SCIENCE_VERSION);
+
+    Ok(RuntimeUpdateStatus {
+        bundled_version: BUNDLED_CLAUDE_SCIENCE_VERSION.into(),
+        bundled_sha8: BUNDLED_CLAUDE_SCIENCE_SHA8.into(),
+        recommended_version: BUNDLED_CLAUDE_SCIENCE_VERSION.into(),
+        latest,
+        stable,
+        update_available,
+        checked_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+        release_notes_url: CLAUDE_SCIENCE_CHANGELOG_URL.into(),
+        note: "CSA v0.1.4 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
+    })
+}
+
+#[tauri::command]
+async fn get_runtime_update_status() -> Result<RuntimeUpdateStatus, String> {
+    run_blocking(get_runtime_update_status_impl).await
+}
+
 fn start_services_raw(distro: &str, user: &str) -> Result<(), String> {
     let script = project_root()?
         .join("scripts")
@@ -3134,13 +3388,32 @@ async fn start_services() -> Result<SystemStatus, String> {
 fn stop_services_raw(distro: &str) -> Result<(), String> {
     let script = r#"
 systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
-for pid in $(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}'); do
+claude_pids="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}')"
+for pid in $claude_pids; do
   kill "$pid" 2>/dev/null || true
 done
 for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
   if [ -r "/proc/$pid/cmdline" ]; then
     cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
     case "$cmd" in *"/proxy.py"*) kill "$pid" 2>/dev/null || true;; esac
+  fi
+done
+grace_deadline=$((SECONDS + 4))
+while [ "$SECONDS" -lt "$grace_deadline" ]; do
+  remaining=0
+  for pid in $claude_pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      remaining=1
+      break
+    fi
+  done
+  [ "$remaining" = "0" ] && break
+  sleep 0.25
+done
+for pid in $claude_pids; do
+  if [ -r "/proc/$pid/cmdline" ]; then
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    case "$cmd" in *"claude-science"*"serve"*) kill -9 "$pid" 2>/dev/null || true;; esac
   fi
 done
 deadline=$((SECONDS + 5))
@@ -3307,6 +3580,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_system_status,
+            get_runtime_update_status,
             start_services,
             stop_services,
             restart_services,
@@ -3971,6 +4245,63 @@ mod tests {
         let encoded = json_arg_hex(&rollback).unwrap();
         assert!(!encoded.contains('"'));
         assert!(encoded.len() > 20);
+    }
+
+    #[test]
+    fn bridge_only_restart_exits_before_claude_runtime_work() {
+        let script = include_str!("../../../scripts/start-claude-science-wsl.sh");
+        let bridge_only = script
+            .find("if [ \"${CSA_BRIDGE_ONLY:-0}\" = \"1\" ]")
+            .expect("bridge-only mode should be present");
+        let token_refresh = script
+            .find("TOKEN_FILE=")
+            .expect("token refresh block should be present");
+        let claude_stop = script
+            .find("for pid in $(pgrep -f \"claude-science\"")
+            .expect("Claude Science stop block should be present");
+        let claude_start = script
+            .find("\"$PATCHED_BIN\" serve")
+            .expect("Claude Science start command should be present");
+
+        assert!(bridge_only < token_refresh);
+        assert!(bridge_only < claude_stop);
+        assert!(bridge_only < claude_start);
+        assert!(script[bridge_only..token_refresh].contains("exit 0"));
+    }
+
+    #[test]
+    fn validates_official_release_pointer_and_manifest() {
+        assert!(valid_release_sha8("b7190511"));
+        assert!(!valid_release_sha8("B7190511"));
+        assert!(!valid_release_sha8("../latest"));
+
+        let checksum = "c663367bbc7ec54e7d1e5a9102594a9e70804ed5070f5d7cd1117e665e3c376c";
+        let text = format!(
+            r#"{{"version":"0.1.25","sha8":"b7190511","buildDate":"2026-07-24","sha256":{{"linux-x64":"{checksum}"}}}}"#
+        );
+        let release = parse_official_release_manifest("b7190511", &text).unwrap();
+        assert_eq!(release.version, "0.1.25");
+        assert_eq!(release.sha8, "b7190511");
+        assert!(parse_official_release_manifest("a8cf9eae", &text).is_err());
+    }
+
+    #[test]
+    fn compares_runtime_versions_numerically() {
+        assert!(release_is_newer("0.1.27", "0.1.25"));
+        assert!(release_is_newer("0.2", "0.1.99"));
+        assert!(!release_is_newer("0.1.25", "0.1.25"));
+        assert!(!release_is_newer("invalid", "0.1.25"));
+    }
+
+    #[test]
+    #[ignore = "requires the public Claude Science release index"]
+    fn official_runtime_index_is_readable() {
+        let status = get_runtime_update_status_impl().unwrap();
+        assert_eq!(status.bundled_version, "0.1.25");
+        assert!(valid_release_sha8(&status.latest.sha8));
+        assert!(valid_release_sha8(&status.stable.sha8));
+        assert!(!status.latest.version.is_empty());
+        assert!(!status.stable.version.is_empty());
     }
 
     #[test]

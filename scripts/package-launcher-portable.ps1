@@ -101,6 +101,8 @@ foreach ($file in @(
   "collect-acceptance-evidence.bat",
   "verify-proxy.ps1",
   "probe-provider-capabilities.ps1",
+  "backup-claude-science-data.sh",
+  "verify-claude-science-data.py",
   "doctor.ps1",
   "uninstall.ps1"
 )) {
@@ -109,10 +111,12 @@ foreach ($file in @(
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "quick-start.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "quick-start.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "architecture-and-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "architecture-and-product-plan.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.3.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.3.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.4.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.4.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.3-update-record.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.3-update-record.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.4-runtime-update.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.4-runtime-update.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-clean-pc-acceptance.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-clean-pc-acceptance.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "provider-access-matrix.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "provider-access-matrix.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "troubleshooting.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "troubleshooting.md")
@@ -203,10 +207,12 @@ $Manifest = [ordered]@{
     "docs/quick-start.zh-CN.md",
     "docs/architecture-and-product-plan.zh-CN.md",
     "docs/github-release-v0.1.3.md",
+    "docs/github-release-v0.1.4.md",
     "docs/green-book-integration.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
     "docs/v0.1.3-update-record.zh-CN.md",
+    "docs/v0.1.4-runtime-update.zh-CN.md",
     "docs/v0.1-clean-pc-acceptance.zh-CN.md",
     "docs/provider-access-matrix.zh-CN.md",
     "docs/troubleshooting.md",
@@ -311,7 +317,15 @@ $RootInstallBat = @(
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $PackageRoot "4-install-runtime-after-preview.bat") -Value $RootInstallBat -Encoding ASCII
 
-$secretMatches = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Select-String -Pattern 'sk-[A-Za-z0-9_-]{20,}' -List -ErrorAction SilentlyContinue)
+$verifiedBinaryPaths = @(
+  (Join-Path $PackageRoot "claude-science-assistant.exe"),
+  (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") "linux-x64") "claude-science")
+)
+$secretMatches = @(
+  Get-ChildItem -LiteralPath $PackageRoot -Recurse -File |
+    Where-Object { $_.FullName -notin $verifiedBinaryPaths } |
+    Select-String -Pattern 'sk-[A-Za-z0-9_-]{20,}' -List -ErrorAction SilentlyContinue
+)
 if ($secretMatches.Count -gt 0) {
   throw "Package contains secret-like tokens; refusing to archive."
 }

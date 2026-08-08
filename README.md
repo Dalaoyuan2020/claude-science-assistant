@@ -10,7 +10,7 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.3 已在 Windows 11 10.0.22631 + Ubuntu-24.04 完成端到端验证；309/其他差异环境尚未完成本版本 DeepSeek thinking 全链路复测。
+> 验证边界：v0.1.4 以 v0.1.3-r2 为稳定基线，锁定 Claude Science 0.1.25 stable；发布前必须完成本机升级、隔离数据迁移和干净环境安装复测。
 
 [下载最新版](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/latest) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
@@ -32,7 +32,7 @@ CSA 把这些步骤收口成一个桌面应用：
 - 默认保护隐私：API Key 使用 Windows 当前用户 DPAPI 加密，界面、日志、诊断包和发布包不应回显明文 Key。
 - 面向新手，也保留工程入口：新手双击 BAT 和启动器即可开始；熟悉命令行的用户仍可使用 PowerShell 脚本和诊断报告。
 
-## v0.1.3 界面结构
+## v0.1.4 界面结构
 
 首页把环境体检收口为可折叠的 2 行 × 3 列六项状态，不再把所有 Provider 或 API Key 平铺在首页：
 
@@ -41,6 +41,14 @@ CSA 把这些步骤收口成一个桌面应用：
 | Claude Science | WSL 存储 | 当前 API Key |
 
 “添加供应商”仍是唯一新增入口，测试连通、模型列表和自动映射都在该对话框内完成。仓库曾使用的两张预览图来自旧版五状态布局，已从 README 移除，避免把旧界面误当成 v0.1.3 实际界面。
+
+## v0.1.4 的核心范围
+
+v0.1.4 不引入 v0.2.0 的 Connect、Telegram、浏览器插件或 Subagent 界面，只保留 v0.1.3-r2 的稳定核心并升级受管 Claude Science runtime。运行时固定为 CSA 已验证的官方 0.1.25，启动时禁用上游后台自动更新，避免未经 CSA 验证的 latest 构建覆盖本地 Bridge 补丁。
+
+首页新增一条紧凑的运行时更新栏：它可以读取 Claude Science 官方 `latest` / `stable` 索引，并生成交给本地 Codex 的安全升级或回退 Prompt。启动器不会静默下载、覆盖或降级运行时。官方版本、官方 stable 与 CSA 已验证推荐版会分别显示，避免把“最新”误写成“已兼容”。
+
+API Key 切换也改为事务化的 Bridge-only 重启：切换期间会串行写入、重启并验证 Bridge，但不会停止或重启正在运行的 Claude Science 会话；失败时回滚 Bridge 配置和 Windows 端选择状态。
 
 ## v0.1.3 的四项核心变化
 
@@ -162,8 +170,8 @@ Claude Science 侧通常会请求类似 `claude-sonnet-*`、`claude-opus-*`、`c
 
 只从 GitHub Releases 下载官方包：
 
-- `claude-science-assistant-v0.1.3-release-portable.zip`
-- `claude-science-assistant-v0.1.3-release-portable.zip.sha256`
+- `claude-science-assistant-v0.1.4-release-portable.zip`
+- `claude-science-assistant-v0.1.4-release-portable.zip.sha256`
 
 不要从群文件、网盘或第三方镜像下载带 `claude-science-assistant.exe` 的压缩包。
 
@@ -335,6 +343,8 @@ Ubuntu-24.04 是默认推荐测试路径，便于复现问题；但启动器不�
 | [docs/quick-start.zh-CN.md](docs/quick-start.zh-CN.md) | 新手完整接入流程 |
 | [docs/architecture-and-product-plan.zh-CN.md](docs/architecture-and-product-plan.zh-CN.md) | 架构、风险审计、产品任务书 |
 | [docs/provider-access-matrix.zh-CN.md](docs/provider-access-matrix.zh-CN.md) | Provider 接入矩阵 |
+| [docs/github-release-v0.1.4.md](docs/github-release-v0.1.4.md) | v0.1.4 GitHub Release 候选文案 |
+| [docs/v0.1.4-runtime-update.zh-CN.md](docs/v0.1.4-runtime-update.zh-CN.md) | Claude Science 0.1.25 运行时升级、备份与回滚边界 |
 | [docs/github-release-v0.1.3.md](docs/github-release-v0.1.3.md) | v0.1.3 GitHub Release 文案 |
 | [docs/v0.1.3-update-record.zh-CN.md](docs/v0.1.3-update-record.zh-CN.md) | v0.1.3 相对 v0.1.2 的完整更新记录 |
 | [docs/retrospectives/2026-07-12-csa-v0.1.3-release-retrospective.zh-CN.md](docs/retrospectives/2026-07-12-csa-v0.1.3-release-retrospective.zh-CN.md) | v0.1.3 当日开发、验收与发布复盘，可作为文章素材 |

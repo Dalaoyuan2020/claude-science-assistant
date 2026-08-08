@@ -1,9 +1,9 @@
 ﻿{
     "product":  "claude-science",
     "platform":  "linux-x64",
-    "version":  "0.1.15-dev.20260701.t220242.shaaa553de",
+    "version":  "0.1.25",
     "profile":  "release, public",
-    "sha256":  "a5c966b3d07fb3e4460522d30b962c43eff7b6e15746defe0f37473b9df0a3d3",
-    "source":  "local WSL ~/.local/bin/claude-science captured for v0.1 portable package",
-    "capturedAt":  "2026-07-05T14:15:52.7547187Z"
+    "sha256":  "c663367bbc7ec54e7d1e5a9102594a9e70804ed5070f5d7cd1117e665e3c376c",
+    "source":  "Anthropic stable release b7190511 from the official operon-dist bucket",
+    "capturedAt":  "2026-08-08T00:00:00Z"
 }

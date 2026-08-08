@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { buildStorageMigrationPrompt, storageRecommendation } from "./storageMigration";
+import {
+  browserPreviewRuntimeStatus,
+  buildRuntimeRollbackPrompt,
+  buildRuntimeUpgradePrompt,
+  type RuntimeUpdateStatus,
+} from "./runtimeUpdate";
 import "./App.css";
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
@@ -260,6 +266,11 @@ function App() {
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
   const [showMigrationAssistant, setShowMigrationAssistant] = useState(false);
   const [migrationCopyState, setMigrationCopyState] = useState("");
+  const [runtimeUpdate, setRuntimeUpdate] = useState<RuntimeUpdateStatus>();
+  const [runtimeChecking, setRuntimeChecking] = useState(false);
+  const [runtimeError, setRuntimeError] = useState("");
+  const [runtimePromptMode, setRuntimePromptMode] = useState<"upgrade" | "rollback">();
+  const [runtimeCopyState, setRuntimeCopyState] = useState("");
   const refreshInFlight = useRef(false);
   const busyRef = useRef(false);
 
@@ -273,6 +284,12 @@ function App() {
   const summary = stateText[status.state];
   const migrationRecommendation = useMemo(() => storageRecommendation(status), [status]);
   const migrationPrompt = useMemo(() => buildStorageMigrationPrompt(status), [status]);
+  const runtimePrompt = useMemo(() => {
+    if (!runtimeUpdate || !runtimePromptMode) return "";
+    return runtimePromptMode === "upgrade"
+      ? buildRuntimeUpgradePrompt(runtimeUpdate)
+      : buildRuntimeRollbackPrompt(runtimeUpdate);
+  }, [runtimePromptMode, runtimeUpdate]);
 
   const refresh = useCallback(async () => {
     if (refreshInFlight.current || busyRef.current) return;
@@ -658,6 +675,41 @@ function App() {
     }
   }
 
+  async function checkRuntimeUpdate() {
+    setRuntimeChecking(true);
+    setRuntimeError("");
+    try {
+      const next = isTauri
+        ? await invoke<RuntimeUpdateStatus>("get_runtime_update_status")
+        : browserPreviewRuntimeStatus;
+      setRuntimeUpdate(next);
+    } catch (reason) {
+      setRuntimeError(String(reason));
+    } finally {
+      setRuntimeChecking(false);
+    }
+  }
+
+  function openRuntimePrompt(mode: "upgrade" | "rollback") {
+    if (mode === "upgrade" && !runtimeUpdate) {
+      setRuntimeError("请先成功读取官方版本索引，再生成升级 Prompt。");
+      return;
+    }
+    const next = runtimeUpdate || browserPreviewRuntimeStatus;
+    setRuntimeUpdate(next);
+    setRuntimePromptMode(mode);
+    setRuntimeCopyState("");
+  }
+
+  async function copyRuntimePrompt() {
+    try {
+      await navigator.clipboard.writeText(runtimePrompt);
+      setRuntimeCopyState("Prompt 已复制，可以交给本地 Codex。 ");
+    } catch {
+      setRuntimeCopyState("自动复制失败，请在文本框中按 Ctrl+A、Ctrl+C 手动复制。");
+    }
+  }
+
   const bridgeDetail = status.bridgeHealthy
     ? (status.bridgePid ? `PID ${status.bridgePid}` : "健康")
     : status.bridgeRunning
@@ -789,6 +841,49 @@ function App() {
           </section>
         </div>
       )}
+
+      {runtimePromptMode && runtimeUpdate && (
+        <div className="migration-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.currentTarget === event.target) setRuntimePromptMode(undefined);
+        }}>
+          <section className="migration-dialog" role="dialog" aria-modal="true" aria-labelledby="runtime-prompt-title">
+            <div className="migration-dialog-head">
+              <div>
+                <span className="eyebrow">Claude Science Runtime</span>
+                <h2 id="runtime-prompt-title">{runtimePromptMode === "upgrade" ? "安全升级 Prompt" : "安全回退 Prompt"}</h2>
+                <p>由本地 Agent 先做隔离验证；未经你批准，不会替换真实运行时。</p>
+              </div>
+              <button className="quiet-button" onClick={() => setRuntimePromptMode(undefined)}>关闭</button>
+            </div>
+            <label className="migration-prompt-label" htmlFor="runtime-prompt">复制下面内容给 Codex</label>
+            <textarea id="runtime-prompt" value={runtimePrompt} readOnly spellCheck={false} />
+            <div className="migration-actions">
+              {runtimeCopyState && <span aria-live="polite">{runtimeCopyState}</span>}
+              <button className="primary-inline-button" onClick={copyRuntimePrompt}>复制 Prompt</button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      <section className="runtime-update-panel" aria-label="Claude Science 运行时更新">
+        <div className="runtime-update-copy">
+          <span className="eyebrow">Runtime Update</span>
+          <h2>Claude Science {runtimeUpdate?.bundledVersion || "0.1.25"}</h2>
+          <p>{runtimeUpdate
+            ? `官方 stable ${runtimeUpdate.stable.version} · latest ${runtimeUpdate.latest.version}`
+            : "CSA 已验证版 0.1.25 · 可读取官方索引检查新版本"}</p>
+          {runtimeError && <small className="runtime-update-error">{runtimeError}</small>}
+        </div>
+        <div className="runtime-update-state">
+          <strong>{runtimeUpdate?.updateAvailable ? "发现官方新版本" : runtimeUpdate ? "已是 CSA 推荐版" : "尚未检查"}</strong>
+          <small>{runtimeUpdate?.note || "检查不会安装或替换运行时"}</small>
+        </div>
+        <div className="runtime-update-actions">
+          <button onClick={checkRuntimeUpdate} disabled={runtimeChecking}>{runtimeChecking ? "检查中…" : "检查更新"}</button>
+          <button onClick={() => openRuntimePrompt("upgrade")} disabled={!runtimeUpdate}>升级 Prompt</button>
+          <button onClick={() => openRuntimePrompt("rollback")}>回退 Prompt</button>
+        </div>
+      </section>
 
       <section className="kit-section">
         <div className="section-heading">

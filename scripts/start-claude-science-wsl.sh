@@ -314,6 +314,11 @@ else
   echo "WSL BYOK proxy already healthy on 127.0.0.1:$PROXY_PORT"
 fi
 
+if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]; then
+  echo "Bridge-only restart complete; Claude Science was left running."
+  exit 0
+fi
+
 TOKEN_FILE="$HOME/.claude-science/.oauth-tokens/byok-user-000000000000000000.enc"
 if [ -f "$HOME/.claude-science/encryption.key" ]; then
   if [ -f "$TOKEN_FILE" ]; then
@@ -444,7 +449,7 @@ done
 sleep 1
 
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
-ANTHROPIC_BASE_URL="$PROXY_URL" "$PATCHED_BIN" serve --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached
+ANTHROPIC_BASE_URL="$PROXY_URL" "$PATCHED_BIN" serve --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update
 
 echo "Started Claude Science patched copy:"
 echo "  daemon: $PATCHED_BIN"

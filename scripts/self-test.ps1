@@ -49,6 +49,57 @@ if (-not $dependenciesReady) {
 & $Python -m py_compile proxy.py setup-token.py forward-443.py
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
+$RuntimeManifestPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\manifest.json"
+$RuntimeBinaryPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\claude-science"
+$StartScriptPath = Join-Path $ProjectDir "scripts\start-claude-science-wsl.sh"
+$RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ([string]$RuntimeManifest.version -ne "0.1.25") {
+  throw "v0.1.4 must lock Claude Science stable 0.1.25."
+}
+if (Test-Path -LiteralPath $RuntimeBinaryPath) {
+  $RuntimeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RuntimeBinaryPath).Hash.ToLowerInvariant()
+  if ($RuntimeHash -ne [string]$RuntimeManifest.sha256) {
+    throw "Bundled Claude Science hash does not match manifest.json."
+  }
+}
+$StartScriptText = Get-Content -LiteralPath $StartScriptPath -Raw -Encoding UTF8
+if (-not $StartScriptText.Contains("--no-auto-update")) {
+  throw "Managed Claude Science must disable upstream background auto-update."
+}
+if (-not $StartScriptText.Contains('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')) {
+  throw "Provider switching must support a Bridge-only restart mode."
+}
+$BridgeOnlyPosition = $StartScriptText.IndexOf('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')
+$ClaudeStopPosition = $StartScriptText.IndexOf('for pid in $(pgrep -f "claude-science"')
+if ($ClaudeStopPosition -lt 0 -or $BridgeOnlyPosition -gt $ClaudeStopPosition) {
+  throw "Bridge-only restart must exit before Claude Science processes are stopped."
+}
+Write-Host "Claude Science 0.1.25 runtime lock checks passed"
+
+$RuntimeUpdateSource = Join-Path $ProjectDir "launcher\src\runtimeUpdate.ts"
+$LauncherRustSource = Join-Path $ProjectDir "launcher\src-tauri\src\lib.rs"
+if (-not (Test-Path -LiteralPath $RuntimeUpdateSource)) {
+  throw "Runtime update Prompt generator is missing."
+}
+$RuntimeUpdateText = Get-Content -LiteralPath $RuntimeUpdateSource -Raw -Encoding UTF8
+foreach ($pattern in @('invoke\s*\(', 'fetch\s*\(', 'child_process', 'execFile\s*\(', 'writeFile\s*\(')) {
+  if ($RuntimeUpdateText -match $pattern) {
+    throw "Runtime update Prompt generator must remain side-effect free; forbidden pattern: $pattern"
+  }
+}
+foreach ($marker in @('0.1.21', '0.1.25', 'SQLite backup API', 'wsl --unregister', 'SHA-256')) {
+  if (-not $RuntimeUpdateText.Contains($marker)) {
+    throw "Runtime update Prompt is missing required safety marker: $marker"
+  }
+}
+$LauncherRustText = Get-Content -LiteralPath $LauncherRustSource -Raw -Encoding UTF8
+foreach ($marker in @('get_runtime_update_status', 'CLAUDE_SCIENCE_RELEASE_BASE', 'BUNDLED_CLAUDE_SCIENCE_VERSION')) {
+  if (-not $LauncherRustText.Contains($marker)) {
+    throw "Runtime update checker is missing required marker: $marker"
+  }
+}
+Write-Host "runtime update checker and Prompt safety checks passed"
+
 $MigrationPromptSource = Join-Path $ProjectDir "launcher\src\storageMigration.ts"
 $MigrationPromptDocument = Join-Path $ProjectDir "docs\prompts\csa-wsl-storage-migration-codex-prompt.zh-CN.md"
 if (Test-Path -LiteralPath $MigrationPromptSource) {
