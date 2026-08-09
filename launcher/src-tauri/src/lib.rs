@@ -2209,12 +2209,16 @@ fn restart_bridge_after_config(
     status: &SystemStatus,
     expected_revision: Option<&str>,
 ) -> Result<(), String> {
-    if !status.bridge_running {
-        return Ok(());
-    }
-    let Some(distro) = status.distro.as_deref() else {
-        return Ok(());
+    let distro = status
+        .distro
+        .as_deref()
+        .ok_or_else(|| "Bridge 配置已写入，但没有可用于生效配置的 WSL 发行版".to_string())?;
+    let activation = if status.bridge_running {
+        "restart"
+    } else {
+        "start"
     };
+    eprintln!("[CSA] Bridge config activation: action={activation}, distro={distro}");
     let project_wsl = project_root()
         .ok()
         .and_then(|root| windows_path_to_wsl(distro, &root))
@@ -4335,5 +4339,127 @@ mod tests {
         assert!(!is_windows_system_drive(Some("D:")));
         assert!(!is_windows_system_drive(Some("/mnt/c")));
         assert!(!is_windows_system_drive(None));
+    }
+
+    #[cfg(windows)]
+    fn live_bridge_json(path: &str) -> Result<serde_json::Value, String> {
+        let mut command = background_command("curl.exe");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "10",
+            &format!("http://127.0.0.1:9876{path}"),
+        ]);
+        let output = command_output_with_timeout(
+            command,
+            Duration::from_secs(12),
+            "读取本地 Bridge 诊断",
+        )?;
+        if !output.status.success() {
+            return Err(command_error_text(&output));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("本地 Bridge 诊断响应无法解析：{error}"))
+    }
+
+    #[cfg(windows)]
+    fn live_bridge_request() -> Result<serde_json::Value, String> {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 48,
+            "messages": [{"role": "user", "content": "Reply only: SWITCH_OK"}]
+        })
+        .to_string();
+        let mut command = background_command("curl.exe");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "90",
+            "-H",
+            "content-type: application/json",
+            "-X",
+            "POST",
+            "--data-binary",
+            &body,
+            "http://127.0.0.1:9876/v1/messages",
+        ]);
+        let output = command_output_with_timeout(
+            command,
+            Duration::from_secs(95),
+            "发送本地 Bridge 切换验证请求",
+        )?;
+        if !output.status.success() {
+            return Err(command_error_text(&output));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Bridge 切换验证响应无法解析：{error}"))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "mutates the current user's active API Key and sends one real request"]
+    fn live_api_key_switch_diagnostic() {
+        let target_id = std::env::var("CSA_LIVE_SWITCH_API_KEY_ID")
+            .expect("set CSA_LIVE_SWITCH_API_KEY_ID to a saved API Key id");
+        let before_settings = load_settings();
+        let target = before_settings
+            .api_keys
+            .iter()
+            .find(|entry| entry.id == target_id)
+            .cloned()
+            .expect("target API Key should exist");
+        let before_status = current_status();
+        let before_health = live_bridge_json("/health").ok();
+
+        let switch_result = activate_api_key_impl(target_id.clone());
+        let after_status = current_status();
+        let after_health = live_bridge_json("/health").ok();
+        let request_result = live_bridge_request();
+        let recent = live_bridge_json("/api/recent-requests").ok();
+        let routed = recent
+            .as_ref()
+            .and_then(|value| value.get("requests"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("backend").and_then(serde_json::Value::as_str) != Some("local")
+                })
+            });
+
+        let evidence = serde_json::json!({
+            "target": {
+                "id": target.id,
+                "provider": target.provider_id,
+                "model": target.model,
+            },
+            "before": {
+                "bridgeRunning": before_status.bridge_running,
+                "bridgeHealthy": before_status.bridge_healthy,
+                "revision": before_health.as_ref().and_then(|value| value.get("config_revision")).and_then(serde_json::Value::as_str),
+            },
+            "switchReturnedOk": switch_result.is_ok(),
+            "switchError": switch_result.as_ref().err(),
+            "after": {
+                "bridgeRunning": after_status.bridge_running,
+                "bridgeHealthy": after_status.bridge_healthy,
+                "revision": after_health.as_ref().and_then(|value| value.get("config_revision")).and_then(serde_json::Value::as_str),
+                "forceModel": after_health.as_ref().and_then(|value| value.get("force_model")).and_then(serde_json::Value::as_str),
+            },
+            "realRequestOk": request_result.is_ok(),
+            "realRequestError": request_result.as_ref().err(),
+            "responseIdPresent": request_result.as_ref().ok().and_then(|value| value.get("id")).and_then(serde_json::Value::as_str).is_some(),
+            "routedBackend": routed.and_then(|value| value.get("backend")).and_then(serde_json::Value::as_str),
+            "routedModel": routed.and_then(|value| value.get("model")).and_then(serde_json::Value::as_str),
+            "routedStatus": routed.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str),
+        });
+        println!("CSA_SWITCH_EVIDENCE={evidence}");
     }
 }
