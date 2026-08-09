@@ -3155,10 +3155,11 @@ fn save_api_key_impl(
     let validated_base_url = validate_base_url(&custom_base_url)?;
     let encrypted_api_key = protect_api_key(clean_key)?;
     let mut settings = load_settings();
-    settings.selected_provider_id = selected_provider_id.clone();
-    settings.custom_base_url = validated_base_url.clone();
-    settings.custom_confirmed = custom_confirmed;
-    let runtime_profile = runtime_profile_for_settings(&settings)?;
+    let mut candidate_settings = settings.clone();
+    candidate_settings.selected_provider_id = selected_provider_id.clone();
+    candidate_settings.custom_base_url = validated_base_url.clone();
+    candidate_settings.custom_confirmed = custom_confirmed;
+    let runtime_profile = runtime_profile_for_settings(&candidate_settings)?;
     let mut sanitized_aliases = clean_model_aliases(&model_aliases);
     let stored_model = if model.trim().is_empty() {
         primary_model_from_aliases(&sanitized_aliases).unwrap_or_default()
@@ -3174,8 +3175,12 @@ fn save_api_key_impl(
             sanitized_aliases = default_aliases_for_profile(profile, &stored_model);
         }
     }
-    let patch =
-        bridge_config_patch_for_api_key(&settings, clean_key, &stored_model, &sanitized_aliases)?;
+    let _validated_patch = bridge_config_patch_for_api_key(
+        &candidate_settings,
+        clean_key,
+        &stored_model,
+        &sanitized_aliases,
+    )?;
     let label = if selected_provider_id == "custom" {
         custom_relay_label(&settings, &display_name)?
     } else {
@@ -3191,10 +3196,8 @@ fn save_api_key_impl(
         model_aliases: sanitized_aliases,
         encrypted_api_key,
     };
-    settings.active_api_key_id = Some(entry.id.clone());
-    settings.active_role = None;
     settings.api_keys.push(entry);
-    commit_launcher_settings_with_bridge(&settings, patch)?;
+    persist_launcher_settings(&settings)?;
     Ok(launcher_state(&settings))
 }
 

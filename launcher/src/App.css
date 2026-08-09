@@ -104,8 +104,10 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 .kit-queue-head small { margin-top: 2px; color: #7b867e; font-size: 11px; }
 .kit-queue-head button, .add-kit-row, .form-actions button { border: 1px solid #d5ded6; border-radius: 11px; padding: 8px 11px; color: #405347; background: white; cursor: pointer; font-size: 12px; font-weight: 700; }
 .kit-row, .template-row, .add-kit-row { width: 100%; display: flex; align-items: center; gap: 11px; text-align: left; }
-.kit-row { border: 1px solid #dbe4dc; border-radius: 14px; padding: 12px; background: #f7faf7; }
+.kit-row { border: 1px solid #dbe4dc; border-radius: 14px; padding: 12px; background: #f7faf7; cursor: pointer; }
 .kit-row.active { border-color: #8db89a; box-shadow: inset 0 0 0 1px #8db89a55; }
+.kit-row.pending { border-color: #587c66; background: #eef6f0; box-shadow: inset 0 0 0 1px #587c6640; }
+.kit-row:focus-visible { outline: 2px solid #315d44; outline-offset: 2px; }
 .kit-index { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; color: #6f7b72; background: #edf1ed; font-size: 11px; font-weight: 850; }
 .kit-row-copy strong, .kit-row-copy small, .template-copy strong, .template-copy small { display: block; }
 .kit-row-copy small, .template-copy small { color: #7b867e; font-size: 11px; margin-top: 2px; }
@@ -115,6 +117,13 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 .key-row-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
 .key-row-actions button { border: 1px solid #d2dcd4; border-radius: 8px; padding: 5px 8px; color: #47584d; background: white; cursor: pointer; font-size: 10px; font-weight: 750; }
 .active-key-label { border-radius: 999px; padding: 5px 8px; color: #176337; background: #dff2e5; font-size: 10px; font-weight: 800; }
+.pending-key-label { border-radius: 999px; padding: 5px 8px; color: #315d44; background: #dce9df; font-size: 10px; font-weight: 800; }
+.key-switch-confirm { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; padding: 10px 11px; border: 1px solid #d9e1da; border-radius: 11px; background: #f8faf8; }
+.key-switch-confirm > span { min-width: 0; color: #67756c; font-size: 11px; line-height: 1.35; }
+.key-switch-confirm > div { flex: 0 0 auto; display: flex; gap: 6px; }
+.key-switch-confirm button { border: 1px solid #cfd9d1; border-radius: 8px; padding: 6px 9px; color: #405347; background: white; cursor: pointer; font-size: 10px; font-weight: 800; }
+.key-switch-confirm .confirm-switch-button { color: white; border-color: #315d44; background: #315d44; }
+.key-switch-confirm button:disabled { opacity: .45; cursor: not-allowed; }
 .add-kit-row { justify-content: center; margin-top: 10px; border-style: dashed; color: #2f5a40; background: #fbfdfb; }
 .add-kit-row span { width: 22px; height: 22px; border-radius: 8px; display: grid; place-items: center; color: white; background: #315d44; font-weight: 900; }
 

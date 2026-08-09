@@ -301,6 +301,7 @@ function App() {
   const [customBaseUrl, setCustomBaseUrl] = useState(fallbackSettings.customBaseUrl);
   const [customConfirmed, setCustomConfirmed] = useState(fallbackSettings.customConfirmed);
   const [activeApiKeyId, setActiveApiKeyId] = useState<string | undefined>();
+  const [pendingApiKeyId, setPendingApiKeyId] = useState<string | undefined>();
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>(fallbackSettings.apiKeys);
   const [activeRole, setActiveRole] = useState<SubscriptionRole | undefined>();
   const [roleBindings, setRoleBindings] = useState<RoleBinding[]>(roleDraftsFromSettings(fallbackSettings));
@@ -411,6 +412,7 @@ function App() {
     setCustomBaseUrl(settings.customBaseUrl);
     setCustomConfirmed(settings.customConfirmed);
     setActiveApiKeyId(settings.activeApiKeyId);
+    setPendingApiKeyId(settings.activeApiKeyId);
     setApiKeys(settings.apiKeys || []);
     setActiveRole(settings.activeRole);
     setRoleBindings(roleDraftsFromSettings(settings));
@@ -491,13 +493,10 @@ function App() {
         customConfirmed: draftConfirmed,
         modelAliases: draftModelAliases,
         hasSecret: Boolean(draftApiKey.trim()),
-        active: true,
+        active: false,
       };
-      setApiKeys((current) => [...current.map((item) => ({ ...item, active: false })), entry]);
-      setActiveApiKeyId(id);
-      setActiveProvider(draftProvider.id);
-      setCustomBaseUrl(draftBaseUrl);
-      setCustomConfirmed(draftConfirmed);
+      setApiKeys((current) => [...current, entry]);
+      setPendingApiKeyId(id);
       setShowKeyPicker(false);
       setDraftApiKey("");
       setDraftDisplayName("");
@@ -516,7 +515,10 @@ function App() {
         model: draftModel,
         modelAliases: draftModelAliases,
       });
+      const previousIds = new Set(apiKeys.map((entry) => entry.id));
+      const added = (saved.apiKeys || []).find((entry) => !previousIds.has(entry.id));
       applyLauncherState(saved);
+      setPendingApiKeyId(added?.id || saved.activeApiKeyId);
       setDraftApiKey("");
       setDraftDisplayName("");
       setDraftModelAliases([]);
@@ -665,6 +667,7 @@ function App() {
       const entry = apiKeys.find((item) => item.id === apiKeyId);
       if (!entry) return;
       setActiveApiKeyId(apiKeyId);
+      setPendingApiKeyId(apiKeyId);
       setActiveProvider(entry.providerId);
       setActiveRole(undefined);
       setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === apiKeyId })));
@@ -818,6 +821,23 @@ function App() {
     } catch {
       setMigrationCopyState("自动复制失败，请在下方文本框中按 Ctrl+A、Ctrl+C 手动复制。");
     }
+  }
+
+  function preselectKey(apiKeyId: string) {
+    if (busy || status.restartBlocked) return;
+    setPendingApiKeyId(apiKeyId);
+    setError("");
+  }
+
+  async function confirmPendingKey() {
+    if (!pendingApiKeyId || pendingApiKeyId === activeApiKeyId) return;
+    await activateKey(pendingApiKeyId);
+  }
+
+  function cancelPendingKey() {
+    if (busy) return;
+    setPendingApiKeyId(activeApiKeyId);
+    setError("");
   }
 
   async function checkRuntimeUpdate() {
@@ -1070,8 +1090,22 @@ function App() {
             {apiKeys.map((entry, index) => {
               const provider = providers.find((item) => item.id === entry.providerId);
               const active = entry.id === activeApiKeyId;
+              const pending = entry.id === pendingApiKeyId && !active;
               return (
-                <div className={`kit-row ${active ? "active" : ""}`} key={entry.id}>
+                <div
+                  className={`kit-row ${active ? "active" : ""} ${pending ? "pending" : ""}`}
+                  key={entry.id}
+                  role="button"
+                  tabIndex={busy ? -1 : 0}
+                  aria-pressed={entry.id === pendingApiKeyId}
+                  onClick={() => preselectKey(entry.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      preselectKey(entry.id);
+                    }
+                  }}
+                >
                   <span className="kit-index">{String(index + 1).padStart(2, "0")}</span>
                   <span className="kit-row-copy">
                     <strong>{entry.label}</strong>
@@ -1079,15 +1113,38 @@ function App() {
                   </span>
                   <span className="key-row-actions">
                     {active
-                      ? activeRole
-                        ? <button onClick={() => activateKey(entry.id)} disabled={busy || status.restartBlocked}>退出角色</button>
-                        : <span className="active-key-label">使用中</span>
-                      : <button onClick={() => activateKey(entry.id)} disabled={busy || status.restartBlocked}>使用</button>}
-                    <button onClick={() => deleteKey(entry.id)} disabled={busy || active}>删除</button>
+                      ? <span className="active-key-label">使用中</span>
+                      : pending
+                        ? <span className="pending-key-label">待生效</span>
+                        : null}
+                    <button
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void deleteKey(entry.id);
+                      }}
+                      disabled={busy || active}
+                    >
+                      删除
+                    </button>
                   </span>
                 </div>
               );
             })}
+            <div className="key-switch-confirm" aria-live="polite">
+              <span>{pendingApiKeyId && pendingApiKeyId !== activeApiKeyId
+                ? `待切换：${apiKeys.find((entry) => entry.id === pendingApiKeyId)?.label || "已选供应商"}`
+                : "点击列表预选，确认后才会重启并生效"}</span>
+              <div>
+                <button onClick={cancelPendingKey} disabled={busy || pendingApiKeyId === activeApiKeyId}>取消</button>
+                <button
+                  className="confirm-switch-button"
+                  onClick={() => void confirmPendingKey()}
+                  disabled={busy || status.restartBlocked || !pendingApiKeyId || pendingApiKeyId === activeApiKeyId}
+                >
+                  {busy ? "切换中…" : "确认切换"}
+                </button>
+              </div>
+            </div>
             <button className="add-kit-row" onClick={openKeyPicker} disabled={busy}>
               <span>+</span>
               添加新的供应商
@@ -1386,7 +1443,7 @@ function App() {
 
                 <div className="form-actions">
                   <button className="primary-inline-button" onClick={applyDraftKey} disabled={busy || testingKey || autoMappingKey || status.restartBlocked}>
-                    {busy ? "正在保存…" : "保存并设为当前 Key"}
+                    {busy ? "正在保存…" : "保存到列表"}
                   </button>
                   <button onClick={() => setShowKeyPicker(false)} disabled={busy || testingKey || autoMappingKey}>取消</button>
                 </div>
