@@ -47,8 +47,8 @@
 - [x] R2 最小加固：预检进程 20 秒超时
 - [ ] R3 加固后回归（待人工：同 R1 的 aggregate-only 验证脚本兼容问题）
 - [x] R4 整理提交
-- [ ] R5 打包 release 便携版
-- [ ] R6 发布包上检测
+- [x] R5 打包 release 便携版
+- [x] R6 发布包上检测
 - [ ] R7 GitHub、页面与交付报告
 
 ## R0 完成
@@ -90,3 +90,21 @@
 证据在哪：提交 `037968d feat: add aggregate subscription schemes`、`8a4067b fix: bound API key preflight execution`、`f5edf38 feat: display the v0.1.5 launcher version`。
 
 下一步：R5 使用现成脚本制作 `release-v0.1.5-publish-20260810`。六份 `CSA_T8*20260809.md` 草案与本轮发布任务冲突且归属无法确认，保留为未跟踪文件并标待人工，不进入提交。
+
+## R5 完成
+
+做了什么：以 `release` profile、单 Cargo job 构建 v0.1.5，并用 `package-launcher-portable.ps1` 生成完整便携包。首次封装发现当前工作副本缺少被 `.gitignore` 排除的 Linux 运行时；随后从 v0.1.4 稳定工作副本补入 Claude Science 0.1.25，并在封装前校验其 SHA-256 与当前仓库 manifest 完全一致。
+
+证据在哪里：运行时 `--version` 为 `claude-science 0.1.25 (release, public)`，SHA-256 为 `C663367BBC7EC54E7D1E5A9102594A9E70804ED5070F5D7CD1117E665E3C376C`；产物位于 `dist/release-v0.1.5-publish-20260810/claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip`，并已生成同名 `.sha256`。
+
+下一步：R6 从发布包本身核验 EXE 时间戳、关键前端文案、包内 self-test 和 ZIP SHA-256。
+
+## R6 完成
+
+做了什么：为便携包补充同构建生成的前端 JS 校验副本，以及 self-test 依赖的三份只读审计源文件；从最终 ZIP 解压到短路径后执行包内自检，并独立复算 ZIP 哈希。
+
+证据在哪里：最新打包源码 `scripts/package-launcher-portable.ps1` 时间为 `2026-08-10T01:28:22+08:00`，包内 EXE 时间为 `2026-08-10T01:30:24+08:00`；包内 `index-Bakxun1r.js` 对“确认切换”“方案一”“方案二”各命中 1 次；包内 self-test 为 `53 translation tests passed`、`self-test passed`；ZIP 大小 `90,677,168` 字节，SHA-256 为 `82D8AA53BEAEA4D09E1E3AA41B318AD86675F3976EFA6688CD87CF8CFDF9814A`，与 `.sha256` 一致。
+
+补充说明：直接在超长开发路径运行包内 self-test 会触发 Windows 传统路径长度限制；从同一最终 ZIP 解压到短路径后完整通过。这不影响启动器运行，但自检建议在短目录执行。
+
+下一步：R7 执行凭据扫描、更新 README/Release 说明与交付报告，再推送分支、标签和正式 Release。

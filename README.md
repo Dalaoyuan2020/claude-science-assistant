@@ -10,9 +10,9 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.5 以 v0.1.4 为稳定基线，锁定 Claude Science 0.1.25；发布前仍需完成视觉订阅图片请求、便携包升级和干净环境安装复测。
+> 验证边界：v0.1.5 以 v0.1.4 为稳定基线，锁定 Claude Science 0.1.25；源码测试、两套聚合方案真实切换和便携包自检已通过，视觉订阅图片请求与干净环境安装仍建议在目标电脑复验。
 
-[下载最新版](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/latest) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
+[下载 v0.1.5](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.5/claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
 官方仓库：[Dalaoyuan2020/claude-science-assistant](https://github.com/Dalaoyuan2020/claude-science-assistant)  
 配套阅读：[Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
@@ -42,6 +42,28 @@ CSA 把这些步骤收口成一个桌面应用：
 6. **长列表收纳**：API 接入页可折叠，供应商列表最多显示五条，更多条目在列表内部滚动。
 
 详细实现与验证证据见 [v0.1.5 模型切换与角色映射说明](docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md)。本版只做手动静态映射，不做请求内容自动分类或智能路由。
+
+### 订阅列表
+
+先在 `API 接入` 页保存可用订阅。点击列表项只会预选，只有点击“确认切换”才会重启 Bridge 并生效。
+
+| 列表内容 | 用途 | 是否单独生效 |
+| --- | --- | --- |
+| 供应商、Base URL、加密 API Key | 保存一条可复用订阅 | 否，保存不会自动替换当前接入 |
+| 模型列表与三层建议 | 为聚合方案提供可选模型 | 否，仍需在方案中确认 |
+| 当前使用 / 待生效 | 区分已运行配置与本次预选 | 点击“确认切换”后才生效 |
+
+### 角色与方案绑定
+
+切到 `聚合模式` 后，一套方案会同时接入三个模型槽，不需要逐个点击角色切换。方案一和方案二各自保存一张完整路由表。
+
+| Claude Science 模型槽 | CSA 角色 | 绑定内容 | 推荐用途 |
+| --- | --- | --- | --- |
+| Opus | 决策（default） | 订阅 + 模型 | 深度思考、复杂科研决策 |
+| Sonnet | 视觉（vision） | 订阅 + 多模态模型 | 图片、图表与多模态任务 |
+| Haiku / Fast | 日常（fast） | 订阅 + 快速模型 | 普通问答与低延迟任务 |
+
+在方案一或方案二中配置三行后，点击“保存并应用整套方案”。以后切换已有方案时，先预选方案，再点一次“确认切换”；三条路由会作为一个事务同时生效。
 
 ## v0.1.4 界面结构
 
@@ -181,8 +203,8 @@ Claude Science 侧通常会请求类似 `claude-sonnet-*`、`claude-opus-*`、`c
 
 只从 GitHub Releases 下载官方包：
 
-- `claude-science-assistant-v0.1.4-release-portable.zip`
-- `claude-science-assistant-v0.1.4-release-portable.zip.sha256`
+- `claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip`
+- `claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip.sha256`
 
 不要从群文件、网盘或第三方镜像下载带 `claude-science-assistant.exe` 的压缩包。
 
@@ -354,6 +376,8 @@ Ubuntu-24.04 是默认推荐测试路径，便于复现问题；但启动器不�
 | [docs/quick-start.zh-CN.md](docs/quick-start.zh-CN.md) | 新手完整接入流程 |
 | [docs/architecture-and-product-plan.zh-CN.md](docs/architecture-and-product-plan.zh-CN.md) | 架构、风险审计、产品任务书 |
 | [docs/provider-access-matrix.zh-CN.md](docs/provider-access-matrix.zh-CN.md) | Provider 接入矩阵 |
+| [docs/github-release-v0.1.5.md](docs/github-release-v0.1.5.md) | v0.1.5 GitHub Release 文案与安装说明 |
+| [docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md](docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md) | 三层聚合、方案切换与可靠性实现 |
 | [docs/github-release-v0.1.4.md](docs/github-release-v0.1.4.md) | v0.1.4 GitHub Release 候选文案 |
 | [docs/v0.1.4-runtime-update.zh-CN.md](docs/v0.1.4-runtime-update.zh-CN.md) | Claude Science 0.1.25 运行时升级、备份与回滚边界 |
 | [docs/github-release-v0.1.3.md](docs/github-release-v0.1.3.md) | v0.1.3 GitHub Release 文案 |

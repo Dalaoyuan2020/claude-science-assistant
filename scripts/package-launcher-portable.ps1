@@ -82,12 +82,23 @@ New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "scripts") | O
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "static") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "tests") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "vendor") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "launcher") "src") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") | Out-Null
 
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PackageRoot "claude-science-assistant.exe")
 foreach ($file in @("proxy.py", "setup-token.py", "forward-443.py", "requirements.txt", "config.example.json")) {
   Copy-Item -LiteralPath (Join-Path $ProjectDir $file) -Destination (Join-Path $PackageRoot $file)
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "static") "dashboard.html") -Destination (Join-Path (Join-Path $PackageRoot "static") "dashboard.html")
+$LauncherDist = Join-Path $LauncherDir "dist"
+if (-not (Test-Path -LiteralPath $LauncherDist)) {
+  throw "Built launcher frontend is missing: $LauncherDist"
+}
+Copy-Item -LiteralPath $LauncherDist -Destination (Join-Path (Join-Path $PackageRoot "static") "launcher") -Recurse
+foreach ($file in @("runtimeUpdate.ts", "storageMigration.ts")) {
+  Copy-Item -LiteralPath (Join-Path (Join-Path $LauncherDir "src") $file) -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src") $file)
+}
+Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "src") "lib.rs") -Destination (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") "lib.rs")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "tests") "test_translation.py") -Destination (Join-Path (Join-Path $PackageRoot "tests") "test_translation.py")
 foreach ($file in @(
   "install-wsl-bridge-service.sh",
