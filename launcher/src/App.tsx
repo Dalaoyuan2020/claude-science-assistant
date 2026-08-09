@@ -76,12 +76,24 @@ interface ApiKeyEntry {
 
 type SubscriptionRole = "default" | "vision" | "fast";
 
+type DraftRoleModels = Record<SubscriptionRole, string>;
+
+type AccessMode = "api" | "aggregate";
+
 interface RoleBinding {
   role: SubscriptionRole;
   providerId: string;
   apiKeyId: string;
   model: string;
 }
+
+interface AggregateScheme {
+  id: "scheme-1" | "scheme-2";
+  name: string;
+  routes: RoleBinding[];
+}
+
+type AggregateSchemeId = AggregateScheme["id"];
 
 interface LauncherSettings {
   selectedProviderId: string;
@@ -91,6 +103,8 @@ interface LauncherSettings {
   apiKeys: ApiKeyEntry[];
   activeRole?: SubscriptionRole;
   roleBindings: RoleBinding[];
+  activeAggregateSchemeId?: string;
+  aggregateSchemes: AggregateScheme[];
 }
 
 interface ApiKeyTestResult {
@@ -153,12 +167,13 @@ const fallbackSettings: LauncherSettings = {
   customConfirmed: false,
   apiKeys: [],
   roleBindings: [],
+  aggregateSchemes: [],
 };
 
 const roleDefinitions: { role: SubscriptionRole; label: string; detail: string }[] = [
-  { role: "default", label: "默认", detail: "日常对话" },
-  { role: "vision", label: "视觉", detail: "图片理解" },
-  { role: "fast", label: "快速", detail: "低延迟回复" },
+  { role: "default", label: "决策", detail: "Opus · 深度思考" },
+  { role: "vision", label: "视觉", detail: "Sonnet · 多模态" },
+  { role: "fast", label: "日常", detail: "Haiku / Fast · 快速响应" },
 ];
 
 const initialStatus: SystemStatus = {
@@ -258,12 +273,52 @@ const rememberHealthCollapsed = (value: boolean) => {
   }
 };
 
+const initialApiSectionCollapsed = () => {
+  try {
+    return window.localStorage.getItem("csa-api-section-collapsed") === "1";
+  } catch {
+    return false;
+  }
+};
+
+const rememberApiSectionCollapsed = (value: boolean) => {
+  try {
+    window.localStorage.setItem("csa-api-section-collapsed", value ? "1" : "0");
+  } catch {
+    // The launcher remains usable when WebView storage is disabled or unavailable.
+  }
+};
+
 const modelsForApiKey = (entry?: ApiKeyEntry) => {
   if (!entry) return [];
   return [entry.model, ...(entry.modelAliases || []).map((alias) => alias.model)]
     .map((model) => model.trim())
     .filter((model, index, models) => Boolean(model) && models.indexOf(model) === index);
 };
+
+const emptyDraftRoleModels = (): DraftRoleModels => ({ default: "", vision: "", fast: "" });
+
+const uniqueModels = (...groups: (string[] | undefined)[]) => groups
+  .flatMap((group) => group || [])
+  .map((model) => model.trim())
+  .filter((model, index, models) => Boolean(model) && models.indexOf(model) === index);
+
+const inferDraftRoleModels = (models: string[], primaryModel = "", fastModel = ""): DraftRoleModels => {
+  const available = uniqueModels(models, [primaryModel, fastModel]);
+  const fallback = primaryModel || available[0] || "";
+  const decision = available.find((model) => /opus|reason|thinking|deep|pro|max|(^|[-_/])r1($|[-_/])|(^|[-_/])o[1-9]($|[-_/])/i.test(model)) || fallback;
+  const vision = available.find((model) => /vision|(^|[-_/])vl($|[-_/])|image|multimodal|4o/i.test(model)) || fallback;
+  const daily = available.find((model) => /fast|haiku|flash|mini|turbo|lite|speed/i.test(model)) || fastModel || fallback;
+  return { default: decision, vision, fast: daily };
+};
+
+const aliasesForDraftRoleModels = (models: DraftRoleModels): ModelAlias[] => [
+  { id: "byok-model-0001", displayName: `CSA 决策模型 -> ${models.default}`, model: models.default },
+  { id: "claude-opus-4-8", displayName: `Claude Opus / 决策 -> ${models.default}`, model: models.default },
+  { id: "claude-sonnet-5", displayName: `Claude Sonnet / 视觉 -> ${models.vision}`, model: models.vision },
+  { id: "claude-sonnet-4-5", displayName: `Claude Sonnet 4.5 / 视觉 -> ${models.vision}`, model: models.vision },
+  { id: "claude-haiku-4-5-20251001", displayName: `Claude Haiku / 快速 -> ${models.fast}`, model: models.fast },
+].filter((alias) => Boolean(alias.model));
 
 const suggestedRoleModel = (entry: ApiKeyEntry | undefined, role: SubscriptionRole) => {
   const models = modelsForApiKey(entry);
@@ -276,20 +331,36 @@ const suggestedRoleModel = (entry: ApiKeyEntry | undefined, role: SubscriptionRo
     const visual = models.find((model) => /vision|vl|image|multimodal|4o/i.test(model));
     if (visual) return visual;
   }
+  if (role === "default") {
+    const decision = models.find((model) => /opus|reason|thinking|deep|pro|max|(^|[-_/])r1($|[-_/])|(^|[-_/])o[1-9]($|[-_/])/i.test(model));
+    if (decision) return decision;
+  }
   return entry?.model || models[0];
 };
 
-const roleDraftsFromSettings = (settings: LauncherSettings): RoleBinding[] => {
+const roleDraftsFromSettings = (settings: LauncherSettings, savedRoutes?: RoleBinding[]): RoleBinding[] => {
   const eligible = (settings.apiKeys || []).filter((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0);
   const fallback = eligible.find((entry) => entry.id === settings.activeApiKeyId) || eligible[0];
   return roleDefinitions.map(({ role }) => {
-    const saved = (settings.roleBindings || []).find((binding) => binding.role === role);
+    const saved = (savedRoutes || settings.roleBindings || []).find((binding) => binding.role === role);
     if (saved) return saved;
     return {
       role,
       providerId: fallback?.providerId || "",
       apiKeyId: fallback?.id || "",
       model: suggestedRoleModel(fallback, role),
+    };
+  });
+};
+
+const normalizedSchemes = (settings: LauncherSettings): AggregateScheme[] => {
+  const stored = settings.aggregateSchemes || [];
+  return (["scheme-1", "scheme-2"] as const).map((id, index) => {
+    const scheme = stored.find((item) => item.id === id);
+    return {
+      id,
+      name: index === 0 ? "方案一" : "方案二",
+      routes: scheme?.routes || (index === 0 ? settings.roleBindings || [] : []),
     };
   });
 };
@@ -304,6 +375,11 @@ function App() {
   const [pendingApiKeyId, setPendingApiKeyId] = useState<string | undefined>();
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>(fallbackSettings.apiKeys);
   const [activeRole, setActiveRole] = useState<SubscriptionRole | undefined>();
+  const [activeAggregateSchemeId, setActiveAggregateSchemeId] = useState<AggregateSchemeId | undefined>();
+  const [accessMode, setAccessMode] = useState<AccessMode>("api");
+  const [aggregateSchemes, setAggregateSchemes] = useState<AggregateScheme[]>(normalizedSchemes(fallbackSettings));
+  const [selectedSchemeId, setSelectedSchemeId] = useState<AggregateSchemeId>("scheme-1");
+  const [pendingSchemeId, setPendingSchemeId] = useState<AggregateSchemeId>("scheme-1");
   const [roleBindings, setRoleBindings] = useState<RoleBinding[]>(roleDraftsFromSettings(fallbackSettings));
   const [roleMappingsDirty, setRoleMappingsDirty] = useState(false);
   const [showKeyPicker, setShowKeyPicker] = useState(false);
@@ -313,6 +389,8 @@ function App() {
   const [draftBaseUrl, setDraftBaseUrl] = useState("");
   const [draftModel, setDraftModel] = useState("");
   const [draftModelAliases, setDraftModelAliases] = useState<ModelAlias[]>([]);
+  const [draftRoleModels, setDraftRoleModels] = useState<DraftRoleModels>(emptyDraftRoleModels);
+  const [draftAvailableModels, setDraftAvailableModels] = useState<string[]>([]);
   const [draftConfirmed, setDraftConfirmed] = useState(false);
   const [testPrompt, setTestPrompt] = useState("Reply only: OK");
   const [testResult, setTestResult] = useState<ApiKeyTestResult | undefined>();
@@ -322,6 +400,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
+  const [apiSectionCollapsed, setApiSectionCollapsed] = useState(initialApiSectionCollapsed);
   const [showMigrationAssistant, setShowMigrationAssistant] = useState(false);
   const [migrationCopyState, setMigrationCopyState] = useState("");
   const [runtimeUpdate, setRuntimeUpdate] = useState<RuntimeUpdateStatus>();
@@ -336,7 +415,12 @@ function App() {
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
   const activeKeyEntry = apiKeys.find((entry) => entry.id === activeApiKeyId);
   const activeKeyProvider = providers.find((provider) => provider.id === (activeKeyEntry?.providerId || activeProvider)) || providers[0];
-  const activeRoleBinding = roleBindings.find((binding) => binding.role === activeRole);
+  const pendingScheme = aggregateSchemes.find((scheme) => scheme.id === pendingSchemeId);
+  const pendingSchemeComplete = Boolean(
+    pendingScheme
+    && pendingScheme.routes.length === roleDefinitions.length
+    && pendingScheme.routes.every((route) => route.apiKeyId && route.providerId && route.model),
+  );
   const roleEligibleKeys = useMemo(
     () => apiKeys.filter((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0),
     [apiKeys],
@@ -415,8 +499,22 @@ function App() {
     setPendingApiKeyId(settings.activeApiKeyId);
     setApiKeys(settings.apiKeys || []);
     setActiveRole(settings.activeRole);
-    setRoleBindings(roleDraftsFromSettings(settings));
-    setRoleMappingsDirty((settings.roleBindings || []).length < roleDefinitions.length && (settings.apiKeys || []).some((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0));
+    const activeSchemeId = settings.activeAggregateSchemeId === "scheme-1" || settings.activeAggregateSchemeId === "scheme-2"
+      ? settings.activeAggregateSchemeId
+      : undefined;
+    setActiveAggregateSchemeId(activeSchemeId);
+    setAccessMode(activeSchemeId ? "aggregate" : "api");
+    const schemes = normalizedSchemes(settings);
+    const preferredId = activeSchemeId || selectedSchemeId;
+    const selected = schemes.find((scheme) => scheme.id === preferredId) || schemes[0];
+    setAggregateSchemes(schemes);
+    setSelectedSchemeId(selected.id);
+    setPendingSchemeId(activeSchemeId || selected.id);
+    setRoleBindings(roleDraftsFromSettings(settings, selected.routes));
+    setRoleMappingsDirty(
+      selected.routes.length < roleDefinitions.length
+      && (settings.apiKeys || []).some((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0),
+    );
   }
 
   function primeDraft(groups = providerGroups, providerId = activeProvider, baseUrl = customBaseUrl, confirmed = customConfirmed) {
@@ -427,6 +525,8 @@ function App() {
     setDraftBaseUrl(provider?.id === "custom" ? baseUrl : provider?.baseUrl || "");
     setDraftModel("");
     setDraftModelAliases([]);
+    setDraftRoleModels(emptyDraftRoleModels());
+    setDraftAvailableModels([]);
     setDraftConfirmed(provider?.trust.startsWith("untrusted") ? confirmed : false);
     setTestResult(undefined);
     setAutoMapResult(undefined);
@@ -444,9 +544,23 @@ function App() {
     setDraftBaseUrl(provider.id === "custom" ? customBaseUrl : provider.baseUrl || "");
     setDraftModel("");
     setDraftModelAliases([]);
+    setDraftRoleModels(emptyDraftRoleModels());
+    setDraftAvailableModels([]);
     setDraftConfirmed(false);
     setTestResult(undefined);
     setAutoMapResult(undefined);
+  }
+
+  function applyDraftRoleModels(models: DraftRoleModels, availableModels = draftAvailableModels) {
+    const available = uniqueModels(availableModels, Object.values(models));
+    setDraftRoleModels(models);
+    setDraftAvailableModels(available);
+    setDraftModel(models.default);
+    setDraftModelAliases(aliasesForDraftRoleModels(models));
+  }
+
+  function updateDraftRoleModel(role: SubscriptionRole, model: string) {
+    applyDraftRoleModels({ ...draftRoleModels, [role]: model });
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
@@ -479,6 +593,10 @@ function App() {
       setError("请填写 API Key；已保存的 Key 可以直接从列表切换。");
       return;
     }
+    if (draftAvailableModels.length > 0 && Object.values(draftRoleModels).some((model) => !model)) {
+      setError("请为决策、视觉和日常三层都选择模型；三层可以使用同一个模型。");
+      return;
+    }
 
     if (!isTauri) {
       const id = `preview-${Date.now()}`;
@@ -500,6 +618,8 @@ function App() {
       setShowKeyPicker(false);
       setDraftApiKey("");
       setDraftDisplayName("");
+      setDraftRoleModels(emptyDraftRoleModels());
+      setDraftAvailableModels([]);
       return;
     }
 
@@ -522,6 +642,8 @@ function App() {
       setDraftApiKey("");
       setDraftDisplayName("");
       setDraftModelAliases([]);
+      setDraftRoleModels(emptyDraftRoleModels());
+      setDraftAvailableModels([]);
       setAutoMapResult(undefined);
       setShowKeyPicker(false);
     } catch (reason) {
@@ -558,11 +680,9 @@ function App() {
         message: "浏览器预览模式：真实测试请打开 Tauri 启动器。",
       };
       setTestResult(preview);
-      if (!draftModel) {
-        setDraftModel(preview.selectedModel);
-        setDraftModelAliases([]);
-        setAutoMapResult(undefined);
-      }
+      const available = uniqueModels(preview.models, [preview.selectedModel]);
+      applyDraftRoleModels(inferDraftRoleModels(available, preview.selectedModel), available);
+      setAutoMapResult(undefined);
       return;
     }
 
@@ -580,8 +700,8 @@ function App() {
       });
       setTestResult(result);
       if (result.ok && result.selectedModel) {
-        setDraftModel(result.selectedModel);
-        setDraftModelAliases([]);
+        const available = uniqueModels(result.models, [result.selectedModel]);
+        applyDraftRoleModels(inferDraftRoleModels(available, result.selectedModel), available);
         setAutoMapResult(undefined);
       }
       if (!result.ok) {
@@ -601,26 +721,21 @@ function App() {
       return;
     }
     if (draftIsThirdParty && !draftConfirmed) {
-      setError("中转服务需要先确认域名后再自动映射，避免 API Key 发到错误地址。");
+      setError("中转服务需要先确认域名后再获取模型列表，避免 API Key 发到错误地址。");
       return;
     }
     if (!draftApiKey.trim()) {
-      setError("请先填写 API Key，再自动映射模型。");
+      setError("请先填写 API Key，再获取模型列表。");
       return;
     }
 
     if (!isTauri) {
       const primaryModel = draftModel || "preview-pro-model";
       const fastModel = primaryModel.includes("fast") ? primaryModel : "preview-fast-model";
-      const aliases: ModelAlias[] = [
-        { id: "byok-model-0001", displayName: `BYOK 主力模型 -> ${primaryModel}`, model: primaryModel },
-        { id: "claude-sonnet-5", displayName: `Claude Sonnet 5 -> ${primaryModel}`, model: primaryModel },
-        { id: "claude-sonnet-4-5", displayName: `Claude Sonnet 4.5 -> ${primaryModel}`, model: primaryModel },
-        { id: "claude-opus-4-8", displayName: `Claude Opus 4.8 -> ${primaryModel}`, model: primaryModel },
-        { id: "claude-haiku-4-5-20251001", displayName: `Claude Haiku 4.5 / Fast -> ${fastModel}`, model: fastModel },
-      ];
-      setDraftModel(primaryModel);
-      setDraftModelAliases(aliases);
+      const available = uniqueModels([primaryModel, "preview-vision-model", fastModel]);
+      const roles = inferDraftRoleModels(available, primaryModel, fastModel);
+      const aliases = aliasesForDraftRoleModels(roles);
+      applyDraftRoleModels(roles, available);
       setAutoMapResult({
         ok: true,
         providerId: draftProvider.id,
@@ -629,8 +744,8 @@ function App() {
         primaryModel,
         fastModel,
         aliases,
-        models: [primaryModel, fastModel],
-        message: "浏览器预览模式：已生成自动映射示例；真实模型列表请打开 Tauri 启动器。",
+        models: available,
+        message: "浏览器预览模式：已生成模型列表示例；真实列表请打开 Tauri 启动器。",
       });
       return;
     }
@@ -647,18 +762,20 @@ function App() {
         model: draftModel,
       });
       setAutoMapResult(result);
-      setDraftModel(result.primaryModel);
-      setDraftModelAliases(result.aliases || []);
+      const available = uniqueModels(result.models, [result.primaryModel, result.fastModel]);
+      applyDraftRoleModels(inferDraftRoleModels(available, result.primaryModel, result.fastModel), available);
     } catch (reason) {
       setError(String(reason));
       setDraftModelAliases([]);
+      setDraftRoleModels(emptyDraftRoleModels());
+      setDraftAvailableModels([]);
     } finally {
       setAutoMappingKey(false);
     }
   }
 
   async function activateKey(apiKeyId: string) {
-    if (apiKeyId === activeApiKeyId && !activeRole) return;
+    if (apiKeyId === activeApiKeyId && !activeRole && !activeAggregateSchemeId) return;
     if (status.restartBlocked) {
       setError("当前诊断不允许切换 API Key；请先处理磁盘、WSL 或安装包问题。");
       return;
@@ -670,18 +787,23 @@ function App() {
       setPendingApiKeyId(apiKeyId);
       setActiveProvider(entry.providerId);
       setActiveRole(undefined);
+      setActiveAggregateSchemeId(undefined);
+      setAccessMode("api");
       setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === apiKeyId })));
       return;
     }
     updateBusy(true);
     setError("");
+    let applied = false;
     try {
       applyLauncherState(await invoke<LauncherSettings>("activate_api_key", { apiKeyId }));
+      applied = true;
     } catch (reason) {
       setError(String(reason));
     } finally {
       updateBusy(false);
     }
+    if (applied) await refresh();
   }
 
   function updateRoleSubscription(role: SubscriptionRole, apiKeyId: string) {
@@ -706,18 +828,102 @@ function App() {
 
   async function saveRoleMappings() {
     if (roleBindings.some((binding) => !binding.apiKeyId || !binding.providerId || !binding.model)) {
-      setError("请为默认、视觉和快速三个角色都选择订阅与模型；三个角色可以使用同一订阅。");
+      setError("请为决策、视觉和日常三个角色都选择订阅与模型；三个角色可以使用同一订阅。");
       return;
     }
     if (!isTauri) {
       setRoleMappingsDirty(false);
+      setAggregateSchemes((current) => current.map((scheme) => scheme.id === selectedSchemeId
+        ? { ...scheme, routes: roleBindings }
+        : scheme));
+      setActiveAggregateSchemeId(selectedSchemeId);
+      setPendingSchemeId(selectedSchemeId);
       setActiveRole(undefined);
+      setAccessMode("aggregate");
+      return;
+    }
+    updateBusy(true);
+    setError("");
+    let applied = false;
+    try {
+      applyLauncherState(await invoke<LauncherSettings>("save_and_activate_aggregate_scheme", {
+        scheme: {
+          id: selectedSchemeId,
+          name: selectedSchemeId === "scheme-1" ? "方案一" : "方案二",
+          routes: roleBindings,
+        },
+      }));
+      applied = true;
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      updateBusy(false);
+    }
+    if (applied) await refresh();
+  }
+
+  function loadAggregateSchemeDraft(schemeId: AggregateSchemeId) {
+    const scheme = aggregateSchemes.find((item) => item.id === schemeId);
+    if (!scheme) return false;
+    setSelectedSchemeId(schemeId);
+    setPendingSchemeId(schemeId);
+    const draftSettings: LauncherSettings = {
+      selectedProviderId: activeProvider,
+      customBaseUrl,
+      customConfirmed,
+      activeApiKeyId,
+      apiKeys,
+      activeRole,
+      roleBindings: scheme.routes,
+      activeAggregateSchemeId,
+      aggregateSchemes,
+    };
+    setRoleBindings(roleDraftsFromSettings(draftSettings, scheme.routes));
+    setRoleMappingsDirty(
+      scheme.routes.length < roleDefinitions.length
+      && apiKeys.some((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0),
+    );
+    const complete = scheme.routes.length === roleDefinitions.length
+      && scheme.routes.every((route) => route.apiKeyId && route.model);
+    setAccessMode("aggregate");
+    setError(complete ? "" : "这套方案尚未配置完整，补齐三条路由后点击“保存并应用整套方案”。");
+    return complete;
+  }
+
+  function preselectAggregateScheme(schemeId: AggregateSchemeId) {
+    if (busy || status.restartBlocked) return;
+    if (roleMappingsDirty && schemeId !== selectedSchemeId) {
+      setError("当前方案有未应用修改，请先保存并应用，或取消修改后再预选另一套方案。");
+      return;
+    }
+    loadAggregateSchemeDraft(schemeId);
+  }
+
+  async function confirmPendingAggregateScheme() {
+    if (busy || status.restartBlocked || roleMappingsDirty) return;
+    if (pendingSchemeId === activeAggregateSchemeId) return;
+    const scheme = aggregateSchemes.find((item) => item.id === pendingSchemeId);
+    if (!scheme) {
+      setError("没有找到待切换的聚合方案。");
+      return;
+    }
+    const complete = scheme.routes.length === roleDefinitions.length
+      && scheme.routes.every((route) => route.apiKeyId && route.providerId && route.model);
+    if (!complete) {
+      setError("这套方案尚未配置完整，请先补齐三条路由并保存应用。");
+      return;
+    }
+    if (!isTauri) {
+      setActiveAggregateSchemeId(pendingSchemeId);
+      setAccessMode("aggregate");
       return;
     }
     updateBusy(true);
     setError("");
     try {
-      applyLauncherState(await invoke<LauncherSettings>("save_role_bindings", { roleBindings }));
+      applyLauncherState(await invoke<LauncherSettings>("activate_aggregate_scheme", {
+        schemeId: pendingSchemeId,
+      }));
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -725,37 +931,22 @@ function App() {
     }
   }
 
-  async function activateSubscriptionRole(role: SubscriptionRole) {
-    if (roleMappingsDirty) {
-      setError("角色映射有未保存改动，请先保存映射。");
-      return;
-    }
-    const binding = roleBindings.find((item) => item.role === role);
-    if (!binding?.apiKeyId || !binding.model) {
-      setError("请先为该角色绑定订阅和模型。");
-      return;
-    }
-    if (status.restartBlocked) {
-      setError("当前诊断不允许切换角色；请先处理磁盘、WSL 或安装包问题。");
-      return;
-    }
-    if (!isTauri) {
-      const entry = apiKeys.find((item) => item.id === binding.apiKeyId);
-      if (!entry) return;
-      setActiveRole(role);
-      setActiveApiKeyId(entry.id);
-      setActiveProvider(entry.providerId);
-      setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === entry.id })));
-      return;
-    }
-    updateBusy(true);
+  function cancelPendingAggregateScheme() {
+    if (busy) return;
+    const target = activeAggregateSchemeId === "scheme-1" || activeAggregateSchemeId === "scheme-2"
+      ? activeAggregateSchemeId
+      : "scheme-1";
+    loadAggregateSchemeDraft(target);
     setError("");
-    try {
-      applyLauncherState(await invoke<LauncherSettings>("activate_role", { role }));
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      updateBusy(false);
+  }
+
+  function switchAccessMode(mode: AccessMode) {
+    setAccessMode(mode);
+    setError("");
+    if (mode === "api") {
+      setPendingApiKeyId(activeApiKeyId);
+    } else {
+      setPendingSchemeId(selectedSchemeId);
     }
   }
 
@@ -893,7 +1084,7 @@ function App() {
         <div className="brand-mark">CSA</div>
         <div>
           <h1>CSA - Claude Science Assistant</h1>
-          <p>多订阅角色，一个安全启动入口</p>
+          <p>三模型聚合，一个安全启动入口</p>
         </div>
         <button className="quiet-button" onClick={refresh} disabled={busy}>刷新状态</button>
       </header>
@@ -942,7 +1133,13 @@ function App() {
               actionLabel={migrationRecommendation.actionLabel}
               onAction={openMigrationAssistant}
             />
-            <HealthItem label="当前 API Key" ok={Boolean(activeKeyEntry)} detail={activeKeyEntry?.label || "未添加"} />
+            <HealthItem
+              label="当前接入"
+              ok={Boolean(activeAggregateSchemeId || activeKeyEntry)}
+              detail={activeAggregateSchemeId
+                ? `${activeAggregateSchemeId === "scheme-1" ? "方案一" : "方案二"} · 三模型聚合`
+                : activeKeyEntry?.label || "未添加"}
+            />
           </div>
         )}
       </section>
@@ -1050,15 +1247,51 @@ function App() {
         </div>
       </section>
 
-      <section className="kit-section">
+      <section className={`kit-section ${accessMode === "api" && apiSectionCollapsed ? "collapsed" : ""}`}>
         <div className="section-heading">
           <div>
-            <span className="eyebrow">API Key</span>
-            <h2>当前接入</h2>
+            <span className="eyebrow">{accessMode === "api" ? "API Key" : "Aggregate"}</span>
+            <h2>{accessMode === "api" ? "API 接入" : "聚合模式"}</h2>
           </div>
-          <p>先从服务商模板添加一个供应商，再启动 Claude Science。新增供应商时才展开模板，不把所有 Key 平铺在首页。</p>
+          <div className="section-heading-actions">
+            <p>{accessMode === "aggregate"
+              ? `${activeAggregateSchemeId ? `${activeAggregateSchemeId === "scheme-1" ? "方案一" : "方案二"}已生效` : "尚未生效"} · 三个模型槽同时接入`
+              : apiSectionCollapsed
+                ? `${activeKeyEntry?.label || "未添加供应商"} · 已保存 ${apiKeys.length} 个供应商`
+                : "从供应商列表选择一条 API 接入；切换后会重新加载并验证 Bridge。"}</p>
+            {accessMode === "api" && <button
+              type="button"
+              aria-expanded={!apiSectionCollapsed}
+              aria-controls="api-key-section-content"
+              onClick={() => {
+                const next = !apiSectionCollapsed;
+                setApiSectionCollapsed(next);
+                rememberApiSectionCollapsed(next);
+              }}
+            >
+              {apiSectionCollapsed ? "展开" : "收起"}
+            </button>}
+          </div>
         </div>
 
+        <div className="access-mode-switcher" aria-label="接入模式">
+          <button
+            className={accessMode === "api" ? "active" : ""}
+            disabled={busy}
+            onClick={() => void switchAccessMode("api")}
+          >
+            API 接入
+          </button>
+          <button
+            className={accessMode === "aggregate" ? "active" : ""}
+            disabled={busy}
+            onClick={() => void switchAccessMode("aggregate")}
+          >
+            聚合模式
+          </button>
+        </div>
+
+        {accessMode === "api" && !apiSectionCollapsed && <div id="api-key-section-content">
         <div className="kit-layout">
           <article className="current-kit-card">
             <div className="kit-mark">{providerInitial(activeKeyEntry ? activeKeyProvider : undefined)}</div>
@@ -1069,8 +1302,7 @@ function App() {
               <div className="kit-meta">
                 {activeKeyEntry && activeKeyProvider && <span className={`trust-badge badge-${badgeClass[activeKeyProvider.badge]}`}>{activeKeyProvider.badge}</span>}
                 {activeKeyEntry?.hasSecret && <span>Key 已加密保存</span>}
-                {activeRole && <span>{roleDefinitions.find((item) => item.role === activeRole)?.label}角色</span>}
-                {(activeRoleBinding?.model || activeKeyEntry?.model) && <span>模型 {activeRoleBinding?.model || activeKeyEntry?.model}</span>}
+                {activeKeyEntry?.model && <span>模型 {activeKeyEntry.model}</span>}
                 {(activeKeyEntry?.modelAliases?.length ?? 0) > 0 && <span>映射 {activeKeyEntry?.modelAliases?.length ?? 0} 条</span>}
                 {activeKeyEntry?.baseUrl && <span>{activeKeyEntry.baseUrl}</span>}
               </div>
@@ -1086,50 +1318,52 @@ function App() {
               </div>
               <button onClick={openKeyPicker} disabled={busy}>添加供应商</button>
             </div>
-            {apiKeys.length === 0 && <div className="key-empty">还没有供应商，点击下方按钮添加。</div>}
-            {apiKeys.map((entry, index) => {
-              const provider = providers.find((item) => item.id === entry.providerId);
-              const active = entry.id === activeApiKeyId;
-              const pending = entry.id === pendingApiKeyId && !active;
-              return (
-                <div
-                  className={`kit-row ${active ? "active" : ""} ${pending ? "pending" : ""}`}
-                  key={entry.id}
-                  role="button"
-                  tabIndex={busy ? -1 : 0}
-                  aria-pressed={entry.id === pendingApiKeyId}
-                  onClick={() => preselectKey(entry.id)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      preselectKey(entry.id);
-                    }
-                  }}
-                >
-                  <span className="kit-index">{String(index + 1).padStart(2, "0")}</span>
-                  <span className="kit-row-copy">
-                    <strong>{entry.label}</strong>
-                    <small>{provider?.badge || "API"} · {entry.hasSecret ? "已加密保存" : "官方登录"}</small>
-                  </span>
-                  <span className="key-row-actions">
-                    {active
-                      ? <span className="active-key-label">使用中</span>
-                      : pending
-                        ? <span className="pending-key-label">待生效</span>
-                        : null}
-                    <button
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void deleteKey(entry.id);
-                      }}
-                      disabled={busy || active}
-                    >
-                      删除
-                    </button>
-                  </span>
-                </div>
-              );
-            })}
+            <div className="kit-queue-scroll">
+              {apiKeys.length === 0 && <div className="key-empty">还没有供应商，点击下方按钮添加。</div>}
+              {apiKeys.map((entry, index) => {
+                const provider = providers.find((item) => item.id === entry.providerId);
+                const active = entry.active;
+                const pending = entry.id === pendingApiKeyId && !active;
+                return (
+                  <div
+                    className={`kit-row ${active ? "active" : ""} ${pending ? "pending" : ""}`}
+                    key={entry.id}
+                    role="button"
+                    tabIndex={busy ? -1 : 0}
+                    aria-pressed={entry.id === pendingApiKeyId}
+                    onClick={() => preselectKey(entry.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        preselectKey(entry.id);
+                      }
+                    }}
+                  >
+                    <span className="kit-index">{String(index + 1).padStart(2, "0")}</span>
+                    <span className="kit-row-copy">
+                      <strong>{entry.label}</strong>
+                      <small>{provider?.badge || "API"} · {entry.hasSecret ? "已加密保存" : "官方登录"}</small>
+                    </span>
+                    <span className="key-row-actions">
+                      {active
+                        ? <span className="active-key-label">使用中</span>
+                        : pending
+                          ? <span className="pending-key-label">待生效</span>
+                          : null}
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteKey(entry.id);
+                        }}
+                        disabled={busy || active}
+                      >
+                        删除
+                      </button>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
             <div className="key-switch-confirm" aria-live="polite">
               <span>{pendingApiKeyId && pendingApiKeyId !== activeApiKeyId
                 ? `待切换：${apiKeys.find((entry) => entry.id === pendingApiKeyId)?.label || "已选供应商"}`
@@ -1151,28 +1385,46 @@ function App() {
             </button>
           </aside>
         </div>
+        </div>}
 
-        <div className="role-mapping-panel">
+        {accessMode === "aggregate" && <div className="role-mapping-panel">
           <div className="role-mapping-head">
             <div>
-              <span className="eyebrow">Subscription Roles</span>
-              <h3>订阅角色</h3>
+              <span className="eyebrow">Aggregate Scheme</span>
+              <h3>三模型聚合方案</h3>
             </div>
-            <div className="role-switcher" aria-label="切换订阅角色">
-              {roleDefinitions.map((definition) => {
-                const binding = roleBindings.find((item) => item.role === definition.role);
-                return (
-                  <button
-                    className={activeRole === definition.role ? "active" : ""}
-                    key={definition.role}
-                    title={definition.detail}
-                    disabled={busy || status.restartBlocked || roleMappingsDirty || !binding?.apiKeyId || !binding.model}
-                    onClick={() => activateSubscriptionRole(definition.role)}
-                  >
-                    {definition.label}
-                  </button>
-                );
-              })}
+            <div className="scheme-switcher" aria-label="切换聚合方案">
+              {aggregateSchemes.map((scheme) => (
+                <button
+                  className={`${selectedSchemeId === scheme.id ? "active" : ""} ${activeAggregateSchemeId === scheme.id ? "applied" : ""}`}
+                  key={scheme.id}
+                  disabled={busy || status.restartBlocked}
+                  onClick={() => preselectAggregateScheme(scheme.id)}
+                >
+                  {scheme.name}
+                  {activeAggregateSchemeId === scheme.id
+                    ? <span>已生效</span>
+                    : pendingSchemeId === scheme.id
+                      ? <span>待切换</span>
+                      : null}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="key-switch-confirm scheme-switch-confirm" aria-live="polite">
+            <span>{pendingSchemeId !== activeAggregateSchemeId
+              ? `待切换：${pendingSchemeId === "scheme-1" ? "方案一" : "方案二"}`
+              : "点击方案预选，确认后才会重启并同时接入三个模型"}</span>
+            <div>
+              <button onClick={cancelPendingAggregateScheme} disabled={busy}>取消</button>
+              <button
+                className="confirm-switch-button"
+                onClick={() => void confirmPendingAggregateScheme()}
+                disabled={busy || status.restartBlocked || roleMappingsDirty || !pendingSchemeComplete || pendingSchemeId === activeAggregateSchemeId}
+              >
+                {busy ? "切换中…" : "确认切换"}
+              </button>
             </div>
           </div>
 
@@ -1195,7 +1447,7 @@ function App() {
                     <span>订阅</span>
                     <select
                       value={binding.apiKeyId}
-                      disabled={busy || Boolean(activeRole) || roleEligibleKeys.length === 0}
+                      disabled={busy || roleEligibleKeys.length === 0}
                       onChange={(event) => updateRoleSubscription(definition.role, event.currentTarget.value)}
                     >
                       <option value="">未选择</option>
@@ -1208,7 +1460,7 @@ function App() {
                     <span>模型</span>
                     <select
                       value={binding.model}
-                      disabled={busy || Boolean(activeRole) || !entry}
+                      disabled={busy || !entry}
                       onChange={(event) => updateRoleModel(definition.role, event.currentTarget.value)}
                     >
                       <option value="">未选择</option>
@@ -1223,16 +1475,20 @@ function App() {
           </div>
 
           <div className="role-mapping-footer">
-            <span>{roleMappingsDirty ? "映射有未保存修改" : "映射已保存"}</span>
+            <span>{roleMappingsDirty
+              ? `${selectedSchemeId === "scheme-1" ? "方案一" : "方案二"}有未应用修改`
+              : activeAggregateSchemeId === selectedSchemeId
+                ? "当前方案的三个模型槽已同时生效"
+                : "当前方案尚未应用"}</span>
             <button
               className="primary-inline-button"
               onClick={saveRoleMappings}
-              disabled={busy || Boolean(activeRole) || !roleMappingsDirty || roleEligibleKeys.length === 0}
+              disabled={busy || !roleMappingsDirty || roleEligibleKeys.length === 0}
             >
-              保存映射
+              保存并应用整套方案
             </button>
           </div>
-        </div>
+        </div>}
 
         {showKeyPicker && (
           <div className="kit-picker" role="dialog" aria-label="添加供应商">
@@ -1301,6 +1557,8 @@ function App() {
                         setTestResult(undefined);
                         setAutoMapResult(undefined);
                         setDraftModelAliases([]);
+                        setDraftRoleModels(emptyDraftRoleModels());
+                        setDraftAvailableModels([]);
                       }}
                     />
                   </label>
@@ -1332,22 +1590,26 @@ function App() {
                         setTestResult(undefined);
                         setAutoMapResult(undefined);
                         setDraftModelAliases([]);
+                        setDraftRoleModels(emptyDraftRoleModels());
+                        setDraftAvailableModels([]);
                       }}
                     />
                   </label>
                 )}
 
                 <label>
-                  默认模型
+                  决策模型（手动）
                   <input
                     value={draftModel}
-                    placeholder="可留空；建议先测试连通或自动映射获取模型列表"
+                    placeholder="可留空；建议先获取模型列表，再为三层分别选择"
                     spellCheck={false}
                     onChange={(event) => {
                       setDraftModel(event.currentTarget.value);
                       setTestResult(undefined);
                       setAutoMapResult(undefined);
                       setDraftModelAliases([]);
+                      setDraftRoleModels({ default: event.currentTarget.value, vision: "", fast: "" });
+                      setDraftAvailableModels([]);
                     }}
                   />
                 </label>
@@ -1357,14 +1619,14 @@ function App() {
                     <div className="test-panel-head">
                       <div>
                         <strong>测试连通</strong>
-                        <small>先在这里真实对话一次；成功后会自动填入可用模型。</small>
+                        <small>先验证连接或获取模型列表，再为决策、视觉、日常三层确认模型。</small>
                       </div>
                       <div className="test-panel-actions">
                         <button onClick={testDraftApiKey} disabled={busy || testingKey || autoMappingKey}>
                         {testingKey ? "正在测试…" : "测试 API Key"}
                         </button>
                         <button onClick={autoMapDraftApiKey} disabled={busy || testingKey || autoMappingKey}>
-                          {autoMappingKey ? "映射中…" : "自动映射"}
+                          {autoMappingKey ? "获取中…" : "获取模型列表"}
                         </button>
                       </div>
                     </div>
@@ -1383,43 +1645,37 @@ function App() {
                         <p>{testResult.message}</p>
                         {testResult.selectedModel && <p>可用模型：{testResult.selectedModel}</p>}
                         {testResult.reply && <p>模型回复：{testResult.reply}</p>}
-                        {testResult.models.length > 0 && (
-                          <div className="model-chip-row">
-                            {testResult.models.slice(0, 8).map((item) => (
-                              <button
-                                className="model-chip"
-                                key={item}
-                                onClick={() => {
-                                  setDraftModel(item);
-                                  setTestResult(undefined);
-                                  setAutoMapResult(undefined);
-                                  setDraftModelAliases([]);
-                                }}
-                              >
-                                {item}
-                              </button>
-                            ))}
-                          </div>
-                        )}
                       </div>
                     )}
                     {autoMapResult && (
                       <div className="mapping-result">
-                        <strong>自动映射草案</strong>
+                        <strong>模型列表已读取</strong>
                         <p>{autoMapResult.message}</p>
-                        <div className="mapping-grid">
-                          {autoMapResult.aliases.map((alias) => (
-                            <div className="mapping-row" key={alias.id}>
-                              <span>{alias.id}</span>
-                              <strong>{alias.model}</strong>
-                            </div>
-                          ))}
+                      </div>
+                    )}
+                    {draftAvailableModels.length > 0 && (
+                      <div className="draft-role-editor" aria-label="三层模型映射">
+                        <div className="draft-role-editor-head">
+                          <strong>三层模型映射</strong>
+                          <small>已给出建议，可按供应商实际能力手动调整。</small>
                         </div>
-                        {autoMapResult.models.length > 0 && (
-                          <p className="mapping-hint">
-                            候选模型：{autoMapResult.models.slice(0, 6).join("、")}{autoMapResult.models.length > 6 ? "…" : ""}
-                          </p>
-                        )}
+                        {roleDefinitions.map((definition) => (
+                          <label className="draft-role-row" key={definition.role}>
+                            <span className="draft-role-name">
+                              <strong>{definition.label}</strong>
+                              <small>{definition.detail}</small>
+                            </span>
+                            <select
+                              value={draftRoleModels[definition.role]}
+                              onChange={(event) => updateDraftRoleModel(definition.role, event.currentTarget.value)}
+                            >
+                              <option value="">选择模型</option>
+                              {draftAvailableModels.map((model) => (
+                                <option value={model} key={model}>{model}</option>
+                              ))}
+                            </select>
+                          </label>
+                        ))}
                       </div>
                     )}
                   </div>
@@ -1435,6 +1691,8 @@ function App() {
                         setTestResult(undefined);
                         setAutoMapResult(undefined);
                         setDraftModelAliases([]);
+                        setDraftRoleModels(emptyDraftRoleModels());
+                        setDraftAvailableModels([]);
                       }}
                     />
                     我已确认该中转服务域名，API Key 只发送到该地址。

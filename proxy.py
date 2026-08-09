@@ -18,6 +18,7 @@ Quick start:
 from __future__ import annotations
 
 import asyncio
+import copy
 import hmac
 from io import BytesIO
 import json
@@ -71,6 +72,8 @@ class Config:
         "openai_model_map": {},
         "custom_model_map": {},
         "model_aliases": [],
+        "aggregate_upstreams": [],
+        "active_aggregate_scheme_id": "",
         "model_list_mode": "aliases",
         "model_token_caps": {},
         "default_max_tokens_cap": 0,
@@ -119,7 +122,10 @@ class Config:
         "proxy_host": "PROXY_HOST",
         "proxy_port": "PROXY_PORT",
     }
-    JSON_KEYS = {"deepseek_model_map", "openai_model_map", "custom_model_map", "model_aliases", "model_token_caps"}
+    JSON_KEYS = {
+        "deepseek_model_map", "openai_model_map", "custom_model_map",
+        "model_aliases", "aggregate_upstreams", "model_token_caps",
+    }
 
     def __init__(self):
         self._data = dict(self.DEFAULTS)
@@ -182,7 +188,7 @@ class Config:
 
     def public_dict(self) -> dict:
         """Return config with API keys masked."""
-        d = dict(self._data)
+        d = copy.deepcopy(self._data)
         for k in ("deepseek_api_key", "openai_api_key", "custom_api_key"):
             val = d.get(k, "")
             if val and len(val) > 8:
@@ -190,6 +196,15 @@ class Config:
         val = d.get("proxy_auth_token", "")
         if val and len(val) > 8:
             d["proxy_auth_token"] = val[:4] + "•" * (len(val) - 8) + val[-4:]
+        for upstream in d.get("aggregate_upstreams", []):
+            if not isinstance(upstream, dict):
+                continue
+            key = str(upstream.get("api_key") or "")
+            if key:
+                upstream["api_key"] = (
+                    key[:4] + "•" * (len(key) - 8) + key[-4:]
+                    if len(key) > 8 else "•" * len(key)
+                )
         return d
 
     @property
@@ -216,6 +231,8 @@ class Config:
     def custom_model_map(self) -> dict: return self._data["custom_model_map"]
     @property
     def model_aliases(self) -> list: return self._data["model_aliases"]
+    @property
+    def aggregate_upstreams(self) -> list: return self._data.get("aggregate_upstreams", [])
     @property
     def model_list_mode(self) -> str: return self._data["model_list_mode"]
     @property
@@ -252,6 +269,38 @@ class Config:
     def resolve_backend(self, model: str) -> dict:
         """Determine which backend to use and what model name to send."""
         alias = self.get_model_alias(model)
+        route_id = str((alias or {}).get("route_id") or "").strip()
+        if route_id:
+            route = next(
+                (
+                    item for item in self.aggregate_upstreams
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "").strip() == route_id
+                ),
+                None,
+            )
+            if not route:
+                raise ValueError(f"Aggregate route '{route_id}' is not configured.")
+            backend = str(route.get("backend") or "custom").strip().lower()
+            if backend not in {"deepseek", "openai", "custom"}:
+                raise ValueError(
+                    f"Aggregate route '{route_id}' has unsupported backend '{backend}'."
+                )
+            api_key = str(route.get("api_key") or "").strip()
+            if not api_key:
+                raise ValueError(f"No API key configured for aggregate route '{route_id}'.")
+            mode = normalize_upstream_mode(route.get("mode") or "openai")
+            base_url = normalize_backend_base_url(str(route.get("base_url") or ""), mode)
+            mapped_model = str(
+                (alias or {}).get("model") or route.get("model") or model
+            ).strip()
+            return {
+                "backend": backend,
+                "model": normalize_backend_model_id(backend, mapped_model),
+                "api_key": api_key,
+                "base_url": base_url,
+                "mode": mode,
+            }
         backend = self.default_backend
         alias_model = ""
         if alias:
@@ -582,6 +631,7 @@ def normalized_model_aliases(raw_aliases) -> list[dict]:
         normalized.append({
             "id": alias_id,
             "backend": backend,
+            "route_id": str(item.get("route_id") or "").strip(),
             "model": model,
             "display_name": display_name,
         })
@@ -2320,7 +2370,7 @@ async def api_update_config(request: Request):
         "deepseek_base_url", "openai_base_url", "custom_base_url",
         "default_backend", "force_model",
         "deepseek_model_map", "openai_model_map", "custom_model_map",
-        "model_aliases", "model_list_mode",
+        "model_aliases", "aggregate_upstreams", "active_aggregate_scheme_id", "model_list_mode",
         "model_token_caps", "default_max_tokens_cap",
         "deepseek_upstream_mode", "openai_upstream_mode", "custom_upstream_mode",
         "proxy_auth_token", "proxy_auth_mode", "outbound_proxy_url",
@@ -2334,6 +2384,13 @@ async def api_update_config(request: Request):
             del update_data[key]  # Skip masked placeholder
     if "proxy_auth_token" in update_data and "•" in str(update_data["proxy_auth_token"]):
         del update_data["proxy_auth_token"]
+    if "aggregate_upstreams" in update_data:
+        routes = update_data["aggregate_upstreams"]
+        if not isinstance(routes, list) or any(
+            not isinstance(route, dict) or "•" in str(route.get("api_key") or "")
+            for route in routes
+        ):
+            del update_data["aggregate_upstreams"]
     if update_data:
         config.update(update_data)
         return {"ok": True}
@@ -2558,6 +2615,10 @@ async def health():
         "force_model": config.force_model or "(none)",
         "model_list_mode": config.model_list_mode,
         "model_aliases": len(normalized_model_aliases(config.model_aliases)),
+        "aggregate_upstreams": len([
+            route for route in config.aggregate_upstreams if isinstance(route, dict)
+        ]),
+        "active_aggregate_scheme_id": str(config.get("active_aggregate_scheme_id", "") or ""),
         "upstream_modes": {
             "deepseek": normalize_upstream_mode(config.deepseek_upstream_mode),
             "openai": normalize_upstream_mode(config.openai_upstream_mode),

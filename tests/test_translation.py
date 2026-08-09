@@ -1099,3 +1099,41 @@ def test_oauth_token_mock_uses_claude_ai_provider_and_scopes():
     assert data["provider"] == "claude_ai"
     for scope in ["user:inference", "user:profile", "user:mcp_servers", "user:plugins"]:
         assert scope in data["scope"].split()
+
+
+def test_aggregate_routes_resolve_three_independent_upstreams_and_mask_secrets():
+    routes = [
+        {"id": "decision", "backend": "custom", "api_key": "decision-secret-key", "base_url": "https://decision.example/v1", "mode": "openai"},
+        {"id": "vision", "backend": "custom", "api_key": "vision-secret-key", "base_url": "https://vision.example/v1", "mode": "openai"},
+        {"id": "daily", "backend": "deepseek", "api_key": "daily-secret-key", "base_url": "https://daily.example/anthropic", "mode": "anthropic"},
+    ]
+    aliases = [
+        {"id": "claude-opus-4-8", "route_id": "decision", "backend": "custom", "model": "decision-model"},
+        {"id": "claude-sonnet-5", "route_id": "vision", "backend": "custom", "model": "vision-model"},
+        {"id": "claude-haiku-4-5-20251001", "route_id": "daily", "backend": "deepseek", "model": "daily-model"},
+    ]
+    with config_values(aggregate_upstreams=routes, model_aliases=aliases, force_model=""):
+        decision = proxy.config.resolve_backend("claude-opus-4-8")
+        vision = proxy.config.resolve_backend("claude-sonnet-5")
+        daily = proxy.config.resolve_backend("claude-haiku-4-5-20251001")
+        public = proxy.config.public_dict()
+
+    assert (decision["api_key"], decision["model"]) == ("decision-secret-key", "decision-model")
+    assert (vision["api_key"], vision["model"]) == ("vision-secret-key", "vision-model")
+    assert (daily["api_key"], daily["model"]) == ("daily-secret-key", "daily-model")
+    assert decision["base_url"] == "https://decision.example/v1"
+    assert vision["base_url"] == "https://vision.example/v1"
+    assert daily["base_url"] == "https://daily.example/anthropic/v1"
+    assert all("secret" not in route["api_key"] for route in public["aggregate_upstreams"])
+    assert routes[0]["api_key"] == "decision-secret-key"
+
+
+def test_aggregate_route_missing_from_table_fails_closed():
+    aliases = [{"id": "claude-opus-4-8", "route_id": "missing", "model": "model-a"}]
+    with config_values(aggregate_upstreams=[], model_aliases=aliases, force_model=""):
+        try:
+            proxy.config.resolve_backend("claude-opus-4-8")
+        except ValueError as error:
+            assert "not configured" in str(error)
+        else:
+            raise AssertionError("missing aggregate route must not fall back to another API key")

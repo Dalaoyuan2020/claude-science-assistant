@@ -304,6 +304,10 @@ struct LauncherSettings {
     active_role: Option<String>,
     #[serde(default)]
     role_bindings: Vec<StoredRoleBinding>,
+    #[serde(default)]
+    active_aggregate_scheme_id: Option<String>,
+    #[serde(default)]
+    aggregate_schemes: Vec<StoredAggregateScheme>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +341,14 @@ struct StoredRoleBinding {
     model: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredAggregateScheme {
+    id: String,
+    name: String,
+    routes: Vec<StoredRoleBinding>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeySummary {
@@ -361,6 +373,8 @@ struct LauncherState {
     api_keys: Vec<ApiKeySummary>,
     active_role: Option<String>,
     role_bindings: Vec<StoredRoleBinding>,
+    active_aggregate_scheme_id: Option<String>,
+    aggregate_schemes: Vec<StoredAggregateScheme>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +401,16 @@ struct BridgeRuntimeProfile {
     default_model: String,
     default_fast_model: String,
     requires_explicit_model: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AggregateRuntimeRoute {
+    role: String,
+    backend: String,
+    api_key: String,
+    base_url: String,
+    upstream_mode: String,
+    model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +457,8 @@ impl Default for LauncherSettings {
             api_keys: Vec::new(),
             active_role: None,
             role_bindings: Vec::new(),
+            active_aggregate_scheme_id: None,
+            aggregate_schemes: Vec::new(),
         }
     }
 }
@@ -1343,7 +1369,26 @@ fn load_settings() -> LauncherSettings {
     let Ok(text) = fs::read_to_string(path) else {
         return LauncherSettings::default();
     };
-    serde_json::from_str(&text).unwrap_or_else(|_| LauncherSettings::default())
+    let mut settings = serde_json::from_str(&text).unwrap_or_else(|_| LauncherSettings::default());
+    normalize_aggregate_schemes(&mut settings);
+    settings
+}
+
+fn normalize_aggregate_schemes(settings: &mut LauncherSettings) {
+    if settings.aggregate_schemes.is_empty() {
+        settings.aggregate_schemes = vec![
+            StoredAggregateScheme {
+                id: "scheme-1".into(),
+                name: "方案一".into(),
+                routes: settings.role_bindings.clone(),
+            },
+            StoredAggregateScheme {
+                id: "scheme-2".into(),
+                name: "方案二".into(),
+                routes: Vec::new(),
+            },
+        ];
+    }
 }
 
 fn launcher_state(settings: &LauncherSettings) -> LauncherState {
@@ -1364,11 +1409,15 @@ fn launcher_state(settings: &LauncherSettings) -> LauncherState {
                 custom_confirmed: entry.custom_confirmed,
                 model_aliases: entry.model_aliases.clone(),
                 has_secret: !entry.encrypted_api_key.is_empty(),
-                active: settings.active_api_key_id.as_deref() == Some(entry.id.as_str()),
+                active: settings.active_role.is_none()
+                    && settings.active_aggregate_scheme_id.is_none()
+                    && settings.active_api_key_id.as_deref() == Some(entry.id.as_str()),
             })
             .collect(),
         active_role: settings.active_role.clone(),
         role_bindings: settings.role_bindings.clone(),
+        active_aggregate_scheme_id: settings.active_aggregate_scheme_id.clone(),
+        aggregate_schemes: settings.aggregate_schemes.clone(),
     }
 }
 
@@ -1394,7 +1443,7 @@ fn validate_role_bindings(
     bindings: &[StoredRoleBinding],
 ) -> Result<Vec<StoredRoleBinding>, String> {
     if bindings.len() > SUBSCRIPTION_ROLES.len() {
-        return Err("角色映射最多只能包含默认、视觉和快速三项".into());
+        return Err("角色映射最多只能包含决策、视觉和日常三项".into());
     }
     let mut normalized = Vec::new();
     for binding in bindings {
@@ -1442,6 +1491,7 @@ fn validate_role_bindings(
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn aliases_for_role(entry: &StoredApiKey, model: &str) -> Vec<StoredModelAlias> {
     clean_model_aliases(&entry.model_aliases)
         .into_iter()
@@ -2153,6 +2203,8 @@ fn bridge_config_patch_for_runtime_profile(
     patch.insert("deepseek_upstream_mode".into(), "anthropic".into());
     patch.insert("openai_upstream_mode".into(), "openai".into());
     patch.insert("custom_upstream_mode".into(), "openai".into());
+    patch.insert("aggregate_upstreams".into(), serde_json::json!([]));
+    patch.insert("active_aggregate_scheme_id".into(), "".into());
 
     match profile.backend {
         "deepseek" => {
@@ -2200,6 +2252,65 @@ fn bridge_config_patch_for_runtime_profile(
     }
 
     serde_json::Value::Object(patch)
+}
+
+fn bridge_config_patch_for_aggregate_routes(
+    scheme_id: &str,
+    routes: &[AggregateRuntimeRoute],
+) -> Result<serde_json::Value, String> {
+    if routes.len() != SUBSCRIPTION_ROLES.len() {
+        return Err("聚合方案必须同时包含决策、视觉和日常三个路由".into());
+    }
+    let mut patch = serde_json::Map::new();
+    patch.insert("default_backend".into(), "custom".into());
+    patch.insert("force_model".into(), "".into());
+    patch.insert("deepseek_api_key".into(), "".into());
+    patch.insert("openai_api_key".into(), "".into());
+    patch.insert("custom_api_key".into(), "".into());
+    patch.insert("model_list_mode".into(), "aliases".into());
+    patch.insert("active_aggregate_scheme_id".into(), scheme_id.into());
+
+    let upstreams = routes
+        .iter()
+        .map(|route| {
+            serde_json::json!({
+                "id": route.role,
+                "backend": route.backend,
+                "api_key": route.api_key,
+                "base_url": route.base_url,
+                "mode": route.upstream_mode,
+                "model": route.model,
+            })
+        })
+        .collect::<Vec<_>>();
+    patch.insert("aggregate_upstreams".into(), upstreams.into());
+
+    let mut aliases = Vec::new();
+    for route in routes {
+        let ids: &[(&str, &str)] = match route.role.as_str() {
+            "default" => &[
+                ("byok-model-0001", "Opus · 决策"),
+                ("claude-opus-4-8", "Opus 4.8 · 决策"),
+            ],
+            "vision" => &[
+                ("claude-sonnet-5", "Sonnet 5 · 视觉"),
+                ("claude-sonnet-4-5", "Sonnet 4.5 · 视觉"),
+            ],
+            "fast" => &[("claude-haiku-4-5-20251001", "Haiku 4.5 · 日常")],
+            _ => return Err(format!("未知聚合角色：{}", route.role)),
+        };
+        aliases.extend(ids.iter().map(|(id, display_name)| {
+            serde_json::json!({
+                "id": id,
+                "display_name": display_name,
+                "backend": route.backend,
+                "route_id": route.role,
+                "model": route.model,
+            })
+        }));
+    }
+    patch.insert("model_aliases".into(), aliases.into());
+    Ok(serde_json::Value::Object(patch))
 }
 
 fn json_arg_hex<T: Serialize>(value: &T) -> Result<String, String> {
@@ -2846,17 +2957,17 @@ fn auto_map_api_key_impl(
 ) -> Result<ApiKeyAutoMapResult, String> {
     let clean_key = api_key.trim();
     if clean_key.is_empty() {
-        return Err("请先填写 API Key，再自动映射模型。".into());
+        return Err("请先填写 API Key，再获取模型列表。".into());
     }
     let provider =
         provider_by_id(&selected_provider_id).ok_or_else(|| "未知 API Key 服务商".to_string())?;
     if provider.trust.starts_with("untrusted") && !custom_confirmed {
-        return Err("中转服务需要先确认域名后再自动映射，避免 API Key 发到错误地址。".into());
+        return Err("中转服务需要先确认域名后再获取模型列表，避免 API Key 发到错误地址。".into());
     }
     let Some(profile) =
         runtime_profile_for_provider(&selected_provider_id, &custom_base_url, custom_confirmed)?
     else {
-        return Err("Claude 官方登录模式不需要在这里自动映射模型。".into());
+        return Err("Claude 官方登录模式不需要在这里获取模型列表。".into());
     };
     let fallback_model = if model.trim().is_empty() {
         String::new()
@@ -3114,6 +3225,7 @@ fn save_provider_selection_impl(
     settings.custom_confirmed = custom_confirmed;
     settings.active_api_key_id = None;
     settings.active_role = None;
+    settings.active_aggregate_scheme_id = None;
     let patch = bridge_config_patch_for_provider(&settings)?;
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
@@ -3260,6 +3372,7 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
         bridge_config_patch_for_api_key(&settings, &api_key, &entry.model, &entry.model_aliases)?;
     settings.active_api_key_id = Some(entry.id);
     settings.active_role = None;
+    settings.active_aggregate_scheme_id = None;
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
@@ -3269,34 +3382,28 @@ async fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
     run_blocking(move || activate_api_key_impl(api_key_id)).await
 }
 
-fn save_role_bindings_impl(
-    role_bindings: Vec<StoredRoleBinding>,
-) -> Result<LauncherState, String> {
+#[cfg(test)]
+fn save_role_bindings_impl(role_bindings: Vec<StoredRoleBinding>) -> Result<LauncherState, String> {
     let mut settings = load_settings();
     let normalized = validate_role_bindings(&settings, &role_bindings)?;
     if settings.active_role.is_some() && normalized != settings.role_bindings {
         return Err("请先从 API Key 列表退出当前角色，再修改角色映射".into());
     }
     settings.role_bindings = normalized;
-    // Saving the table does not silently change the running Bridge. The user
-    // explicitly activates a role after reviewing the mapping.
+    // Retained only for legacy migration tests; it is not exposed as a Tauri command.
     persist_launcher_settings(&settings)?;
     Ok(launcher_state(&settings))
 }
 
-#[tauri::command]
-async fn save_role_bindings(
-    role_bindings: Vec<StoredRoleBinding>,
+#[cfg(test)]
+fn activate_role_in_settings(
+    mut settings: LauncherSettings,
+    role: String,
 ) -> Result<LauncherState, String> {
-    run_blocking(move || save_role_bindings_impl(role_bindings)).await
-}
-
-fn activate_role_impl(role: String) -> Result<LauncherState, String> {
     let role = role.trim().to_ascii_lowercase();
     if !role_exists(&role) {
         return Err("未知订阅角色".into());
     }
-    let mut settings = load_settings();
     let binding = settings
         .role_bindings
         .iter()
@@ -3326,27 +3433,173 @@ fn activate_role_impl(role: String) -> Result<LauncherState, String> {
     settings.custom_base_url = entry.base_url.clone();
     settings.custom_confirmed = entry.custom_confirmed;
     let role_aliases = aliases_for_role(&entry, &binding.model);
-    let patch = bridge_config_patch_for_api_key(
-        &settings,
-        &api_key,
-        &binding.model,
-        &role_aliases,
-    )?;
+    let patch =
+        bridge_config_patch_for_api_key(&settings, &api_key, &binding.model, &role_aliases)?;
     settings.active_api_key_id = Some(entry.id);
     settings.active_role = Some(role);
+    settings.active_aggregate_scheme_id = None;
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
 
+#[cfg(test)]
+fn activate_role_impl(role: String) -> Result<LauncherState, String> {
+    activate_role_in_settings(load_settings(), role)
+}
+
+fn normalize_aggregate_scheme(
+    settings: &LauncherSettings,
+    scheme: StoredAggregateScheme,
+) -> Result<StoredAggregateScheme, String> {
+    let id = scheme.id.trim().to_ascii_lowercase();
+    if !matches!(id.as_str(), "scheme-1" | "scheme-2") {
+        return Err("首版聚合接入只支持方案一和方案二".into());
+    }
+    let routes = validate_role_bindings(settings, &scheme.routes)?;
+    if routes.len() != SUBSCRIPTION_ROLES.len() {
+        return Err("请为决策、视觉和日常三个模型槽都选择订阅与模型".into());
+    }
+    let name = if id == "scheme-1" {
+        "方案一"
+    } else {
+        "方案二"
+    };
+    Ok(StoredAggregateScheme {
+        id,
+        name: name.into(),
+        routes,
+    })
+}
+
+fn aggregate_runtime_routes(
+    settings: &LauncherSettings,
+    routes: &[StoredRoleBinding],
+) -> Result<Vec<AggregateRuntimeRoute>, String> {
+    let mut runtime_routes = Vec::new();
+    for role in SUBSCRIPTION_ROLES {
+        let binding = routes
+            .iter()
+            .find(|binding| binding.role == role)
+            .ok_or_else(|| format!("聚合方案缺少 {role} 路由"))?;
+        let entry = settings
+            .api_keys
+            .iter()
+            .find(|entry| entry.id == binding.api_key_id)
+            .ok_or_else(|| format!("{role} 路由绑定的 API Key 已不存在"))?;
+        let api_key = unprotect_api_key(&entry.encrypted_api_key)?;
+        if api_key.trim().is_empty() || api_key.contains(char::is_whitespace) {
+            return Err(format!("{role} 路由的 API Key 无效，请重新添加该订阅"));
+        }
+        let mut provider_settings = settings.clone();
+        provider_settings.selected_provider_id = entry.provider_id.clone();
+        provider_settings.custom_base_url = entry.base_url.clone();
+        provider_settings.custom_confirmed = entry.custom_confirmed;
+        let profile = runtime_profile_for_settings(&provider_settings)?
+            .ok_or_else(|| "聚合接入暂不支持依赖 Claude 官方登录的订阅".to_string())?;
+        let model = canonical_model_for_profile(&profile, &binding.model);
+        eprintln!(
+            "[CSA switch] aggregate preflight started: role={role}, provider={}, model={model}",
+            entry.provider_id
+        );
+        let preflight = test_api_key_impl(
+            entry.provider_id.clone(),
+            api_key.clone(),
+            entry.base_url.clone(),
+            entry.custom_confirmed,
+            model.clone(),
+            "Reply only: SWITCH_READY".into(),
+        )?;
+        require_successful_preflight(preflight)
+            .map_err(|error| format!("{role} 路由{error}"))?;
+        eprintln!("[CSA switch] aggregate preflight passed: role={role}");
+        runtime_routes.push(AggregateRuntimeRoute {
+            role: role.to_string(),
+            backend: profile.backend.to_string(),
+            api_key: api_key.trim().to_string(),
+            base_url: profile.base_url.clone(),
+            upstream_mode: profile.upstream_mode.to_string(),
+            model,
+        });
+    }
+    Ok(runtime_routes)
+}
+
+fn activate_aggregate_scheme_in_settings(
+    mut settings: LauncherSettings,
+    scheme: StoredAggregateScheme,
+) -> Result<LauncherState, String> {
+    let scheme = normalize_aggregate_scheme(&settings, scheme)?;
+    let runtime_routes = aggregate_runtime_routes(&settings, &scheme.routes)?;
+    let patch = Some(bridge_config_patch_for_aggregate_routes(
+        &scheme.id,
+        &runtime_routes,
+    )?);
+    if let Some(existing) = settings
+        .aggregate_schemes
+        .iter_mut()
+        .find(|stored| stored.id == scheme.id)
+    {
+        *existing = scheme.clone();
+    } else {
+        settings.aggregate_schemes.push(scheme.clone());
+    }
+    settings.role_bindings = scheme.routes.clone();
+    settings.active_role = None;
+    settings.active_aggregate_scheme_id = Some(scheme.id);
+    commit_launcher_settings_with_bridge(&settings, patch)?;
+    Ok(launcher_state(&settings))
+}
+
+fn save_and_activate_aggregate_scheme_impl(
+    scheme: StoredAggregateScheme,
+) -> Result<LauncherState, String> {
+    activate_aggregate_scheme_in_settings(load_settings(), scheme)
+}
+
 #[tauri::command]
-async fn activate_role(role: String) -> Result<LauncherState, String> {
-    run_blocking(move || activate_role_impl(role)).await
+async fn save_and_activate_aggregate_scheme(
+    scheme: StoredAggregateScheme,
+) -> Result<LauncherState, String> {
+    run_blocking(move || save_and_activate_aggregate_scheme_impl(scheme)).await
+}
+
+fn activate_aggregate_scheme_impl(scheme_id: String) -> Result<LauncherState, String> {
+    let settings = load_settings();
+    let scheme = settings
+        .aggregate_schemes
+        .iter()
+        .find(|scheme| scheme.id == scheme_id)
+        .cloned()
+        .ok_or_else(|| "没有找到该聚合方案".to_string())?;
+    activate_aggregate_scheme_in_settings(settings, scheme)
+}
+
+#[tauri::command]
+async fn activate_aggregate_scheme(scheme_id: String) -> Result<LauncherState, String> {
+    run_blocking(move || activate_aggregate_scheme_impl(scheme_id)).await
 }
 
 fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     let mut settings = load_settings();
-    if settings.active_api_key_id.as_deref() == Some(api_key_id.as_str()) {
+    if settings.active_aggregate_scheme_id.is_none()
+        && settings.active_api_key_id.as_deref() == Some(api_key_id.as_str())
+    {
         return Err("当前正在使用的 API Key 不能直接删除；请先切换到另一条 Key".into());
+    }
+    if settings
+        .active_aggregate_scheme_id
+        .as_deref()
+        .is_some_and(|active_id| {
+            settings.aggregate_schemes.iter().any(|scheme| {
+                scheme.id == active_id
+                    && scheme
+                        .routes
+                        .iter()
+                        .any(|route| route.api_key_id == api_key_id)
+            })
+        })
+    {
+        return Err("该 API Key 正在被当前聚合方案使用，请先切换到 API 接入或另一套方案".into());
     }
     let before = settings.api_keys.len();
     settings.api_keys.retain(|entry| entry.id != api_key_id);
@@ -3356,6 +3609,9 @@ fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     settings
         .role_bindings
         .retain(|binding| binding.api_key_id != api_key_id);
+    for scheme in &mut settings.aggregate_schemes {
+        scheme.routes.retain(|route| route.api_key_id != api_key_id);
+    }
     if settings.active_role.as_deref().is_some_and(|role| {
         !settings
             .role_bindings
@@ -3847,8 +4103,8 @@ pub fn run() {
             save_provider_selection,
             save_api_key,
             activate_api_key,
-            save_role_bindings,
-            activate_role,
+            activate_aggregate_scheme,
+            save_and_activate_aggregate_scheme,
             test_api_key,
             auto_map_api_key,
             delete_api_key
@@ -4472,6 +4728,86 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_patch_routes_claude_slots_to_three_independent_upstreams() {
+        let routes = vec![
+            AggregateRuntimeRoute {
+                role: "default".into(),
+                backend: "custom".into(),
+                api_key: "decision-key".into(),
+                base_url: "https://decision.example/v1".into(),
+                upstream_mode: "openai".into(),
+                model: "decision-model".into(),
+            },
+            AggregateRuntimeRoute {
+                role: "vision".into(),
+                backend: "custom".into(),
+                api_key: "vision-key".into(),
+                base_url: "https://vision.example/v1".into(),
+                upstream_mode: "openai".into(),
+                model: "vision-model".into(),
+            },
+            AggregateRuntimeRoute {
+                role: "fast".into(),
+                backend: "deepseek".into(),
+                api_key: "daily-key".into(),
+                base_url: "https://daily.example/anthropic".into(),
+                upstream_mode: "anthropic".into(),
+                model: "daily-model".into(),
+            },
+        ];
+        let patch = bridge_config_patch_for_aggregate_routes("scheme-1", &routes).unwrap();
+        assert_eq!(patch["force_model"], "");
+        assert_eq!(patch["active_aggregate_scheme_id"], "scheme-1");
+        assert_eq!(patch["aggregate_upstreams"].as_array().unwrap().len(), 3);
+        let aliases = patch["model_aliases"].as_array().unwrap();
+        assert!(aliases
+            .iter()
+            .any(|alias| { alias["id"] == "claude-opus-4-8" && alias["route_id"] == "default" }));
+        assert!(aliases
+            .iter()
+            .any(|alias| { alias["id"] == "claude-sonnet-5" && alias["route_id"] == "vision" }));
+        assert!(aliases.iter().any(|alias| {
+            alias["id"] == "claude-haiku-4-5-20251001" && alias["route_id"] == "fast"
+        }));
+    }
+
+    #[test]
+    fn single_api_patch_explicitly_disables_aggregate_mode() {
+        let profile = BridgeRuntimeProfile {
+            provider_id: "custom".into(),
+            label: "Custom".into(),
+            backend: "custom",
+            api_key_field: "custom_api_key",
+            base_url: "https://example.com/v1".into(),
+            upstream_mode: "openai",
+            default_model: "model-a".into(),
+            default_fast_model: "model-a".into(),
+            requires_explicit_model: true,
+        };
+        let patch = bridge_config_patch_for_runtime_profile(&profile, "key-a", "model-a", &[]);
+        assert_eq!(patch["aggregate_upstreams"], serde_json::json!([]));
+        assert_eq!(patch["active_aggregate_scheme_id"], "");
+    }
+
+    #[test]
+    fn legacy_role_bindings_migrate_to_scheme_one_without_auto_activation() {
+        let mut settings = LauncherSettings {
+            role_bindings: vec![StoredRoleBinding {
+                role: "default".into(),
+                provider_id: "custom".into(),
+                api_key_id: "key-a".into(),
+                model: "model-a".into(),
+            }],
+            ..LauncherSettings::default()
+        };
+        normalize_aggregate_schemes(&mut settings);
+        assert_eq!(settings.aggregate_schemes.len(), 2);
+        assert_eq!(settings.aggregate_schemes[0].routes, settings.role_bindings);
+        assert!(settings.aggregate_schemes[1].routes.is_empty());
+        assert!(settings.active_aggregate_scheme_id.is_none());
+    }
+
+    #[test]
     fn custom_relay_uses_user_name_when_provided() {
         let settings = LauncherSettings::default();
         assert_eq!(
@@ -4517,6 +4853,101 @@ mod tests {
     fn api_key_test_budget_supports_reasoning_models() {
         assert!(API_KEY_TEST_INITIAL_MAX_TOKENS >= 256);
         assert!(API_KEY_TEST_RETRY_MAX_TOKENS >= API_KEY_TEST_INITIAL_MAX_TOKENS * 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_saved_base_url_preflight_returns_visible_error() {
+        let result = test_api_key_impl(
+            "custom".into(),
+            "diagnostic-key".into(),
+            "https://127.0.0.1:9/v1".into(),
+            true,
+            "diagnostic-model".into(),
+            "Reply only: OK".into(),
+        )
+        .unwrap();
+        let error = require_successful_preflight(result).unwrap_err();
+        assert!(!error.trim().is_empty());
+        assert!(!error.contains("diagnostic-key"));
+    }
+
+    #[test]
+    fn switch_path_keeps_required_observability_markers() {
+        let source = include_str!("lib.rs");
+        for marker in [
+            "received configuration transition request",
+            "writing Bridge config: revision=",
+            "Bridge health verified: revision=",
+            "activation failed; starting rollback",
+            "transition complete",
+        ] {
+            assert!(source.contains(marker), "missing switch log marker: {marker}");
+        }
+    }
+
+    #[test]
+    fn saving_new_api_key_does_not_activate_bridge() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn save_api_key_impl(")
+            .expect("save_api_key_impl should exist");
+        let end = source[start..]
+            .find("async fn save_api_key(")
+            .map(|offset| start + offset)
+            .expect("save_api_key command should follow the implementation");
+        let implementation = &source[start..end];
+
+        assert!(implementation.contains("persist_launcher_settings(&settings)?"));
+        assert!(!implementation.contains("commit_launcher_settings_with_bridge"));
+        assert!(!implementation.contains("settings.active_api_key_id ="));
+    }
+
+    #[test]
+    fn api_key_ui_requires_pending_confirmation() {
+        let source = include_str!("../../src/App.tsx");
+
+        assert_eq!(
+            source
+                .matches("invoke<LauncherSettings>(\"activate_api_key\"")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("activateKey(pendingApiKeyId)").count(), 1);
+        assert!(source.contains("onClick={() => preselectKey(entry.id)}"));
+        assert!(source.contains("保存到列表"));
+    }
+
+    #[test]
+    fn aggregate_scheme_ui_requires_pending_confirmation() {
+        let source = include_str!("../../src/App.tsx");
+        let preselect_start = source
+            .find("function preselectAggregateScheme(")
+            .expect("aggregate preselection helper should exist");
+        let confirm_start = source[preselect_start..]
+            .find("async function confirmPendingAggregateScheme(")
+            .map(|offset| preselect_start + offset)
+            .expect("aggregate confirmation helper should exist");
+        let cancel_start = source[confirm_start..]
+            .find("function cancelPendingAggregateScheme(")
+            .map(|offset| confirm_start + offset)
+            .expect("aggregate cancellation helper should exist");
+        let switch_mode_start = source[cancel_start..]
+            .find("function switchAccessMode(")
+            .map(|offset| cancel_start + offset)
+            .expect("access mode helper should exist");
+        let delete_start = source[switch_mode_start..]
+            .find("async function deleteKey(")
+            .map(|offset| switch_mode_start + offset)
+            .expect("delete helper should follow access mode helper");
+
+        assert!(!source[preselect_start..confirm_start].contains("invoke<LauncherSettings>"));
+        assert!(source[confirm_start..cancel_start]
+            .contains("invoke<LauncherSettings>(\"activate_aggregate_scheme\""));
+        assert!(!source[switch_mode_start..delete_start].contains("activateKey("));
+        assert!(!source[switch_mode_start..delete_start].contains("activate_aggregate_scheme"));
+        assert!(source.contains("onClick={() => preselectAggregateScheme(scheme.id)}"));
+        assert!(source.contains("onClick={() => void confirmPendingAggregateScheme()}"));
     }
 
     #[test]
@@ -4666,112 +5097,6 @@ mod tests {
         assert!(!status.stable.version.is_empty());
     }
 
-    #[cfg(windows)]
-    fn live_bridge_json(path: &str) -> Result<serde_json::Value, String> {
-        let mut command = background_command("curl.exe");
-        command.args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "1",
-            "--max-time",
-            "10",
-            &format!("http://127.0.0.1:9876{path}"),
-        ]);
-        let output =
-            command_output_with_timeout(command, Duration::from_secs(12), "读取本地 Bridge 诊断")?;
-        if !output.status.success() {
-            return Err(command_error_text(&output));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("本地 Bridge 诊断响应无法解析：{error}"))
-    }
-
-    #[cfg(windows)]
-    fn live_bridge_request() -> Result<serde_json::Value, String> {
-        let body = serde_json::json!({
-            "model": "claude-sonnet-4-5",
-            "max_tokens": 48,
-            "messages": [{"role": "user", "content": "Reply only: SWITCH_OK"}]
-        })
-        .to_string();
-        let mut command = background_command("curl.exe");
-        command.args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "2",
-            "--max-time",
-            "90",
-            "-H",
-            "content-type: application/json",
-            "-X",
-            "POST",
-            "--data-binary",
-            &body,
-            "http://127.0.0.1:9876/v1/messages",
-        ]);
-        let output = command_output_with_timeout(
-            command,
-            Duration::from_secs(95),
-            "发送本地 Bridge 切换验证请求",
-        )?;
-        if !output.status.success() {
-            return Err(command_error_text(&output));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("Bridge 切换验证响应无法解析：{error}"))
-    }
-
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "mutates the current API Key; caller must back up and restore settings"]
-    fn live_api_key_switch_diagnostic() {
-        let target_id = std::env::var("CSA_LIVE_SWITCH_API_KEY_ID")
-            .expect("set CSA_LIVE_SWITCH_API_KEY_ID to a saved API Key id");
-        let target = load_settings()
-            .api_keys
-            .iter()
-            .find(|entry| entry.id == target_id)
-            .cloned()
-            .expect("target API Key should exist");
-        let before_revision = live_bridge_json("/health")
-            .ok()
-            .and_then(|value| value.get("config_revision").cloned());
-        let switched = activate_api_key_impl(target_id);
-        let health = live_bridge_json("/health").expect("Bridge health should remain available");
-        let request = live_bridge_request();
-        let after_revision = health.get("config_revision").cloned();
-        println!(
-            "CSA_SWITCH_EVIDENCE={}",
-            serde_json::json!({
-                "targetProvider": target.provider_id,
-                "targetModel": target.model,
-                "switchOk": switched.is_ok(),
-                "switchError": switched.as_ref().err(),
-                "revisionChanged": before_revision != after_revision,
-                "forceModel": health.get("force_model"),
-                "realRequestOk": request.is_ok(),
-                "realRequestError": request.as_ref().err(),
-            })
-        );
-        assert!(switched.is_ok(), "API Key switch should succeed");
-        assert!(
-            before_revision != after_revision,
-            "Bridge revision should change"
-        );
-        assert_eq!(
-            health.get("force_model"),
-            Some(&serde_json::json!(target.model))
-        );
-        assert!(
-            request.is_ok(),
-            "real request should use the switched profile"
-        );
-    }
-
     #[test]
     fn dashboard_url_includes_path_secret_only_when_required() {
         assert_eq!(
@@ -4818,11 +5143,8 @@ mod tests {
             "10",
             &format!("http://127.0.0.1:9876{path}"),
         ]);
-        let output = command_output_with_timeout(
-            command,
-            Duration::from_secs(12),
-            "读取本地 Bridge 诊断",
-        )?;
+        let output =
+            command_output_with_timeout(command, Duration::from_secs(12), "读取本地 Bridge 诊断")?;
         if !output.status.success() {
             return Err(command_error_text(&output));
         }
@@ -4983,8 +5305,8 @@ mod tests {
     #[test]
     #[ignore = "temporarily changes role mappings and sends two real requests"]
     fn live_subscription_role_switch_diagnostic() {
-        let default_id = std::env::var("CSA_LIVE_DEFAULT_API_KEY_ID")
-            .expect("set CSA_LIVE_DEFAULT_API_KEY_ID");
+        let default_id =
+            std::env::var("CSA_LIVE_DEFAULT_API_KEY_ID").expect("set CSA_LIVE_DEFAULT_API_KEY_ID");
         let fast_id =
             std::env::var("CSA_LIVE_FAST_API_KEY_ID").expect("set CSA_LIVE_FAST_API_KEY_ID");
         let original = load_settings();
