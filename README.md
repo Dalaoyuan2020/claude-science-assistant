@@ -10,7 +10,7 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.4 以 v0.1.3-r2 为稳定基线，锁定 Claude Science 0.1.25 stable；发布前必须完成本机升级、隔离数据迁移和干净环境安装复测。
+> 验证边界：v0.1.5 以 v0.1.4 为稳定基线，锁定 Claude Science 0.1.25；发布前仍需完成视觉订阅图片请求、便携包升级和干净环境安装复测。
 
 [下载最新版](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/latest) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
@@ -28,9 +28,17 @@ CSA 把这些步骤收口成一个桌面应用：
 - 一个启动器，跑通 Windows 科研链路：体检电脑、安装/修复 WSL 运行时、启动 Claude Science 和本地 Bridge。
 - 告别反复手改配置：API Key 通过模板添加，官方直连、聚合平台、第三方中转和自定义 Base URL 都在同一个入口管理。
 - 先测试，再启用：保存前可测试 API Key 连通性，必要时读取 `/models` 自动生成 Claude 角色到上游模型的映射。
-- 当前只激活一条 Key：已保存 Key 按添加顺序展示，首页聚焦“现在用什么、能不能启动、哪里出问题”。
+- 多订阅角色映射：保留多条已验证订阅，把默认、视觉和快速角色分别绑定到订阅与模型，点击角色即可切换。
 - 默认保护隐私：API Key 使用 Windows 当前用户 DPAPI 加密，界面、日志、诊断包和发布包不应回显明文 Key。
 - 面向新手，也保留工程入口：新手双击 BAT 和启动器即可开始；熟悉命令行的用户仍可使用 PowerShell 脚本和诊断报告。
+
+## v0.1.5 的核心变化
+
+1. **消除 API Key 切换假成功**：即使 Bridge 当时已停止，配置提交也会主动拉起 Bridge 并核对配置 revision；无法生效时返回错误并回滚，不再显示无动作的成功。
+2. **订阅角色表**：现有 API Key 列表作为订阅表，新增默认、视觉、快速三行静态映射。保存映射不会暗中切换，点击角色才应用对应订阅与模型。
+3. **角色切换仍是单事务**：DPAPI 解密、Bridge 配置写入、Bridge-only 启动/重启、revision 校验和 Windows 设置提交保持在同一事务内；失败沿用 v0.1.4 回滚机制。
+
+详细实现与验证证据见 [v0.1.5 模型切换与角色映射说明](docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md)。本版只做手动静态映射，不做请求内容自动分类或智能路由。
 
 ## v0.1.4 界面结构
 

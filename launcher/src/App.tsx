@@ -74,12 +74,23 @@ interface ApiKeyEntry {
   active: boolean;
 }
 
+type SubscriptionRole = "default" | "vision" | "fast";
+
+interface RoleBinding {
+  role: SubscriptionRole;
+  providerId: string;
+  apiKeyId: string;
+  model: string;
+}
+
 interface LauncherSettings {
   selectedProviderId: string;
   customBaseUrl: string;
   customConfirmed: boolean;
   activeApiKeyId?: string;
   apiKeys: ApiKeyEntry[];
+  activeRole?: SubscriptionRole;
+  roleBindings: RoleBinding[];
 }
 
 interface ApiKeyTestResult {
@@ -141,7 +152,14 @@ const fallbackSettings: LauncherSettings = {
   customBaseUrl: "",
   customConfirmed: false,
   apiKeys: [],
+  roleBindings: [],
 };
+
+const roleDefinitions: { role: SubscriptionRole; label: string; detail: string }[] = [
+  { role: "default", label: "默认", detail: "日常对话" },
+  { role: "vision", label: "视觉", detail: "图片理解" },
+  { role: "fast", label: "快速", detail: "低延迟回复" },
+];
 
 const initialStatus: SystemStatus = {
   state: "loading",
@@ -240,6 +258,42 @@ const rememberHealthCollapsed = (value: boolean) => {
   }
 };
 
+const modelsForApiKey = (entry?: ApiKeyEntry) => {
+  if (!entry) return [];
+  return [entry.model, ...(entry.modelAliases || []).map((alias) => alias.model)]
+    .map((model) => model.trim())
+    .filter((model, index, models) => Boolean(model) && models.indexOf(model) === index);
+};
+
+const suggestedRoleModel = (entry: ApiKeyEntry | undefined, role: SubscriptionRole) => {
+  const models = modelsForApiKey(entry);
+  if (models.length === 0) return "";
+  if (role === "fast") {
+    const alias = (entry?.modelAliases || []).find((item) => /fast|haiku|flash|highspeed/i.test(`${item.id} ${item.displayName} ${item.model}`));
+    if (alias?.model) return alias.model;
+  }
+  if (role === "vision") {
+    const visual = models.find((model) => /vision|vl|image|multimodal|4o/i.test(model));
+    if (visual) return visual;
+  }
+  return entry?.model || models[0];
+};
+
+const roleDraftsFromSettings = (settings: LauncherSettings): RoleBinding[] => {
+  const eligible = (settings.apiKeys || []).filter((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0);
+  const fallback = eligible.find((entry) => entry.id === settings.activeApiKeyId) || eligible[0];
+  return roleDefinitions.map(({ role }) => {
+    const saved = (settings.roleBindings || []).find((binding) => binding.role === role);
+    if (saved) return saved;
+    return {
+      role,
+      providerId: fallback?.providerId || "",
+      apiKeyId: fallback?.id || "",
+      model: suggestedRoleModel(fallback, role),
+    };
+  });
+};
+
 function App() {
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
   const [providerGroups, setProviderGroups] = useState<ProviderGroup[]>(fallbackProviderGroups);
@@ -248,6 +302,9 @@ function App() {
   const [customConfirmed, setCustomConfirmed] = useState(fallbackSettings.customConfirmed);
   const [activeApiKeyId, setActiveApiKeyId] = useState<string | undefined>();
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>(fallbackSettings.apiKeys);
+  const [activeRole, setActiveRole] = useState<SubscriptionRole | undefined>();
+  const [roleBindings, setRoleBindings] = useState<RoleBinding[]>(roleDraftsFromSettings(fallbackSettings));
+  const [roleMappingsDirty, setRoleMappingsDirty] = useState(false);
   const [showKeyPicker, setShowKeyPicker] = useState(false);
   const [draftProviderId, setDraftProviderId] = useState(fallbackSettings.selectedProviderId);
   const [draftApiKey, setDraftApiKey] = useState("");
@@ -278,6 +335,11 @@ function App() {
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
   const activeKeyEntry = apiKeys.find((entry) => entry.id === activeApiKeyId);
   const activeKeyProvider = providers.find((provider) => provider.id === (activeKeyEntry?.providerId || activeProvider)) || providers[0];
+  const activeRoleBinding = roleBindings.find((binding) => binding.role === activeRole);
+  const roleEligibleKeys = useMemo(
+    () => apiKeys.filter((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0),
+    [apiKeys],
+  );
   const draftProvider = providers.find((provider) => provider.id === draftProviderId) || activeKeyProvider;
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
@@ -350,6 +412,9 @@ function App() {
     setCustomConfirmed(settings.customConfirmed);
     setActiveApiKeyId(settings.activeApiKeyId);
     setApiKeys(settings.apiKeys || []);
+    setActiveRole(settings.activeRole);
+    setRoleBindings(roleDraftsFromSettings(settings));
+    setRoleMappingsDirty((settings.roleBindings || []).length < roleDefinitions.length && (settings.apiKeys || []).some((entry) => entry.hasSecret && modelsForApiKey(entry).length > 0));
   }
 
   function primeDraft(groups = providerGroups, providerId = activeProvider, baseUrl = customBaseUrl, confirmed = customConfirmed) {
@@ -591,7 +656,7 @@ function App() {
   }
 
   async function activateKey(apiKeyId: string) {
-    if (apiKeyId === activeApiKeyId) return;
+    if (apiKeyId === activeApiKeyId && !activeRole) return;
     if (status.restartBlocked) {
       setError("当前诊断不允许切换 API Key；请先处理磁盘、WSL 或安装包问题。");
       return;
@@ -601,6 +666,7 @@ function App() {
       if (!entry) return;
       setActiveApiKeyId(apiKeyId);
       setActiveProvider(entry.providerId);
+      setActiveRole(undefined);
       setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === apiKeyId })));
       return;
     }
@@ -615,9 +681,88 @@ function App() {
     }
   }
 
+  function updateRoleSubscription(role: SubscriptionRole, apiKeyId: string) {
+    const entry = apiKeys.find((item) => item.id === apiKeyId);
+    setRoleBindings((current) => current.map((binding) => binding.role === role
+      ? {
+          ...binding,
+          providerId: entry?.providerId || "",
+          apiKeyId,
+          model: suggestedRoleModel(entry, role),
+        }
+      : binding));
+    setRoleMappingsDirty(true);
+  }
+
+  function updateRoleModel(role: SubscriptionRole, model: string) {
+    setRoleBindings((current) => current.map((binding) => binding.role === role
+      ? { ...binding, model }
+      : binding));
+    setRoleMappingsDirty(true);
+  }
+
+  async function saveRoleMappings() {
+    if (roleBindings.some((binding) => !binding.apiKeyId || !binding.providerId || !binding.model)) {
+      setError("请为默认、视觉和快速三个角色都选择订阅与模型；三个角色可以使用同一订阅。");
+      return;
+    }
+    if (!isTauri) {
+      setRoleMappingsDirty(false);
+      setActiveRole(undefined);
+      return;
+    }
+    updateBusy(true);
+    setError("");
+    try {
+      applyLauncherState(await invoke<LauncherSettings>("save_role_bindings", { roleBindings }));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      updateBusy(false);
+    }
+  }
+
+  async function activateSubscriptionRole(role: SubscriptionRole) {
+    if (roleMappingsDirty) {
+      setError("角色映射有未保存改动，请先保存映射。");
+      return;
+    }
+    const binding = roleBindings.find((item) => item.role === role);
+    if (!binding?.apiKeyId || !binding.model) {
+      setError("请先为该角色绑定订阅和模型。");
+      return;
+    }
+    if (status.restartBlocked) {
+      setError("当前诊断不允许切换角色；请先处理磁盘、WSL 或安装包问题。");
+      return;
+    }
+    if (!isTauri) {
+      const entry = apiKeys.find((item) => item.id === binding.apiKeyId);
+      if (!entry) return;
+      setActiveRole(role);
+      setActiveApiKeyId(entry.id);
+      setActiveProvider(entry.providerId);
+      setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === entry.id })));
+      return;
+    }
+    updateBusy(true);
+    setError("");
+    try {
+      applyLauncherState(await invoke<LauncherSettings>("activate_role", { role }));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      updateBusy(false);
+    }
+  }
+
   async function deleteKey(apiKeyId: string) {
     if (!isTauri) {
       setApiKeys((current) => current.filter((item) => item.id !== apiKeyId));
+      setRoleBindings((current) => current.map((binding) => binding.apiKeyId === apiKeyId
+        ? { ...binding, providerId: "", apiKeyId: "", model: "" }
+        : binding));
+      setRoleMappingsDirty(true);
       return;
     }
     updateBusy(true);
@@ -728,7 +873,7 @@ function App() {
         <div className="brand-mark">CSA</div>
         <div>
           <h1>CSA - Claude Science Assistant</h1>
-          <p>一个当前 API Key，一个安全启动入口</p>
+          <p>多订阅角色，一个安全启动入口</p>
         </div>
         <button className="quiet-button" onClick={refresh} disabled={busy}>刷新状态</button>
       </header>
@@ -904,7 +1049,8 @@ function App() {
               <div className="kit-meta">
                 {activeKeyEntry && activeKeyProvider && <span className={`trust-badge badge-${badgeClass[activeKeyProvider.badge]}`}>{activeKeyProvider.badge}</span>}
                 {activeKeyEntry?.hasSecret && <span>Key 已加密保存</span>}
-                {activeKeyEntry?.model && <span>模型 {activeKeyEntry.model}</span>}
+                {activeRole && <span>{roleDefinitions.find((item) => item.role === activeRole)?.label}角色</span>}
+                {(activeRoleBinding?.model || activeKeyEntry?.model) && <span>模型 {activeRoleBinding?.model || activeKeyEntry?.model}</span>}
                 {(activeKeyEntry?.modelAliases?.length ?? 0) > 0 && <span>映射 {activeKeyEntry?.modelAliases?.length ?? 0} 条</span>}
                 {activeKeyEntry?.baseUrl && <span>{activeKeyEntry.baseUrl}</span>}
               </div>
@@ -933,7 +1079,9 @@ function App() {
                   </span>
                   <span className="key-row-actions">
                     {active
-                      ? <span className="active-key-label">使用中</span>
+                      ? activeRole
+                        ? <button onClick={() => activateKey(entry.id)} disabled={busy || status.restartBlocked}>退出角色</button>
+                        : <span className="active-key-label">使用中</span>
                       : <button onClick={() => activateKey(entry.id)} disabled={busy || status.restartBlocked}>使用</button>}
                     <button onClick={() => deleteKey(entry.id)} disabled={busy || active}>删除</button>
                   </span>
@@ -945,6 +1093,88 @@ function App() {
               添加新的供应商
             </button>
           </aside>
+        </div>
+
+        <div className="role-mapping-panel">
+          <div className="role-mapping-head">
+            <div>
+              <span className="eyebrow">Subscription Roles</span>
+              <h3>订阅角色</h3>
+            </div>
+            <div className="role-switcher" aria-label="切换订阅角色">
+              {roleDefinitions.map((definition) => {
+                const binding = roleBindings.find((item) => item.role === definition.role);
+                return (
+                  <button
+                    className={activeRole === definition.role ? "active" : ""}
+                    key={definition.role}
+                    title={definition.detail}
+                    disabled={busy || status.restartBlocked || roleMappingsDirty || !binding?.apiKeyId || !binding.model}
+                    onClick={() => activateSubscriptionRole(definition.role)}
+                  >
+                    {definition.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="role-mapping-table">
+            {roleDefinitions.map((definition) => {
+              const binding = roleBindings.find((item) => item.role === definition.role) || {
+                role: definition.role,
+                providerId: "",
+                apiKeyId: "",
+                model: "",
+              };
+              const entry = apiKeys.find((item) => item.id === binding.apiKeyId);
+              return (
+                <div className="role-mapping-row" key={definition.role}>
+                  <span className="role-name">
+                    <strong>{definition.label}</strong>
+                    <small>{definition.detail}</small>
+                  </span>
+                  <label>
+                    <span>订阅</span>
+                    <select
+                      value={binding.apiKeyId}
+                      disabled={busy || Boolean(activeRole) || roleEligibleKeys.length === 0}
+                      onChange={(event) => updateRoleSubscription(definition.role, event.currentTarget.value)}
+                    >
+                      <option value="">未选择</option>
+                      {roleEligibleKeys.map((item) => (
+                        <option value={item.id} key={item.id}>{item.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>模型</span>
+                    <select
+                      value={binding.model}
+                      disabled={busy || Boolean(activeRole) || !entry}
+                      onChange={(event) => updateRoleModel(definition.role, event.currentTarget.value)}
+                    >
+                      <option value="">未选择</option>
+                      {modelsForApiKey(entry).map((model) => (
+                        <option value={model} key={model}>{model}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="role-mapping-footer">
+            <span>{roleMappingsDirty ? "映射有未保存修改" : "映射已保存"}</span>
+            <button
+              className="primary-inline-button"
+              onClick={saveRoleMappings}
+              disabled={busy || Boolean(activeRole) || !roleMappingsDirty || roleEligibleKeys.length === 0}
+            >
+              保存映射
+            </button>
+          </div>
         </div>
 
         {showKeyPicker && (

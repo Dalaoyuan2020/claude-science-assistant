@@ -54,7 +54,7 @@ $RuntimeBinaryPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\clau
 $StartScriptPath = Join-Path $ProjectDir "scripts\start-claude-science-wsl.sh"
 $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$RuntimeManifest.version -ne "0.1.25") {
-  throw "v0.1.4 must lock Claude Science stable 0.1.25."
+  throw "v0.1.5 must lock Claude Science stable 0.1.25."
 }
 if (Test-Path -LiteralPath $RuntimeBinaryPath) {
   $RuntimeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RuntimeBinaryPath).Hash.ToLowerInvariant()

@@ -24,6 +24,7 @@ const CLAUDE_SCIENCE_RELEASE_BASE: &str = "https://storage.googleapis.com/operon
 const CLAUDE_SCIENCE_CHANGELOG_URL: &str = "https://claude.com/docs/claude-science/changelog";
 const BUNDLED_CLAUDE_SCIENCE_VERSION: &str = "0.1.25";
 const BUNDLED_CLAUDE_SCIENCE_SHA8: &str = "b7190511";
+const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
 
 // Provider changes update the WSL Bridge config and restart its listener. Keep
 // the whole write/restart/verify transaction single-flight to prevent a second
@@ -299,6 +300,10 @@ struct LauncherSettings {
     active_api_key_id: Option<String>,
     #[serde(default)]
     api_keys: Vec<StoredApiKey>,
+    #[serde(default)]
+    active_role: Option<String>,
+    #[serde(default)]
+    role_bindings: Vec<StoredRoleBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +325,15 @@ struct StoredApiKey {
 struct StoredModelAlias {
     id: String,
     display_name: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredRoleBinding {
+    role: String,
+    provider_id: String,
+    api_key_id: String,
     model: String,
 }
 
@@ -345,6 +359,8 @@ struct LauncherState {
     custom_confirmed: bool,
     active_api_key_id: Option<String>,
     api_keys: Vec<ApiKeySummary>,
+    active_role: Option<String>,
+    role_bindings: Vec<StoredRoleBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +431,8 @@ impl Default for LauncherSettings {
             custom_confirmed: false,
             active_api_key_id: None,
             api_keys: Vec::new(),
+            active_role: None,
+            role_bindings: Vec::new(),
         }
     }
 }
@@ -1349,7 +1367,90 @@ fn launcher_state(settings: &LauncherSettings) -> LauncherState {
                 active: settings.active_api_key_id.as_deref() == Some(entry.id.as_str()),
             })
             .collect(),
+        active_role: settings.active_role.clone(),
+        role_bindings: settings.role_bindings.clone(),
     }
+}
+
+fn role_exists(role: &str) -> bool {
+    SUBSCRIPTION_ROLES.contains(&role)
+}
+
+fn available_models_for_api_key(entry: &StoredApiKey) -> Vec<String> {
+    let mut models = Vec::new();
+    for model in std::iter::once(entry.model.as_str())
+        .chain(entry.model_aliases.iter().map(|alias| alias.model.as_str()))
+    {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|item| item == model) {
+            models.push(model.to_string());
+        }
+    }
+    models
+}
+
+fn validate_role_bindings(
+    settings: &LauncherSettings,
+    bindings: &[StoredRoleBinding],
+) -> Result<Vec<StoredRoleBinding>, String> {
+    if bindings.len() > SUBSCRIPTION_ROLES.len() {
+        return Err("角色映射最多只能包含默认、视觉和快速三项".into());
+    }
+    let mut normalized = Vec::new();
+    for binding in bindings {
+        let role = binding.role.trim().to_ascii_lowercase();
+        if !role_exists(&role) {
+            return Err(format!("未知订阅角色：{}", binding.role));
+        }
+        if normalized
+            .iter()
+            .any(|item: &StoredRoleBinding| item.role == role)
+        {
+            return Err(format!("订阅角色重复：{role}"));
+        }
+        let entry = settings
+            .api_keys
+            .iter()
+            .find(|entry| entry.id == binding.api_key_id)
+            .ok_or_else(|| format!("{role} 角色绑定的 API Key 已不存在"))?;
+        if entry.provider_id != binding.provider_id {
+            return Err(format!("{role} 角色的 Provider 与 API Key 不匹配"));
+        }
+        let model = binding.model.trim();
+        if model.is_empty() {
+            return Err(format!("{role} 角色尚未选择模型"));
+        }
+        if !available_models_for_api_key(entry)
+            .iter()
+            .any(|item| item == model)
+        {
+            return Err(format!("{role} 角色选择的模型不属于该订阅"));
+        }
+        normalized.push(StoredRoleBinding {
+            role,
+            provider_id: entry.provider_id.clone(),
+            api_key_id: entry.id.clone(),
+            model: model.to_string(),
+        });
+    }
+    normalized.sort_by_key(|binding| {
+        SUBSCRIPTION_ROLES
+            .iter()
+            .position(|role| *role == binding.role)
+            .unwrap_or(SUBSCRIPTION_ROLES.len())
+    });
+    Ok(normalized)
+}
+
+fn aliases_for_role(entry: &StoredApiKey, model: &str) -> Vec<StoredModelAlias> {
+    clean_model_aliases(&entry.model_aliases)
+        .into_iter()
+        .map(|mut alias| {
+            alias.model = model.to_string();
+            alias.display_name = format!("{} -> {model}", alias.id);
+            alias
+        })
+        .collect()
 }
 
 fn run_powershell_with_stdin(script: &str, input: &str) -> Result<String, String> {
@@ -2969,6 +3070,7 @@ fn save_provider_selection_impl(
     settings.custom_base_url = validate_base_url(&custom_base_url)?;
     settings.custom_confirmed = custom_confirmed;
     settings.active_api_key_id = None;
+    settings.active_role = None;
     let patch = bridge_config_patch_for_provider(&settings)?;
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
@@ -3047,6 +3149,7 @@ fn save_api_key_impl(
         encrypted_api_key,
     };
     settings.active_api_key_id = Some(entry.id.clone());
+    settings.active_role = None;
     settings.api_keys.push(entry);
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
@@ -3094,6 +3197,7 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     let patch =
         bridge_config_patch_for_api_key(&settings, &api_key, &entry.model, &entry.model_aliases)?;
     settings.active_api_key_id = Some(entry.id);
+    settings.active_role = None;
     commit_launcher_settings_with_bridge(&settings, patch)?;
     Ok(launcher_state(&settings))
 }
@@ -3101,6 +3205,80 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
 #[tauri::command]
 async fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
     run_blocking(move || activate_api_key_impl(api_key_id)).await
+}
+
+fn save_role_bindings_impl(
+    role_bindings: Vec<StoredRoleBinding>,
+) -> Result<LauncherState, String> {
+    let mut settings = load_settings();
+    let normalized = validate_role_bindings(&settings, &role_bindings)?;
+    if settings.active_role.is_some() && normalized != settings.role_bindings {
+        return Err("请先从 API Key 列表退出当前角色，再修改角色映射".into());
+    }
+    settings.role_bindings = normalized;
+    // Saving the table does not silently change the running Bridge. The user
+    // explicitly activates a role after reviewing the mapping.
+    persist_launcher_settings(&settings)?;
+    Ok(launcher_state(&settings))
+}
+
+#[tauri::command]
+async fn save_role_bindings(
+    role_bindings: Vec<StoredRoleBinding>,
+) -> Result<LauncherState, String> {
+    run_blocking(move || save_role_bindings_impl(role_bindings)).await
+}
+
+fn activate_role_impl(role: String) -> Result<LauncherState, String> {
+    let role = role.trim().to_ascii_lowercase();
+    if !role_exists(&role) {
+        return Err("未知订阅角色".into());
+    }
+    let mut settings = load_settings();
+    let binding = settings
+        .role_bindings
+        .iter()
+        .find(|binding| binding.role == role)
+        .cloned()
+        .ok_or_else(|| "请先保存该角色的订阅与模型映射".to_string())?;
+    let entry = settings
+        .api_keys
+        .iter()
+        .find(|entry| entry.id == binding.api_key_id)
+        .cloned()
+        .ok_or_else(|| "该角色绑定的 API Key 已不存在，请重新保存映射".to_string())?;
+    if entry.provider_id != binding.provider_id {
+        return Err("该角色的 Provider 与 API Key 不匹配，请重新保存映射".into());
+    }
+    if !available_models_for_api_key(&entry)
+        .iter()
+        .any(|model| model == &binding.model)
+    {
+        return Err("该角色绑定的模型已不可用，请重新保存映射".into());
+    }
+    if entry.provider_id != "claude" && entry.encrypted_api_key.is_empty() {
+        return Err("该角色绑定的旧配置没有可用的加密 Key，请重新添加订阅".into());
+    }
+    let api_key = unprotect_api_key(&entry.encrypted_api_key)?;
+    settings.selected_provider_id = entry.provider_id.clone();
+    settings.custom_base_url = entry.base_url.clone();
+    settings.custom_confirmed = entry.custom_confirmed;
+    let role_aliases = aliases_for_role(&entry, &binding.model);
+    let patch = bridge_config_patch_for_api_key(
+        &settings,
+        &api_key,
+        &binding.model,
+        &role_aliases,
+    )?;
+    settings.active_api_key_id = Some(entry.id);
+    settings.active_role = Some(role);
+    commit_launcher_settings_with_bridge(&settings, patch)?;
+    Ok(launcher_state(&settings))
+}
+
+#[tauri::command]
+async fn activate_role(role: String) -> Result<LauncherState, String> {
+    run_blocking(move || activate_role_impl(role)).await
 }
 
 fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
@@ -3112,6 +3290,17 @@ fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     settings.api_keys.retain(|entry| entry.id != api_key_id);
     if settings.api_keys.len() == before {
         return Err("没有找到这条 API Key".into());
+    }
+    settings
+        .role_bindings
+        .retain(|binding| binding.api_key_id != api_key_id);
+    if settings.active_role.as_deref().is_some_and(|role| {
+        !settings
+            .role_bindings
+            .iter()
+            .any(|binding| binding.role == role)
+    }) {
+        settings.active_role = None;
     }
     persist_launcher_settings(&settings)?;
     Ok(launcher_state(&settings))
@@ -3596,6 +3785,8 @@ pub fn run() {
             save_provider_selection,
             save_api_key,
             activate_api_key,
+            save_role_bindings,
+            activate_role,
             test_api_key,
             auto_map_api_key,
             delete_api_key
@@ -4116,6 +4307,109 @@ mod tests {
     }
 
     #[test]
+    fn role_bindings_validate_against_saved_subscription_models() {
+        let entry = StoredApiKey {
+            id: "key-vision".into(),
+            provider_id: "custom".into(),
+            label: "Vision relay".into(),
+            base_url: "https://example.com/v1".into(),
+            model: "text-model".into(),
+            custom_confirmed: true,
+            model_aliases: vec![StoredModelAlias {
+                id: "vision-alias".into(),
+                display_name: "Vision".into(),
+                model: "vision-model".into(),
+            }],
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let settings = LauncherSettings {
+            api_keys: vec![entry],
+            ..LauncherSettings::default()
+        };
+        let normalized = validate_role_bindings(
+            &settings,
+            &[
+                StoredRoleBinding {
+                    role: "vision".into(),
+                    provider_id: "custom".into(),
+                    api_key_id: "key-vision".into(),
+                    model: "vision-model".into(),
+                },
+                StoredRoleBinding {
+                    role: "default".into(),
+                    provider_id: "custom".into(),
+                    api_key_id: "key-vision".into(),
+                    model: "text-model".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(normalized[0].role, "default");
+        assert_eq!(normalized[1].role, "vision");
+    }
+
+    #[test]
+    fn role_bindings_reject_stale_keys_and_unknown_models() {
+        let entry = StoredApiKey {
+            id: "key-default".into(),
+            provider_id: "deepseek".into(),
+            label: "DeepSeek".into(),
+            base_url: String::new(),
+            model: "deepseek-v4-pro".into(),
+            custom_confirmed: false,
+            model_aliases: Vec::new(),
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let settings = LauncherSettings {
+            api_keys: vec![entry],
+            ..LauncherSettings::default()
+        };
+        let stale = StoredRoleBinding {
+            role: "default".into(),
+            provider_id: "deepseek".into(),
+            api_key_id: "missing".into(),
+            model: "deepseek-v4-pro".into(),
+        };
+        assert!(validate_role_bindings(&settings, &[stale]).is_err());
+
+        let unknown_model = StoredRoleBinding {
+            role: "fast".into(),
+            provider_id: "deepseek".into(),
+            api_key_id: "key-default".into(),
+            model: "not-imported".into(),
+        };
+        assert!(validate_role_bindings(&settings, &[unknown_model]).is_err());
+    }
+
+    #[test]
+    fn role_activation_retargets_all_stored_aliases() {
+        let entry = StoredApiKey {
+            id: "key-fast".into(),
+            provider_id: "custom".into(),
+            label: "Fast".into(),
+            base_url: "https://example.com/v1".into(),
+            model: "primary-model".into(),
+            custom_confirmed: true,
+            model_aliases: vec![
+                StoredModelAlias {
+                    id: "claude-sonnet-4-5".into(),
+                    display_name: "Sonnet".into(),
+                    model: "primary-model".into(),
+                },
+                StoredModelAlias {
+                    id: "claude-haiku-4-5-20251001".into(),
+                    display_name: "Haiku".into(),
+                    model: "fast-model".into(),
+                },
+            ],
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let aliases = aliases_for_role(&entry, "fast-model");
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.iter().all(|alias| alias.model == "fast-model"));
+    }
+
+    #[test]
     fn custom_relay_uses_user_name_when_provided() {
         let settings = LauncherSettings::default();
         assert_eq!(
@@ -4176,6 +4470,8 @@ mod tests {
         assert_eq!(settings.selected_provider_id, "deepseek");
         assert!(settings.active_api_key_id.is_none());
         assert!(settings.api_keys.is_empty());
+        assert!(settings.active_role.is_none());
+        assert!(settings.role_bindings.is_empty());
         assert!(launcher_state(&settings).api_keys.is_empty());
     }
 
@@ -4461,5 +4757,119 @@ mod tests {
             "routedStatus": routed.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str),
         });
         println!("CSA_SWITCH_EVIDENCE={evidence}");
+    }
+
+    #[cfg(windows)]
+    fn restore_live_launcher_settings(settings: &LauncherSettings) -> Result<(), String> {
+        let Some(active_id) = settings.active_api_key_id.as_deref() else {
+            return persist_launcher_settings(settings);
+        };
+        let entry = settings
+            .api_keys
+            .iter()
+            .find(|entry| entry.id == active_id)
+            .cloned()
+            .ok_or_else(|| "原活动 API Key 已不存在".to_string())?;
+        let api_key = unprotect_api_key(&entry.encrypted_api_key)?;
+        let active_binding = settings.active_role.as_deref().and_then(|role| {
+            settings
+                .role_bindings
+                .iter()
+                .find(|binding| binding.role == role && binding.api_key_id == entry.id)
+        });
+        let model = active_binding
+            .map(|binding| binding.model.as_str())
+            .unwrap_or(entry.model.as_str());
+        let aliases = active_binding
+            .map(|binding| aliases_for_role(&entry, &binding.model))
+            .unwrap_or_else(|| entry.model_aliases.clone());
+        let patch = bridge_config_patch_for_api_key(settings, &api_key, model, &aliases)?;
+        commit_launcher_settings_with_bridge(settings, patch)
+    }
+
+    #[cfg(windows)]
+    fn live_role_result(role: &str) -> Result<serde_json::Value, String> {
+        activate_role_impl(role.to_string())?;
+        let health = live_bridge_json("/health")?;
+        live_bridge_request()?;
+        let recent = live_bridge_json("/api/recent-requests")?;
+        let routed = recent
+            .get("requests")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("backend").and_then(serde_json::Value::as_str) != Some("local")
+                })
+            });
+        Ok(serde_json::json!({
+            "role": role,
+            "forceModel": health.get("force_model"),
+            "revision": health.get("config_revision"),
+            "routedBackend": routed.and_then(|value| value.get("backend")),
+            "routedModel": routed.and_then(|value| value.get("model")),
+            "routedStatus": routed.and_then(|value| value.get("status")),
+        }))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "temporarily changes role mappings and sends two real requests"]
+    fn live_subscription_role_switch_diagnostic() {
+        let default_id = std::env::var("CSA_LIVE_DEFAULT_API_KEY_ID")
+            .expect("set CSA_LIVE_DEFAULT_API_KEY_ID");
+        let fast_id =
+            std::env::var("CSA_LIVE_FAST_API_KEY_ID").expect("set CSA_LIVE_FAST_API_KEY_ID");
+        let original = load_settings();
+        let run_result = (|| -> Result<serde_json::Value, String> {
+            let default_entry = original
+                .api_keys
+                .iter()
+                .find(|entry| entry.id == default_id)
+                .ok_or_else(|| "默认角色测试订阅不存在".to_string())?;
+            let fast_entry = original
+                .api_keys
+                .iter()
+                .find(|entry| entry.id == fast_id)
+                .ok_or_else(|| "快速角色测试订阅不存在".to_string())?;
+            let bindings = vec![
+                StoredRoleBinding {
+                    role: "default".into(),
+                    provider_id: default_entry.provider_id.clone(),
+                    api_key_id: default_entry.id.clone(),
+                    model: default_entry.model.clone(),
+                },
+                StoredRoleBinding {
+                    role: "vision".into(),
+                    provider_id: default_entry.provider_id.clone(),
+                    api_key_id: default_entry.id.clone(),
+                    model: default_entry.model.clone(),
+                },
+                StoredRoleBinding {
+                    role: "fast".into(),
+                    provider_id: fast_entry.provider_id.clone(),
+                    api_key_id: fast_entry.id.clone(),
+                    model: fast_entry.model.clone(),
+                },
+            ];
+            save_role_bindings_impl(bindings)?;
+            let default_result = live_role_result("default")?;
+            let fast_result = live_role_result("fast")?;
+            Ok(serde_json::json!({
+                "default": default_result,
+                "fast": fast_result,
+            }))
+        })();
+        let restore_result = restore_live_launcher_settings(&original);
+        println!(
+            "CSA_ROLE_EVIDENCE={}",
+            serde_json::json!({
+                "run": run_result.as_ref().ok(),
+                "runError": run_result.as_ref().err(),
+                "restored": restore_result.is_ok(),
+                "restoreError": restore_result.as_ref().err(),
+            })
+        );
+        assert!(run_result.is_ok(), "role switch diagnostic failed");
+        assert!(restore_result.is_ok(), "original settings restore failed");
     }
 }
