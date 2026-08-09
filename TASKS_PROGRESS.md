@@ -49,7 +49,7 @@
 - [x] R4 整理提交
 - [x] R5 打包 release 便携版
 - [x] R6 发布包上检测
-- [ ] R7 GitHub、页面与交付报告
+- [x] R7 GitHub、页面与交付报告
 
 ## R0 完成
 
@@ -108,3 +108,13 @@
 补充说明：直接在超长开发路径运行包内 self-test 会触发 Windows 传统路径长度限制；从同一最终 ZIP 解压到短路径后完整通过。这不影响启动器运行，但自检建议在短目录执行。
 
 下一步：R7 执行凭据扫描、更新 README/Release 说明与交付报告，再推送分支、标签和正式 Release。
+
+## R7 完成
+
+做了什么：完成仓库与最终包凭据扫描；更新 README、v0.1.5 Release 说明和发布报告；推送 `codex/csa-v0.1.5-model-roles` 分支，创建并推送 `v0.1.5` 标签，发布非草稿、非预发布的 GitHub Release。
+
+证据在哪里：仓库 120 个文本文件与包内 64 个文本文件对 Telegram/OpenAI/Anthropic/GitHub/Bearer 凭据模式均为 0 命中；Release 为 `https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.5`；GitHub 反查 ZIP 为 `90,677,168` 字节，SHA 文件为 `137` 字节。
+
+待人工清单：`verify-proxy.ps1` 增加 aggregate-only 识别；目标电脑复验视觉订阅图片请求和旧版并排升级；确认六份本地 `CSA_T8*20260809.md` 草案应保留、合并还是删除。这些事项未混入本次 tag 和 Release。
+
+下一步：人工按 `docs/reports/CSA_v015_release_report_20260810.md` 第一段执行两项 10 分钟内复验。
