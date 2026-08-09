@@ -10,6 +10,8 @@ import {
 } from "./runtimeUpdate";
 import "./App.css";
 
+const APP_VERSION = "V0.1.5";
+
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
 
 interface SystemStatus {
@@ -1083,7 +1085,10 @@ function App() {
       <header className="topbar">
         <div className="brand-mark">CSA</div>
         <div>
-          <h1>CSA - Claude Science Assistant</h1>
+          <div className="brand-title-row">
+            <h1>CSA - Claude Science Assistant</h1>
+            <span className="app-version" aria-label={`启动器版本 ${APP_VERSION}`}>{APP_VERSION}</span>
+          </div>
           <p>三模型聚合，一个安全启动入口</p>
         </div>
         <button className="quiet-button" onClick={refresh} disabled={busy}>刷新状态</button>
@@ -1097,7 +1102,7 @@ function App() {
           <p>{summary.detail}</p>
         </div>
         <button className="primary-button" onClick={primaryAction} disabled={busy || status.state === "loading"}>
-          {busy ? "正在处理…" : primaryLabel}
+          {busy ? (accessMode === "aggregate" ? "正在验证三个模型…" : "正在处理…") : primaryLabel}
         </button>
       </section>
 
@@ -1423,7 +1428,7 @@ function App() {
                 onClick={() => void confirmPendingAggregateScheme()}
                 disabled={busy || status.restartBlocked || roleMappingsDirty || !pendingSchemeComplete || pendingSchemeId === activeAggregateSchemeId}
               >
-                {busy ? "切换中…" : "确认切换"}
+                {busy ? "正在验证线路…" : "确认切换"}
               </button>
             </div>
           </div>

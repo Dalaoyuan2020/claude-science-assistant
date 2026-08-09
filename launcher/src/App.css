@@ -14,7 +14,9 @@ button, input, textarea { font: inherit; }
 .app-shell { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: 30px 0 24px; }
 .topbar { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }
 .brand-mark { width: 46px; height: 46px; border-radius: 14px; display: grid; place-items: center; color: white; background: #173e2c; font-weight: 800; letter-spacing: -1px; box-shadow: 0 10px 24px #173e2c29; }
+.brand-title-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .topbar h1 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+.app-version { flex: 0 0 auto; border: 1px solid #b9c9be; border-radius: 7px; padding: 3px 7px; color: #28523a; background: #f7faf7; font-size: 11px; font-weight: 800; letter-spacing: 0; }
 .topbar p { margin: 2px 0 0; color: #6f7c74; font-size: 13px; }
 .quiet-button { margin-left: auto; border: 1px solid #d4dbd5; background: #ffffffa8; color: #4c5c52; border-radius: 10px; padding: 8px 13px; cursor: pointer; }
 

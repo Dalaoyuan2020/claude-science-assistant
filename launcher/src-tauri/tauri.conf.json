@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "CSA - Claude Science Assistant",
+        "title": "CSA V0.1.5 - Claude Science Assistant",
         "width": 1040,
         "height": 820,
         "minWidth": 760,
