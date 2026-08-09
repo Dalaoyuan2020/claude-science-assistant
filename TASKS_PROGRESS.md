@@ -28,12 +28,65 @@
 
 下一步：运行代理回归、构建最终 debug exe、校验时间戳和 Bridge 来源，然后关闭旧实例并启动新版。
 
-## T7-3 进行中
+## T7-3 验收停止
 
-做了什么：前端、Rust、代理测试全部通过；debug exe 已生成，构建时间 `2026-08-09 21:47:18`，晚于最新源码 `2026-08-09 21:46:45`。
+做了什么：旧实例已退出，新 debug 启动器 PID `190080` 已运行；Bridge 来源与 API Key 预选确认链路完成真实验收。连续预选 `OpenCode Go`、`MiniMax`、`LongCat` 时 Bridge PID 与 revision 均不变；只点一次“确认切换”后，Bridge 仅从 PID `4045196` 变为 `4046269`，revision 仅更新一次，实际后端请求记录为 `custom / LongCat-2.0 / success`。
 
-证据在哪：`npm run build`；Rust 52+9 passed；53 translation tests passed；proxy verification passed；`docs/reports/CSA_T7_merge_status_20260809.md`。
+证据在哪：`/health.source_path` 为 `/mnt/c/Users/Admin/Documents/New project 5/csa-v0.1.5-model-roles/proxy.py`；切换前 revision `190640-1786281097675014600`，切换后 revision `190080-1786288134669273000`；截图 `C:\Users\Admin\AppData\Local\Temp\csa-t7-api-pending.png`、`C:\Users\Admin\AppData\Local\Temp\csa-t7-after-api.png`。
 
-当前阻塞：旧启动器 PID `190640` 以更高权限运行，普通关闭只进入托盘，`Stop-Process` 与 `taskkill` 两次均被 Windows 拒绝。按纪律停止强杀，没有启动第二份。
+当前阻塞：API 切到 `LongCat` 后，聚合页的方案一被自动变成三个 `LongCat`，并显示“方案一有未应用修改”。此状态阻止预选方案二，“确认切换”也不可用，因此无法完成方案一/方案二的零重启与单次重启验收。按“任一项不通过即停止、不瞎改”的要求，T7-3 保持未完成。
 
-下一步：人工从旧启动器托盘“退出”或管理员任务管理器结束 PID `190640`，随后启动新版并确认 Bridge source 与合并界面。
+下一步：单独定位 API 激活为何会改写聚合方案草稿；修复后从“API 切换完成后进入聚合页”这一现场重新执行方案预选与确认验收。
+
+---
+
+# CSA v0.1.5 Release R0-R7
+
+- [x] R0 确认场地 + 建台账
+- [ ] R1 发布前复盘检测（待人工：`verify-proxy.ps1` 不识别 aggregate-only 配置）
+- [x] R2 最小加固：预检进程 20 秒超时
+- [ ] R3 加固后回归（待人工：同 R1 的 aggregate-only 验证脚本兼容问题）
+- [x] R4 整理提交
+- [ ] R5 打包 release 便携版
+- [ ] R6 发布包上检测
+- [ ] R7 GitHub、页面与交付报告
+
+## R0 完成
+
+做了什么：确认工作副本为 `csa-v0.1.5-model-roles`，当前分支为 `codex/csa-v0.1.5-model-roles`，远端为 `Dalaoyuan2020/claude-science-assistant`；建立 R0-R7 发布清单。
+
+证据在哪：`git rev-parse --show-toplevel`、`git branch --show-current`、`git remote get-url origin`；开工时 `git status --porcelain` 为 22 项。
+
+下一步：执行 R1 源码构建、Rust/代理回归和命令行聚合切换实测。
+
+## R1 完成（1 项待人工）
+
+做了什么：`npm run build` 成功（34 modules）；`cargo test` 为 52 个库测试 + 9 个集成测试通过、0 failed、3 ignored；`self-test.ps1` 为 53 translation tests passed。命令行实测 scheme-2 → scheme-1 用时 `54.8448143s`，scheme-1 → scheme-2 用时 `48.9163934s`，两次真实请求均成功。
+
+证据在哪：两次健康结果均为 `aggregate_upstreams=3`；scheme-1 revision `193616-1786294510604921800`，scheme-2 revision `193616-1786294560557634000`；两次请求均 `responseIdPresent=true`，最近路由均记录 `custom / MiniMax-M3 / success`。`verify-proxy.ps1` 失败原因为它只检查单后端 `custom/deepseek/openai_configured`，当前合法聚合状态为三者 false、`aggregate_upstreams=3`，任务书禁止修改该脚本，标待人工。
+
+下一步：R2 只给 `test_api_key_impl` 的 PowerShell 进程增加 20 秒外层超时，不改 45 秒请求超时、Bridge-only 或预检调用。
+
+## R2 完成
+
+做了什么：新增可通过 stdin 传递敏感输入的 `run_powershell_with_stdin_timeout`，仅将 `test_api_key_impl` 的执行改为外层 `20s` 硬超时；超时会终止子进程并返回“API Key 预检在 20 秒内没有响应”。
+
+证据在哪：`launcher/src-tauri/src/lib.rs`；脚本内两处 `Invoke-RestMethod -TimeoutSec 45` 保持不变，`CSA_BRIDGE_ONLY=1` 和两条切换路径上的预检调用保持不变；`cargo build --jobs 1` 通过，耗时 `18.09s`。
+
+下一步：执行 R3，完整重跑前端、Rust、self-test 和 verify-proxy。
+
+## R3 完成（1 项待人工）
+
+做了什么：加固后重跑 `npm run build`、完整 `cargo test`、`self-test.ps1`、`verify-proxy.ps1`。前三项结果与 R1 一致，没有 R2 引入的退化。
+
+证据在哪：前端 34 modules；Rust 52 + 9 passed、0 failed、3 ignored；self-test 为 53 translation tests passed。`verify-proxy.ps1` 仍在 health 第一步因只识别单后端配置而失败，与 R1 完全相同。
+
+下一步：R4 分类当前改动，排除本机产物和临时文件，整理 v0.1.5 发布提交。
+
+## R4 完成
+
+做了什么：将聚合功能、20 秒预检超时和启动器版本标识拆成三个英文提交；新增 `launcher/src-tauri/target-*/` 忽略规则，排除本机构建目录。
+
+证据在哪：提交 `037968d feat: add aggregate subscription schemes`、`8a4067b fix: bound API key preflight execution`、`f5edf38 feat: display the v0.1.5 launcher version`。
+
+下一步：R5 使用现成脚本制作 `release-v0.1.5-publish-20260810`。六份 `CSA_T8*20260809.md` 草案与本轮发布任务冲突且归属无法确认，保留为未跟踪文件并标待人工，不进入提交。
