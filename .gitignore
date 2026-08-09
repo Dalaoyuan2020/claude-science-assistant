@@ -31,6 +31,7 @@ dist/
 launcher/dist/
 launcher/src-tauri/target/
 launcher/src-tauri/target-validation/
+launcher/src-tauri/target-*/
 
 # Local captured/bundled third-party runtime binaries.
 # Keep these out of the source repo; publish portable ZIPs as GitHub Release assets instead.

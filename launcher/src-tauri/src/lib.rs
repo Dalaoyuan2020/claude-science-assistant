@@ -1534,6 +1534,83 @@ fn run_powershell_with_stdin(script: &str, input: &str) -> Result<String, String
     Ok(decode_console_output(&output.stdout).trim().to_string())
 }
 
+fn run_powershell_with_stdin_timeout(
+    script: &str,
+    input: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    let script = format!(
+        "$utf8=New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $OutputEncoding=$utf8; {script}"
+    );
+    let mut child = background_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{label}启动失败：{error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{label}无法打开标准输入"))?;
+    stdin
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("{label}无法写入标准输入：{error}"))?;
+    drop(stdin);
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}无法读取标准输出"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}无法读取错误输出"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "{label}在 {} 秒内没有响应，已停止本次操作。",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("{label}状态读取失败：{error}"));
+            }
+        }
+    };
+    let output = Output {
+        status,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
+    };
+    if !output.status.success() {
+        return Err(format!("{label}失败：{}", command_error_text(&output)));
+    }
+    Ok(decode_console_output(&output.stdout).trim().to_string())
+}
+
 fn protect_api_key(api_key: &str) -> Result<String, String> {
     if api_key.is_empty() {
         return Ok(String::new());
@@ -2917,7 +2994,8 @@ Emit $false "" "" $models ("模型列表可访问，但没有找到可完成对�
 "#;
     let input = serde_json::to_string(&payload)
         .map_err(|error| format!("无法准备 API Key 测试请求：{error}"))?;
-    let output = run_powershell_with_stdin(script, &input)?;
+    let output =
+        run_powershell_with_stdin_timeout(script, &input, Duration::from_secs(20), "API Key 预检")?;
     let output = redact_secret_text(&output, clean_key);
     let mut result: ApiKeyTestResult = serde_json::from_str(&output)
         .map_err(|error| format!("API Key 测试结果解析失败：{error}; {output}"))?;
@@ -3509,8 +3587,7 @@ fn aggregate_runtime_routes(
             model.clone(),
             "Reply only: SWITCH_READY".into(),
         )?;
-        require_successful_preflight(preflight)
-            .map_err(|error| format!("{role} 路由{error}"))?;
+        require_successful_preflight(preflight).map_err(|error| format!("{role} 路由{error}"))?;
         eprintln!("[CSA switch] aggregate preflight passed: role={role}");
         runtime_routes.push(AggregateRuntimeRoute {
             role: role.to_string(),
@@ -4882,7 +4959,10 @@ mod tests {
             "activation failed; starting rollback",
             "transition complete",
         ] {
-            assert!(source.contains(marker), "missing switch log marker: {marker}");
+            assert!(
+                source.contains(marker),
+                "missing switch log marker: {marker}"
+            );
         }
     }
 
