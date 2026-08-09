@@ -2314,12 +2314,6 @@ fn restart_bridge_after_config(
         .distro
         .as_deref()
         .ok_or_else(|| "Bridge 配置已写入，但没有可用于生效配置的 WSL 发行版".to_string())?;
-    let activation = if status.bridge_running {
-        "restart"
-    } else {
-        "start"
-    };
-    eprintln!("[CSA] Bridge config activation: action={activation}, distro={distro}");
     let project_wsl = project_root()
         .ok()
         .and_then(|root| windows_path_to_wsl(distro, &root))
@@ -2328,6 +2322,12 @@ fn restart_bridge_after_config(
         "{}/scripts/start-claude-science-wsl.sh",
         project_wsl.trim_end_matches('/')
     );
+    let action = if status.bridge_running {
+        "restart"
+    } else {
+        "start"
+    };
+    eprintln!("[CSA switch] applying Bridge config: action={action}, distro={distro}");
     let restart_output = run_wsl_with_timeout(
         distro,
         &[
@@ -2341,10 +2341,26 @@ fn restart_bridge_after_config(
         Duration::from_secs(45),
     )?;
     if !restart_output.status.success() {
+        eprintln!(
+            "[CSA switch] Bridge {action} failed: {}",
+            command_error_text(&restart_output)
+        );
         return Err(format!(
             "Bridge 配置已写入，但重启失败：{}",
             command_error_text(&restart_output)
         ));
+    }
+    let restart_trace = clean_diagnostic_text(&format!(
+        "{}\n{}",
+        output_text(&restart_output),
+        decode_console_output(&restart_output.stderr)
+    ));
+    for line in restart_trace.lines().filter(|line| {
+        line.contains("Stopping stale CSA Bridge listener")
+            || line.contains("proxy process started (PID")
+            || line.contains("Bridge-only restart complete")
+    }) {
+        eprintln!("[CSA switch] {line}");
     }
     if let Some(expected_revision) = expected_revision {
         let health_output = run_wsl(
@@ -2369,9 +2385,15 @@ fn restart_bridge_after_config(
             .get("source_path")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if actual_revision != expected_revision || source_path.is_empty() {
+        let expected_source = format!("{}/proxy.py", project_wsl.trim_end_matches('/'));
+        if actual_revision != expected_revision
+            || source_path.replace('\\', "/") != expected_source.replace('\\', "/")
+        {
             return Err("Bridge 已响应，但仍未加载刚保存的配置或不是当前 CSA 实例".into());
         }
+        eprintln!(
+            "[CSA switch] Bridge health verified: revision={expected_revision}, source=current"
+        );
     }
     Ok(())
 }
@@ -2441,7 +2463,9 @@ fn apply_bridge_config_patch_value(
         .as_object_mut()
         .ok_or_else(|| "Bridge 配置补丁格式无效".to_string())?;
     object.insert("_csa_revision".into(), revision.clone().into());
+    eprintln!("[CSA switch] writing Bridge config: revision={revision}");
     let rollback = write_bridge_config_patch(distro, &patch)?;
+    eprintln!("[CSA switch] Bridge config written: revision={revision}");
     match restart_bridge_after_config(&status, Some(&revision)) {
         Ok(()) => Ok(AppliedBridgeConfig {
             distro: distro.to_string(),
@@ -2449,12 +2473,17 @@ fn apply_bridge_config_patch_value(
             previous_status: status,
         }),
         Err(error) => {
+            eprintln!("[CSA switch] activation failed; starting rollback: {error}");
             let rollback_message = match restore_bridge_config(distro, &rollback) {
                 Ok(()) => {
                     let _ = restart_bridge_after_config(&status, None);
+                    eprintln!("[CSA switch] Bridge rollback completed");
                     "已回滚 Bridge 配置".to_string()
                 }
-                Err(rollback_error) => format!("回滚失败：{rollback_error}"),
+                Err(rollback_error) => {
+                    eprintln!("[CSA switch] Bridge rollback failed: {rollback_error}");
+                    format!("回滚失败：{rollback_error}")
+                }
             };
             Err(format!("{error}；{rollback_message}"))
         }
@@ -2515,6 +2544,18 @@ fn redact_secret_text(text: &str, secret: &str) -> String {
         return text.to_string();
     }
     text.replace(secret, "[redacted-api-key]")
+}
+
+fn require_successful_preflight(result: ApiKeyTestResult) -> Result<(), String> {
+    if result.ok {
+        return Ok(());
+    }
+    let message = result.message.trim();
+    Err(if message.is_empty() {
+        "切换前连通性检查失败，请检查 Base URL、API Key 和模型".into()
+    } else {
+        format!("切换前连通性检查失败：{message}")
+    })
 }
 
 fn test_api_key_impl(
@@ -3019,6 +3060,7 @@ fn commit_launcher_settings_with_bridge(
     settings: &LauncherSettings,
     patch: Option<serde_json::Value>,
 ) -> Result<(), String> {
+    eprintln!("[CSA switch] received configuration transition request");
     let _transition = bridge_config_transition_lock()
         .lock()
         .map_err(|_| "Bridge 配置切换锁异常，请重新启动 CSA 后再试".to_string())?;
@@ -3041,6 +3083,7 @@ fn commit_launcher_settings_with_bridge(
             "Windows 启动器配置提交失败：{settings_error}；{rollback_message}"
         ));
     }
+    eprintln!("[CSA switch] Windows settings committed; transition complete");
     Ok(())
 }
 
@@ -3191,6 +3234,22 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
         return Err("这条旧配置没有可切换的加密 Key，请重新添加该 API Key".into());
     }
     let api_key = unprotect_api_key(&entry.encrypted_api_key)?;
+    if entry.provider_id != "claude" {
+        eprintln!(
+            "[CSA switch] preflight started: provider={}, model={}",
+            entry.provider_id, entry.model
+        );
+        let preflight = test_api_key_impl(
+            entry.provider_id.clone(),
+            api_key.clone(),
+            entry.base_url.clone(),
+            entry.custom_confirmed,
+            entry.model.clone(),
+            "Reply only: SWITCH_READY".into(),
+        )?;
+        require_successful_preflight(preflight)?;
+        eprintln!("[CSA switch] preflight passed");
+    }
     settings.selected_provider_id = entry.provider_id.clone();
     settings.custom_base_url = entry.base_url.clone();
     settings.custom_confirmed = entry.custom_confirmed;
@@ -4602,6 +4661,112 @@ mod tests {
         assert!(valid_release_sha8(&status.stable.sha8));
         assert!(!status.latest.version.is_empty());
         assert!(!status.stable.version.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn live_bridge_json(path: &str) -> Result<serde_json::Value, String> {
+        let mut command = background_command("curl.exe");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "10",
+            &format!("http://127.0.0.1:9876{path}"),
+        ]);
+        let output =
+            command_output_with_timeout(command, Duration::from_secs(12), "读取本地 Bridge 诊断")?;
+        if !output.status.success() {
+            return Err(command_error_text(&output));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("本地 Bridge 诊断响应无法解析：{error}"))
+    }
+
+    #[cfg(windows)]
+    fn live_bridge_request() -> Result<serde_json::Value, String> {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 48,
+            "messages": [{"role": "user", "content": "Reply only: SWITCH_OK"}]
+        })
+        .to_string();
+        let mut command = background_command("curl.exe");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "90",
+            "-H",
+            "content-type: application/json",
+            "-X",
+            "POST",
+            "--data-binary",
+            &body,
+            "http://127.0.0.1:9876/v1/messages",
+        ]);
+        let output = command_output_with_timeout(
+            command,
+            Duration::from_secs(95),
+            "发送本地 Bridge 切换验证请求",
+        )?;
+        if !output.status.success() {
+            return Err(command_error_text(&output));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Bridge 切换验证响应无法解析：{error}"))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "mutates the current API Key; caller must back up and restore settings"]
+    fn live_api_key_switch_diagnostic() {
+        let target_id = std::env::var("CSA_LIVE_SWITCH_API_KEY_ID")
+            .expect("set CSA_LIVE_SWITCH_API_KEY_ID to a saved API Key id");
+        let target = load_settings()
+            .api_keys
+            .iter()
+            .find(|entry| entry.id == target_id)
+            .cloned()
+            .expect("target API Key should exist");
+        let before_revision = live_bridge_json("/health")
+            .ok()
+            .and_then(|value| value.get("config_revision").cloned());
+        let switched = activate_api_key_impl(target_id);
+        let health = live_bridge_json("/health").expect("Bridge health should remain available");
+        let request = live_bridge_request();
+        let after_revision = health.get("config_revision").cloned();
+        println!(
+            "CSA_SWITCH_EVIDENCE={}",
+            serde_json::json!({
+                "targetProvider": target.provider_id,
+                "targetModel": target.model,
+                "switchOk": switched.is_ok(),
+                "switchError": switched.as_ref().err(),
+                "revisionChanged": before_revision != after_revision,
+                "forceModel": health.get("force_model"),
+                "realRequestOk": request.is_ok(),
+                "realRequestError": request.as_ref().err(),
+            })
+        );
+        assert!(switched.is_ok(), "API Key switch should succeed");
+        assert!(
+            before_revision != after_revision,
+            "Bridge revision should change"
+        );
+        assert_eq!(
+            health.get("force_model"),
+            Some(&serde_json::json!(target.model))
+        );
+        assert!(
+            request.is_ok(),
+            "real request should use the switched profile"
+        );
     }
 
     #[test]
