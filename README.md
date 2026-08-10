@@ -10,20 +10,31 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 
 ## 当前版本
 
-CSA 目前提供两条清晰的版本线。普通用户可以选择稳定核心版；需要远程连接和沙盒外 Agent 的用户可以选择功能完整版。
+CSA 目前提供两条清晰的版本线。普通用户可以选择稳定聚合版；需要远程连接和沙盒外 Agent 的用户可以选择功能完整版。
 
 | 版本 | 适合谁 | 主要能力 | 下载 |
 | --- | --- | --- | --- |
-| **v0.1.4 稳定核心版** | 优先考虑启动、API Key 与运行时稳定性 | 基于 v0.1.3-r2，内置已验证的 Claude Science 0.1.25；修复 API Key 切换；增加官方版本检查和安全升级/回退 Prompt | [Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.4) · [ZIP](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.4/claude-science-assistant-v0.1.4-release-portable.zip) · [SHA-256](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.4/claude-science-assistant-v0.1.4-release-portable.zip.sha256) |
-| **v0.2.0 功能完整版** | 需要 Telegram/飞书、Connect 与 Subagent | 在启动器与 Bridge 基础上增加本地消息网关、浏览器连接器、图片回传和外部 Agent 协作 | [Latest Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.2.0) |
+| **v0.1.5 稳定聚合版** | 需要可靠启动、API Key 与三模型聚合 | 内置 Claude Science 0.1.25；把决策、视觉、日常分别绑定到订阅与模型；方案一/方案二整套切换；修复切换假成功与长期“正在处理” | [Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.5) · [ZIP](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.5/claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip) · [SHA-256](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/download/v0.1.5/claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip.sha256) |
+| **v0.2.0 功能完整版** | 需要 Telegram/飞书、Connect 与 Subagent | 在启动器与 Bridge 基础上增加本地消息网关、浏览器连接器、图片回传和外部 Agent 协作 | [Release](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.2.0) |
 
-### v0.1.4 更新了什么
+### v0.1.5 更新了什么
 
-- **Claude Science 运行时升级**：锁定并校验官方 Linux x64 `0.1.25`，受管实例关闭未验证的后台自动更新。
-- **API Key 切换修复**：切换 Key 时只事务化重启 Bridge，不再停止 Claude Science daemon 或打断当前会话；失败会回滚两侧配置。
-- **版本检查**：读取 Claude Science 官方 `latest` / `stable` 索引，并区分“官方最新”与“CSA 已验证推荐版”。
-- **安全升级与回退**：启动器生成交给本地 Codex 的升级/回退 Prompt，先做哈希校验、SQLite 备份和隔离验证，不静默替换真实运行时。
-- **发布验证**：Rust、Bridge、真实代理链路、便携包结构和 GitHub 回下载 SHA-256 均已通过。
+- **三模型聚合**：决策（Opus）、视觉（Sonnet）和日常（Haiku / Fast）可以分别使用不同订阅与模型，并作为一张路由表同时生效。
+- **两套聚合方案**：方案一和方案二各自保存三条完整映射，预选不会改运行状态，点击“确认切换”后才执行一次事务化切换。
+- **API Key 切换加固**：消除 Bridge 未运行时静默返回成功的路径；切换后核对 `source_path`、配置 revision 与真实上游请求，失败会显示原因并回滚。
+- **模型列表与手动映射**：添加供应商时可以获取真实模型列表；自动建议之后，仍可手动选择决策、视觉和日常模型。
+- **交互收纳**：API 接入区可折叠，API Key 列表最多显示五条，更多订阅在列表内部滚动。
+- **发布验证**：Rust 52 个库测试与 9 个集成测试通过，包内 53 个 Bridge 测试通过，两套方案完成真实切换验收。
+
+#### v0.1.5 三模型对应关系
+
+| Claude Science 模型槽 | CSA 角色 | 推荐用途 |
+| --- | --- | --- |
+| Opus | 决策（default） | 深度思考、复杂科研决策 |
+| Sonnet | 视觉（vision） | 图片、图表与多模态任务 |
+| Haiku / Fast | 日常（fast） | 普通问答与低延迟任务 |
+
+先在 `API 接入` 中保存订阅，再到 `聚合模式` 为三行分别选择订阅和模型。配置完成后点击“保存并应用整套方案”；以后在方案一和方案二之间切换时，先预选，再点击一次“确认切换”。
 
 ## v0.2.0 新功能
 
@@ -37,7 +48,7 @@ v0.2.0 新增两条本地优先链路：Connect 可把本人 Telegram/飞书私�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.4 已在 Windows 11 10.0.22631 + Ubuntu-24.04 完成运行时升级、Bridge/API Key 切换、真实代理链路和发布包复测；其他差异环境仍建议先运行只读体检。
+> 验证边界：v0.1.5 已在 Windows 11 + Ubuntu-24.04 完成 Bridge/API Key、两套三模型聚合方案、真实代理链路和发布包复测；视觉订阅图片请求与其他差异环境仍建议在目标电脑复验。
 
 [下载最新版](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/latest) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
@@ -55,7 +66,7 @@ CSA 把这些步骤收口成一个桌面应用：
 - 一个启动器，跑通 Windows 科研链路：体检电脑、安装/修复 WSL 运行时、启动 Claude Science 和本地 Bridge。
 - 告别反复手改配置：API Key 通过模板添加，官方直连、聚合平台、第三方中转和自定义 Base URL 都在同一个入口管理。
 - 先测试，再启用：保存前可测试 API Key 连通性，必要时读取 `/models` 自动生成 Claude 角色到上游模型的映射。
-- 当前只激活一条 Key：已保存 Key 按添加顺序展示，首页聚焦“现在用什么、能不能启动、哪里出问题”。
+- 两种接入模式：API 接入一次激活一条订阅；聚合模式把决策、视觉、日常三条路由作为一个事务同时应用。
 - 默认保护隐私：API Key 使用 Windows 当前用户 DPAPI 加密，界面、日志、诊断包和发布包不应回显明文 Key。
 - 面向新手，也保留工程入口：新手双击 BAT 和启动器即可开始；熟悉命令行的用户仍可使用 PowerShell 脚本和诊断报告。
 - 本地双向 Connect：Telegram 私聊通过 WSL Gateway 和浏览器连接器进入真实 Claude Science 会话，完成回复由 Bridge 旁路回送；当前开发基线也支持把 Claude Science 明确生成的 artifact 图片安全回传 Telegram。MCP/Skill 与工作区文件保留为降级路线，不开放公网端口，也不接受远程 shell。
@@ -190,10 +201,10 @@ Claude Science 侧通常会请求类似 `claude-sonnet-*`、`claude-opus-*`、`c
 
 ### 1. 下载
 
-只从 GitHub Releases 下载官方包。优先稳定核心能力请选择 v0.1.4；需要 Connect 与 Subagent 请选择 v0.2.0：
+只从 GitHub Releases 下载官方包。优先稳定聚合能力请选择 v0.1.5；需要 Connect 与 Subagent 请选择 v0.2.0：
 
-- `claude-science-assistant-v0.1.4-release-portable.zip`
-- `claude-science-assistant-v0.1.4-release-portable.zip.sha256`
+- `claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip`
+- `claude-science-assistant-v0.1.5-publish-20260810-release-portable.zip.sha256`
 
 - `claude-science-assistant-v0.2.0-release-portable.zip`
 - `claude-science-assistant-v0.2.0-release-portable.zip.sha256`
@@ -372,6 +383,9 @@ Ubuntu-24.04 是默认推荐测试路径，便于复现问题；但启动器不�
 | [docs/v0.2-new-features-acceptance.zh-CN.md](docs/v0.2-new-features-acceptance.zh-CN.md) | Connect 与 Subagent 验收矩阵 |
 | [docs/v0.2-technology-and-release-review.zh-CN.md](docs/v0.2-technology-and-release-review.zh-CN.md) | v0.2 技术实现、安全边界与发布审查 |
 | [docs/v0.2-install-upgrade-release-guide.zh-CN.md](docs/v0.2-install-upgrade-release-guide.zh-CN.md) | 新装、并排升级、回退和发布流程 |
+| [docs/github-release-v0.1.5.md](docs/github-release-v0.1.5.md) | v0.1.5 GitHub Release 文案与安装说明 |
+| [docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md](docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md) | 三模型聚合、方案切换与可靠性实现 |
+| [docs/reports/CSA_v015_release_report_20260810.md](docs/reports/CSA_v015_release_report_20260810.md) | v0.1.5 构建、测试、包检与发布证据 |
 | [docs/github-release-v0.1.3.md](docs/github-release-v0.1.3.md) | v0.1.3 GitHub Release 文案 |
 | [docs/v0.1.3-update-record.zh-CN.md](docs/v0.1.3-update-record.zh-CN.md) | v0.1.3 相对 v0.1.2 的完整更新记录 |
 | [docs/retrospectives/2026-07-12-csa-v0.1.3-release-retrospective.zh-CN.md](docs/retrospectives/2026-07-12-csa-v0.1.3-release-retrospective.zh-CN.md) | v0.1.3 当日开发、验收与发布复盘，可作为文章素材 |
