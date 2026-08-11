@@ -3973,14 +3973,15 @@ async fn start_services() -> Result<SystemStatus, String> {
     run_blocking(start_services_impl).await
 }
 
-fn stop_services_raw(distro: &str) -> Result<(), String> {
-    let script = r#"
+const STOP_SERVICES_SHELL: &str = "bash";
+const STOP_SERVICES_SCRIPT: &str = r#"
 systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
 claude_pids="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}')"
 for pid in $claude_pids; do
   kill "$pid" 2>/dev/null || true
 done
-for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
   if [ -r "/proc/$pid/cmdline" ]; then
     cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
     case "$cmd" in *"/proxy.py"*) kill "$pid" 2>/dev/null || true;; esac
@@ -4015,7 +4016,13 @@ done
 echo "CSA services did not stop within 5 seconds." >&2
 exit 1
 "#;
-    let output = run_wsl_with_timeout(distro, &["sh", "-lc", script], Duration::from_secs(10))?;
+
+fn stop_services_raw(distro: &str) -> Result<(), String> {
+    let output = run_wsl_with_timeout(
+        distro,
+        &[STOP_SERVICES_SHELL, "-lc", STOP_SERVICES_SCRIPT],
+        Duration::from_secs(10),
+    )?;
     if !output.status.success() {
         return Err(format!("停止服务失败：{}", command_error_text(&output)));
     }
@@ -5441,5 +5448,12 @@ mod tests {
         );
         assert!(run_result.is_ok(), "role switch diagnostic failed");
         assert!(restore_result.is_ok(), "original settings restore failed");
+    }
+
+    #[test]
+    fn stop_services_uses_bash_and_rejects_empty_listener_pids() {
+        assert_eq!(STOP_SERVICES_SHELL, "bash");
+        assert!(STOP_SERVICES_SCRIPT.contains("grep -oE 'pid=[0-9]+'"));
+        assert!(STOP_SERVICES_SCRIPT.contains("case \"$pid\" in ''|*[!0-9]*) continue"));
     }
 }
