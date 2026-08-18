@@ -22,36 +22,56 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROXY_PORT="${PROXY_PORT:-9876}"
 CLAUDE_SCIENCE_PORT="${CLAUDE_SCIENCE_PORT:-8765}"
-STATE_DIR="$HOME/.local/share/claude-science-api-bridge"
-BUNDLED_CLAUDE_DIR="$PROJECT_DIR/vendor/claude-science/linux-x64"
-BUNDLED_CLAUDE_BIN="$BUNDLED_CLAUDE_DIR/claude-science"
-BUNDLED_CLAUDE_SHA="$BUNDLED_CLAUDE_DIR/claude-science.sha256"
-MANAGED_CLAUDE_DIR="$STATE_DIR/bin"
-MANAGED_CLAUDE_BIN="$MANAGED_CLAUDE_DIR/claude-science"
-PATCH_DIR="${PATCH_DIR:-$HOME/.local/share/claude-science-api-bridge/patched}"
-PATCHED_BIN="${PATCHED_BIN:-$PATCH_DIR/claude-science}"
+CSA_PACKAGE_VERSION="${CSA_PACKAGE_VERSION:-unknown}"
+LEGACY_STATE_DIR="$HOME/.local/share/claude-science-api-bridge"
+RUNTIME_LAYOUT_SCRIPT="$PROJECT_DIR/scripts/csa-runtime-layout.sh"
+if [ ! -f "$RUNTIME_LAYOUT_SCRIPT" ]; then
+  echo "CSA runtime layout helper is missing: $RUNTIME_LAYOUT_SCRIPT" >&2
+  exit 2
+fi
+# shellcheck source=csa-runtime-layout.sh
+source "$RUNTIME_LAYOUT_SCRIPT"
+BRIDGE_PROXY="$CSA_BRIDGE_ROOT/current/proxy.py"
+BRIDGE_STATIC="$CSA_BRIDGE_ROOT/current/static"
+PATCH_DIR_OVERRIDE="${PATCH_DIR:-}"
 LOG_DIR="$HOME/.claude-science/logs"
 LOG_FILE="$LOG_DIR/wsl-proxy.log"
 
-if [ -x "$HOME/.local/share/claude-science-api-bridge/venv/bin/python" ]; then
-  PYTHON_BIN="${PYTHON:-$HOME/.local/share/claude-science-api-bridge/venv/bin/python}"
+if [ -x "$LEGACY_STATE_DIR/venv/bin/python" ]; then
+  PYTHON_BIN="${PYTHON:-$LEGACY_STATE_DIR/venv/bin/python}"
 else
   PYTHON_BIN="${PYTHON:-python3}"
 fi
 
 check_bridge_health() {
   local payload
-  payload="$(curl -fsS --connect-timeout 0.4 --max-time 1 "http://127.0.0.1:$PROXY_PORT/health" 2>/dev/null)" || return 1
+  payload="$(curl --noproxy '*' -fsS --connect-timeout 0.4 --max-time 1 "http://127.0.0.1:$PROXY_PORT/health" 2>/dev/null)" || return 1
   "$PYTHON_BIN" -c '
 import json, os, sys
 try:
-    health = json.loads(sys.argv[2])
+    health = json.loads(sys.argv[5])
 except Exception:
     raise SystemExit(1)
 expected = os.path.realpath(sys.argv[1])
 actual = os.path.realpath(str(health.get("source_path") or ""))
-raise SystemExit(0 if health.get("status") == "ok" and actual == expected else 1)
-' "$PROJECT_DIR/proxy.py" "$payload" >/dev/null 2>&1
+identity = health.get("runtime_identity") or {}
+valid = (
+    health.get("status") == "ok"
+    and actual == expected
+    and identity.get("schemaVersion") == 1
+    and identity.get("component") == "bridge"
+    and identity.get("managed") is True
+    and identity.get("runtimeId") == sys.argv[2]
+    and identity.get("version") == sys.argv[3]
+    and identity.get("buildId") == sys.argv[4][:16].lower()
+    and str(identity.get("sourceSha256") or "").lower() == sys.argv[4].lower()
+    and isinstance(identity.get("pid"), int)
+    and identity.get("pid") > 0
+    and "health" in (identity.get("capabilities") or [])
+    and os.path.realpath(str(identity.get("sourcePath") or "")) == expected
+)
+raise SystemExit(0 if valid else 1)
+' "$BRIDGE_PROXY" "$CSA_BRIDGE_RUNTIME_ID" "$CSA_BRIDGE_VERSION" "$CSA_BRIDGE_SOURCE_SHA256" "$payload" >/dev/null 2>&1
 }
 
 wait_bridge_health() {
@@ -76,6 +96,62 @@ bridge_listener_pids() {
     | grep -o 'pid=[0-9]*' \
     | cut -d= -f2 \
     | sort -u
+}
+
+claude_listener_pids() {
+  for port in "$CLAUDE_SCIENCE_PORT" 8766; do
+    ss -ltnp "sport = :$port" 2>/dev/null \
+      | grep -o 'pid=[0-9]*' \
+      | cut -d= -f2
+  done | sort -u
+}
+
+running_claude_binary() {
+  local pid executable
+  for pid in $(claude_listener_pids || true); do
+    case "$pid" in ''|*[!0-9]*) continue;; esac
+    executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    case "$executable" in
+      "$CSA_CLAUDE_ROOT"/patched/*/claude-science|"$LEGACY_STATE_DIR"/patched/claude-science)
+        if [ -x "$executable" ]; then
+          printf '%s\n' "$executable"
+          return 0
+        fi
+        ;;
+    esac
+  done
+}
+
+check_claude_health() {
+  local expected_bin="$1" pids pid cmd count=0
+  pids="$(claude_listener_pids || true)"
+  [ -n "$pids" ] || return 1
+  for pid in $pids; do
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmd" == *"$expected_bin serve"* ]] || return 1
+    count=$((count + 1))
+  done
+  [ "$count" = "1" ] || return 1
+  curl --noproxy '*' -sS -o /dev/null --connect-timeout 0.5 --max-time 1 \
+    "http://127.0.0.1:$CLAUDE_SCIENCE_PORT/" 2>/dev/null
+}
+
+wait_claude_health() {
+  local expected_bin="$1"
+  local timeout="${2:-15}"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if check_claude_health "$expected_bin"; then
+      sleep 0.75
+      if check_claude_health "$expected_bin"; then
+        return 0
+      fi
+    fi
+    sleep 0.35
+  done
+  return 1
 }
 
 stop_stale_bridge_listener() {
@@ -130,11 +206,19 @@ rotate_bridge_log() {
   echo "Rotated Bridge log at 50 MB (kept one backup: $LOG_FILE.1)"
 }
 
-service_matches_project() {
-  if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" != "systemd" ]; then
+systemd_runtime_available() {
+  [ "${CSA_DISABLE_SYSTEMD:-0}" != "1" ] \
+    && [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]
+}
+
+service_matches_runtime() {
+  if ! systemd_runtime_available; then
     return 0
   fi
-  systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$PROJECT_DIR/proxy.py" >/dev/null 2>&1
+  local unit
+  unit="$(systemctl --user cat claude-science-bridge.service 2>/dev/null || true)"
+  grep -F -- "$BRIDGE_PROXY" <<<"$unit" >/dev/null 2>&1 \
+    && grep -F -- "CSA_BRIDGE_RUNTIME_ID=$CSA_BRIDGE_RUNTIME_ID" <<<"$unit" >/dev/null 2>&1
 }
 
 start_fallback_proxy() {
@@ -146,7 +230,7 @@ start_fallback_proxy() {
   stop_stale_bridge_listener
   rotate_bridge_log
   local proxy_pid
-  if ! proxy_pid="$("$PYTHON_BIN" - "$PYTHON_BIN" "$PROJECT_DIR/proxy.py" "$PROJECT_DIR" "$LOG_FILE" <<'PY'
+  if ! proxy_pid="$("$PYTHON_BIN" - "$PYTHON_BIN" "$BRIDGE_PROXY" "$CSA_BRIDGE_ROOT/current" "$LOG_FILE" <<'PY'
 import os
 import subprocess
 import sys
@@ -180,7 +264,7 @@ PY
     if [ -r "/proc/$proxy_pid/cmdline" ]; then
       local launched_cmdline
       launched_cmdline="$(tr '\0' ' ' <"/proc/$proxy_pid/cmdline" 2>/dev/null || true)"
-      if [[ "$launched_cmdline" == *"$PROJECT_DIR/proxy.py"* ]]; then
+      if [[ "$launched_cmdline" == *"$BRIDGE_PROXY"* ]]; then
         kill "$proxy_pid" 2>/dev/null || true
       fi
     fi
@@ -190,9 +274,12 @@ PY
 
 start_systemd_proxy() {
   local unit_ready=0
-  if service_matches_project; then
+  if service_matches_runtime; then
     unit_ready=1
-  elif PROXY_PORT="$PROXY_PORT" PYTHON="$PYTHON_BIN" bash "$SCRIPT_DIR/install-wsl-bridge-service.sh" >/dev/null; then
+  elif PROXY_PORT="$PROXY_PORT" PYTHON="$PYTHON_BIN" CSA_STATE_ROOT="$CSA_STATE_ROOT" \
+    CSA_PACKAGE_DIR="$PROJECT_DIR" CSA_BRIDGE_RUNTIME_ID="$CSA_BRIDGE_RUNTIME_ID" \
+    CSA_BRIDGE_VERSION="$CSA_BRIDGE_VERSION" CSA_BRIDGE_SOURCE_SHA256="$CSA_BRIDGE_SOURCE_SHA256" \
+    bash "$SCRIPT_DIR/install-wsl-bridge-service.sh" >/dev/null; then
     unit_ready=1
   else
     echo "Warning: failed to install/update systemd user service; falling back to direct WSL proxy start." >&2
@@ -240,51 +327,145 @@ if ! write_probe "$HOME"; then
   exit 1
 fi
 
-install_bundled_claude_science() {
-  if [ ! -f "$BUNDLED_CLAUDE_BIN" ]; then
-    return 1
-  fi
-  mkdir -p "$MANAGED_CLAUDE_DIR" || return 1
-  cp -f "$BUNDLED_CLAUDE_BIN" "$MANAGED_CLAUDE_BIN" || return 1
-  chmod 755 "$MANAGED_CLAUDE_BIN" || return 1
-  if [ -f "$BUNDLED_CLAUDE_SHA" ]; then
-    (cd "$MANAGED_CLAUDE_DIR" && sha256sum -c "$BUNDLED_CLAUDE_SHA") || return 1
-  fi
-  return 0
-}
-
-if [ -n "${CLAUDE_SCIENCE_BIN:-}" ]; then
-  SOURCE_BIN="$CLAUDE_SCIENCE_BIN"
-elif [ -x "$MANAGED_CLAUDE_BIN" ]; then
-  if [ -f "$BUNDLED_CLAUDE_SHA" ] && ! (cd "$MANAGED_CLAUDE_DIR" && sha256sum -c "$BUNDLED_CLAUDE_SHA" >/dev/null 2>&1); then
-    echo "Product-managed Claude Science binary hash does not match the locked bundled version; reinstalling bundled binary."
-    install_bundled_claude_science
-  fi
-  SOURCE_BIN="$MANAGED_CLAUDE_BIN"
-elif install_bundled_claude_science; then
-  SOURCE_BIN="$MANAGED_CLAUDE_BIN"
-else
-  SOURCE_BIN="$HOME/.local/bin/claude-science"
-fi
-
-if [ ! -x "$SOURCE_BIN" ]; then
-  cat >&2 <<EOF
-Claude Science Linux binary not found or not executable.
-Checked product-managed path: $MANAGED_CLAUDE_BIN
-Checked user path: $HOME/.local/bin/claude-science
-
-Use the full portable package that includes vendor/claude-science/linux-x64/claude-science,
-then run 1-run-acceptance-preview.bat and 4-install-runtime-after-preview.bat.
-EOF
-  exit 1
-fi
-
 if mkdir -p "$LOG_DIR" 2>/dev/null && : >>"$LOG_FILE" 2>/dev/null; then
   :
 else
   echo "Warning: WSL log directory is not writable; proxy fallback logs will be discarded." >&2
   LOG_FILE="/dev/null"
 fi
+
+BRIDGE_POINTER_CHANGED=0
+BRIDGE_PREVIOUS_RUNTIME=""
+BRIDGE_CANDIDATE_RUNTIME=""
+BRIDGE_VALIDATED=0
+CLAUDE_POINTER_CHANGED=0
+CLAUDE_PREVIOUS_RUNTIME=""
+CLAUDE_CANDIDATE_RUNTIME=""
+CLAUDE_VALIDATED=0
+CLAUDE_STOPPED_FOR_ACTIVATION=0
+PREVIOUS_RUNNING_CLAUDE_BIN=""
+START_COMPLETED=0
+
+rollback_runtime_pointer() {
+  local root="$1" previous="$2" candidate="$3" label="$4" current
+  if [ -n "$previous" ]; then
+    if csa_restore_previous_pointer "$root"; then
+      echo "Restored previous $label runtime pointer after failed activation." >&2
+      return 0
+    fi
+    echo "Failed to restore the previous $label runtime pointer." >&2
+    return 1
+  fi
+
+  current="$(csa_current_target "$root")"
+  if [ -n "$candidate" ] && [ "$current" = "$candidate" ] && [ -L "$root/current" ]; then
+    rm -f "$root/current"
+    echo "Removed the failed first $label runtime pointer; no previous managed runtime existed." >&2
+    return 0
+  fi
+  echo "Could not safely clear the failed first $label runtime pointer." >&2
+  return 1
+}
+
+restore_runtime_after_failure() {
+  local exit_code=$?
+  trap - EXIT
+  if [ "$exit_code" -ne 0 ] && [ "$START_COMPLETED" != "1" ]; then
+    set +e
+    set +u
+    if [ "$CLAUDE_POINTER_CHANGED" = "1" ]; then
+      if [ -n "${PATCHED_BIN:-}" ]; then
+        for pid in $(pgrep -x "claude-science" 2>/dev/null || true); do
+          if [ -r "/proc/$pid/cmdline" ]; then
+            cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+            if [[ "$cmd" == *"$PATCHED_BIN serve"* ]]; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          fi
+        done
+      fi
+      rollback_runtime_pointer \
+        "$CSA_CLAUDE_ROOT" "$CLAUDE_PREVIOUS_RUNTIME" "$CLAUDE_CANDIDATE_RUNTIME" \
+        "Claude Science" || true
+    fi
+    if [ "$CLAUDE_STOPPED_FOR_ACTIVATION" = "1" ] \
+      && [ -n "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
+      && [ -x "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
+      && [ -z "$(claude_listener_pids || true)" ]; then
+      rollback_proxy_url="http://127.0.0.1:$PROXY_PORT"
+      if ANTHROPIC_BASE_URL="$rollback_proxy_url" "$PREVIOUS_RUNNING_CLAUDE_BIN" serve \
+        --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update >/dev/null 2>&1 \
+        && wait_claude_health "$PREVIOUS_RUNNING_CLAUDE_BIN" 12; then
+        echo "Restarted the previous Claude Science daemon after failed activation." >&2
+      else
+        echo "Failed to restart the previous Claude Science daemon after activation failure." >&2
+      fi
+    fi
+    if [ "$BRIDGE_VALIDATED" != "1" ] \
+      && [ "$BRIDGE_POINTER_CHANGED" = "1" ]; then
+      if rollback_runtime_pointer \
+        "$CSA_BRIDGE_ROOT" "$BRIDGE_PREVIOUS_RUNTIME" "$BRIDGE_CANDIDATE_RUNTIME" \
+        "Bridge"; then
+        if [ -n "$BRIDGE_PREVIOUS_RUNTIME" ] && csa_load_bridge_runtime_identity; then
+          if systemd_runtime_available; then
+            start_systemd_proxy >/dev/null 2>&1 || start_fallback_proxy >/dev/null 2>&1 || true
+          else
+            start_fallback_proxy >/dev/null 2>&1 || true
+          fi
+        fi
+      fi
+    fi
+  fi
+  exit "$exit_code"
+}
+trap restore_runtime_after_failure EXIT
+
+csa_stage_bridge_runtime "$PROJECT_DIR" "$CSA_PACKAGE_VERSION"
+BRIDGE_POINTER_CHANGED="$CSA_POINTER_CHANGED"
+BRIDGE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
+BRIDGE_CANDIDATE_RUNTIME="$CSA_BRIDGE_RUNTIME_DIR"
+
+start_current_bridge() {
+  if check_bridge_health && [ "${CSA_FORCE_RESTART:-0}" != "1" ]; then
+    echo "WSL BYOK proxy already healthy on 127.0.0.1:$PROXY_PORT"
+    return 0
+  fi
+  if systemd_runtime_available; then
+    start_systemd_proxy || start_fallback_proxy
+  else
+    if [ "${CSA_FORCE_RESTART:-0}" = "1" ]; then
+      stop_stale_bridge_listener
+    fi
+    start_fallback_proxy
+  fi
+}
+
+if ! start_current_bridge; then
+  echo "Managed Bridge candidate failed to start; activation will be rolled back." >&2
+  exit 1
+fi
+BRIDGE_VALIDATED=1
+
+if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]; then
+  echo "Bridge-only restart complete; Claude Science was left running."
+  csa_print_bridge_identity
+  START_COMPLETED=1
+  exit 0
+fi
+
+csa_stage_claude_runtime "$PROJECT_DIR"
+CLAUDE_POINTER_CHANGED="$CSA_POINTER_CHANGED"
+CLAUDE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
+CLAUDE_CANDIDATE_RUNTIME="$CSA_CLAUDE_RUNTIME_DIR"
+SOURCE_BIN="$CSA_CLAUDE_RUNTIME_DIR/claude-science"
+SOURCE_SHA="$CSA_CLAUDE_SOURCE_SHA256"
+if [ -n "$PATCH_DIR_OVERRIDE" ]; then
+  PATCH_DIR="$PATCH_DIR_OVERRIDE"
+else
+  PATCH_DIR="$CSA_CLAUDE_ROOT/patched/${SOURCE_SHA}-${PROXY_PORT}"
+fi
+PATCHED_BIN="$PATCH_DIR/claude-science"
+
 mkdir -p "$PATCH_DIR"
 
 echo "Using Claude Science Linux binary: $SOURCE_BIN"
@@ -292,30 +473,16 @@ echo "Using Claude Science Linux binary: $SOURCE_BIN"
 
 if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
   && check_bridge_health \
-  && service_matches_project \
-  && pgrep -f "claude-science-api-bridge/patched/claude-science serve" >/dev/null 2>&1; then
+  && { ! systemd_runtime_available || service_matches_runtime; } \
+  && ps -eo args= | grep -F -- "$PATCHED_BIN serve" | grep -v grep >/dev/null 2>&1; then
   echo "Claude Science and WSL BYOK proxy are already running; using fast start path."
   if [ -x "$PATCHED_BIN" ]; then
-    "$PATCHED_BIN" url || true
+    echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
   else
-    echo "http://localhost:$CLAUDE_SCIENCE_PORT"
+    echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT."
   fi
-  exit 0
-fi
-
-if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then
-  start_systemd_proxy || start_fallback_proxy
-elif [ "${CSA_FORCE_RESTART:-0}" = "1" ]; then
-  stop_stale_bridge_listener
-  start_fallback_proxy
-elif ! check_bridge_health; then
-  start_fallback_proxy
-else
-  echo "WSL BYOK proxy already healthy on 127.0.0.1:$PROXY_PORT"
-fi
-
-if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]; then
-  echo "Bridge-only restart complete; Claude Science was left running."
+  csa_print_bridge_identity
+  START_COMPLETED=1
   exit 0
 fi
 
@@ -325,13 +492,17 @@ if [ -f "$HOME/.claude-science/encryption.key" ]; then
     echo "Local fake OAuth token already exists"
   else
     echo "Refreshing local fake OAuth token"
-    "$PYTHON_BIN" "$PROJECT_DIR/setup-token.py" >/dev/null
+    "$PYTHON_BIN" "$CSA_BRIDGE_ROOT/current/setup-token.py" >/dev/null
   fi
 else
   echo "Warning: ~/.claude-science/encryption.key does not exist; fake OAuth token was not generated." >&2
 fi
 
-SOURCE_SHA="$(sha256sum "$SOURCE_BIN" | awk '{print $1}')"
+ACTUAL_SOURCE_SHA="$(sha256sum "$SOURCE_BIN" | awk '{print tolower($1)}')"
+if [ "$ACTUAL_SOURCE_SHA" != "$SOURCE_SHA" ]; then
+  echo "Managed Claude Science source changed after activation; refusing to patch it." >&2
+  exit 1
+fi
 PATCH_MARKER="$PATCH_DIR/.claude-science.source.sha256"
 PATCH_CACHE_KEY="$SOURCE_SHA:$PROXY_PORT"
 
@@ -434,24 +605,52 @@ PY
   printf '%s\n' "$PATCH_CACHE_KEY" > "$PATCH_MARKER"
 fi
 
-for pid in $(pgrep -f "claude-science" 2>/dev/null || true); do
-  if [ "$pid" = "$$" ]; then
-    continue
-  fi
-  if [ ! -r "/proc/$pid/cmdline" ]; then
-    continue
-  fi
-  cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
-  if [[ "$cmd" == *"claude-science serve"* ]]; then
-    kill "$pid" 2>/dev/null || true
+PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary || true)"
+claude_pids="$(claude_listener_pids || true)"
+if [ -n "$claude_pids" ]; then
+  CLAUDE_STOPPED_FOR_ACTIVATION=1
+fi
+for pid in $claude_pids; do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
+  if [ -r "/proc/$pid/cmdline" ]; then
+    cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+    if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
   fi
 done
-sleep 1
+deadline=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$deadline" ] && [ -n "$(claude_listener_pids || true)" ]; do
+  sleep 0.25
+done
+if [ -n "$(claude_listener_pids || true)" ]; then
+  for pid in $(claude_listener_pids || true); do
+    case "$pid" in ''|*[!0-9]*) continue;; esac
+    if [ -r "/proc/$pid/cmdline" ]; then
+      cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+      if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+  done
+fi
+if [ -n "$(claude_listener_pids || true)" ]; then
+  echo "Existing Claude Science listeners did not stop within 5 seconds." >&2
+  exit 1
+fi
 
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 ANTHROPIC_BASE_URL="$PROXY_URL" "$PATCHED_BIN" serve --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update
+if ! wait_claude_health "$PATCHED_BIN" 15; then
+  echo "Claude Science candidate did not become healthy on 127.0.0.1:$CLAUDE_SCIENCE_PORT." >&2
+  exit 1
+fi
+csa_atomic_symlink "$PATCH_DIR" "$CSA_CLAUDE_ROOT/patched-current"
+CLAUDE_VALIDATED=1
 
 echo "Started Claude Science patched copy:"
 echo "  daemon: $PATCHED_BIN"
 echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
-"$PATCHED_BIN" url
+echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
+csa_print_bridge_identity
+START_COMPLETED=1

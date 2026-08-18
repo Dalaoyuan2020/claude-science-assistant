@@ -4,6 +4,8 @@ param(
   [string]$User = "",
   [int]$ProxyPort = 9876,
   [int]$ClaudeSciencePort = 8765,
+  [ValidatePattern('^[A-Za-z0-9._-]+$')]
+  [string]$PackageVersion = "0.1.5",
   [switch]$Open
 )
 
@@ -73,6 +75,7 @@ try {
   $output = @(& wsl.exe -d $Distro -u $User -- env `
     "PROXY_PORT=$ProxyPort" `
     "CLAUDE_SCIENCE_PORT=$ClaudeSciencePort" `
+    "CSA_PACKAGE_VERSION=$PackageVersion" `
     "CSA_MERGE_STDERR=1" `
     bash "$ProjectWsl/scripts/start-claude-science-wsl.sh" 2>$null)
   $exitCode = $LASTEXITCODE
@@ -86,10 +89,14 @@ if ($exitCode -ne 0) {
 }
 
 if ($Open) {
-  $match = $output | Select-String -Pattern "http://localhost:\d+/\?nonce=[a-f0-9]+" | Select-Object -First 1
+  $urlOutput = @((Invoke-WslQuiet @(
+    "-d", $Distro, "-u", $User, "--", "bash", "-lc",
+    '"$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science" url'
+  )) -replace [char]0, "")
+  $match = $urlOutput | Select-String -Pattern "http://(?:localhost|127\.0\.0\.1):\d+/\?nonce=[a-f0-9]+" | Select-Object -First 1
   if ($match) {
     Start-Process $match.Matches[0].Value
   } else {
-    Write-Warning "Claude Science URL was not found in script output."
+    Write-Warning "Claude Science URL could not be obtained from the managed runtime."
   }
 }

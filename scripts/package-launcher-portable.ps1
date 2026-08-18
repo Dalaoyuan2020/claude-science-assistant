@@ -98,9 +98,12 @@ Copy-Item -LiteralPath $LauncherDist -Destination (Join-Path (Join-Path $Package
 foreach ($file in @("runtimeUpdate.ts", "storageMigration.ts")) {
   Copy-Item -LiteralPath (Join-Path (Join-Path $LauncherDir "src") $file) -Destination (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src") $file)
 }
-Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "src") "lib.rs") -Destination (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") "lib.rs")
+foreach ($file in @("lib.rs", "runtime_lifecycle.rs")) {
+  Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "src") $file) -Destination (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") $file)
+}
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "tests") "test_translation.py") -Destination (Join-Path (Join-Path $PackageRoot "tests") "test_translation.py")
 foreach ($file in @(
+  "csa-runtime-layout.sh",
   "install-wsl-bridge-service.sh",
   "start-claude-science-wsl.sh",
   "start-claude-science-wsl.ps1",
@@ -176,8 +179,15 @@ if (
 }
 
 $ExeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ExePath).Hash.ToLowerInvariant()
-$SourceCommit = (& git -C $ProjectDir rev-parse HEAD 2>$null | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { $SourceCommit = "unknown" }
+$SourceCommit = "unknown"
+try {
+  $SourceCommitCandidate = (& git -C $ProjectDir rev-parse HEAD 2>$null | Select-Object -First 1)
+  if ($? -and $SourceCommitCandidate) {
+    $SourceCommit = [string]$SourceCommitCandidate
+  }
+} catch {
+  $SourceCommit = "unknown"
+}
 $SourceDirty = $false
 if ($SourceCommit -ne "unknown") {
   $SourceDirty = [bool](& git -C $ProjectDir status --porcelain 2>$null | Select-Object -First 1)

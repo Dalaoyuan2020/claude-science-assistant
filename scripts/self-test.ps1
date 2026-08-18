@@ -70,7 +70,7 @@ if (-not $StartScriptText.Contains('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')) {
   throw "Provider switching must support a Bridge-only restart mode."
 }
 $BridgeOnlyPosition = $StartScriptText.IndexOf('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')
-$ClaudeStopPosition = $StartScriptText.IndexOf('for pid in $(pgrep -f "claude-science"')
+$ClaudeStopPosition = $StartScriptText.IndexOf('PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary')
 if ($ClaudeStopPosition -lt 0 -or $BridgeOnlyPosition -gt $ClaudeStopPosition) {
   throw "Bridge-only restart must exit before Claude Science processes are stopped."
 }

@@ -8,6 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod runtime_lifecycle;
+
+use runtime_lifecycle::{
+    parse_runtime_identity, runtime_identity_from_health, RuntimeIdentity, ServiceOperationLock,
+};
+
 #[cfg(windows)]
 use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 
@@ -33,6 +39,14 @@ static BRIDGE_CONFIG_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn bridge_config_transition_lock() -> &'static Mutex<()> {
     BRIDGE_CONFIG_TRANSITION.get_or_init(|| Mutex::new(()))
+}
+
+fn service_operation_lock(operation: &str) -> Result<ServiceOperationLock, String> {
+    let path = settings_path()?
+        .parent()
+        .ok_or_else(|| "无法定位 CSA 状态目录".to_string())?
+        .join("service-lifecycle.lock");
+    ServiceOperationLock::acquire(&path, operation, Duration::from_secs(3))
 }
 
 #[cfg(windows)]
@@ -148,6 +162,7 @@ struct SystemStatus {
     claude_running: bool,
     claude_pid: Option<u32>,
     bridge_healthy: bool,
+    bridge_identity: Option<RuntimeIdentity>,
     windows_bridge_pid: Option<u32>,
     runtime_ready: bool,
     source_binary_present: bool,
@@ -254,6 +269,7 @@ struct WslProbeRuntime {
     claude_pid: Option<u32>,
     bridge_source_path: Option<String>,
     bridge_source_matches: Option<bool>,
+    bridge_identity: Option<RuntimeIdentity>,
     #[serde(default)]
     bridge_healthy: bool,
     #[serde(default)]
@@ -750,6 +766,7 @@ fn current_status() -> SystemStatus {
                 claude_running: false,
                 claude_pid: None,
                 bridge_healthy: false,
+                bridge_identity: None,
                 windows_bridge_pid: legacy_windows_bridge_pid(),
                 runtime_ready: false,
                 source_binary_present: false,
@@ -781,6 +798,7 @@ fn current_status() -> SystemStatus {
             claude_running: false,
             claude_pid: None,
             bridge_healthy: false,
+            bridge_identity: None,
             windows_bridge_pid: legacy_windows_bridge_pid(),
             runtime_ready: false,
             source_binary_present: false,
@@ -839,6 +857,7 @@ fn current_status() -> SystemStatus {
                 claude_running: false,
                 claude_pid: None,
                 bridge_healthy: false,
+                bridge_identity: None,
                 windows_bridge_pid: None,
                 runtime_ready: false,
                 source_binary_present: false,
@@ -914,10 +933,7 @@ fn current_status() -> SystemStatus {
         warnings.push("Bridge process/service/port exists, but health check failed.".into());
     }
     if probe.runtime.bridge_health_responding && !bridge_healthy {
-        let expected = project_wsl
-            .as_deref()
-            .map(|root| format!("{}/proxy.py", root.trim_end_matches('/')))
-            .unwrap_or_else(|| "unknown".into());
+        let expected = "$HOME/.local/share/csa/runtime/bridge/current/proxy.py";
         let actual = probe
             .runtime
             .bridge_source_path
@@ -936,7 +952,7 @@ fn current_status() -> SystemStatus {
         warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
     }
     if unit_matches_project == Some(false) {
-        warnings.push("WSL Bridge service points to a different package directory; run the repair flow to re-register the current CSA folder.".into());
+        warnings.push("WSL Bridge service does not point to the stable CSA managed runtime; run repair and restart to migrate it.".into());
     }
 
     if bridge_pid.is_some() && claude_pid.is_none() {
@@ -1044,6 +1060,7 @@ fn current_status() -> SystemStatus {
         claude_running,
         claude_pid,
         bridge_healthy,
+        bridge_identity: probe.runtime.bridge_identity,
         windows_bridge_pid,
         runtime_ready,
         source_binary_present,
@@ -1071,6 +1088,7 @@ fn project_runtime_files_present() -> bool {
                     .join("scripts")
                     .join("start-claude-science-wsl.sh")
                     .is_file()
+                && root.join("scripts").join("csa-runtime-layout.sh").is_file()
                 && root
                     .join("skills")
                     .join("bootstrap-claude-science-wsl")
@@ -1125,6 +1143,10 @@ fn find_project_root_from(start: &Path) -> Option<PathBuf> {
             && ancestor
                 .join("scripts")
                 .join("start-claude-science-wsl.sh")
+                .is_file()
+            && ancestor
+                .join("scripts")
+                .join("csa-runtime-layout.sh")
                 .is_file()
         {
             return Some(ancestor.to_path_buf());
@@ -2523,6 +2545,7 @@ fn restart_bridge_after_config(
             "CSA_FORCE_RESTART=1",
             "CSA_BRIDGE_ONLY=1",
             "PROXY_PORT=9876",
+            concat!("CSA_PACKAGE_VERSION=", env!("CARGO_PKG_VERSION")),
             "bash",
             &start_script,
         ],
@@ -2543,6 +2566,7 @@ fn restart_bridge_after_config(
         output_text(&restart_output),
         decode_console_output(&restart_output.stderr)
     ));
+    let expected_identity = parse_runtime_identity(&restart_trace)?;
     for line in restart_trace.lines().filter(|line| {
         line.contains("Stopping stale CSA Bridge listener")
             || line.contains("proxy process started (PID")
@@ -2550,37 +2574,37 @@ fn restart_bridge_after_config(
     }) {
         eprintln!("[CSA switch] {line}");
     }
+    let health_output = run_wsl(
+        distro,
+        &[
+            "curl",
+            "--noproxy",
+            "*",
+            "-fsS",
+            "--connect-timeout",
+            "0.4",
+            "--max-time",
+            "2",
+            "http://127.0.0.1:9876/health",
+        ],
+    )?;
+    let health = serde_json::from_str::<serde_json::Value>(&output_text(&health_output))
+        .map_err(|error| format!("Bridge 已重启，但健康结果无法解析：{error}"))?;
+    let actual_identity = runtime_identity_from_health(&health)?;
+    if actual_identity != expected_identity {
+        return Err("Bridge 已响应，但运行时身份与本次启动候选不一致".into());
+    }
     if let Some(expected_revision) = expected_revision {
-        let health_output = run_wsl(
-            distro,
-            &[
-                "curl",
-                "-fsS",
-                "--connect-timeout",
-                "0.4",
-                "--max-time",
-                "2",
-                "http://127.0.0.1:9876/health",
-            ],
-        )?;
-        let health = serde_json::from_str::<serde_json::Value>(&output_text(&health_output))
-            .map_err(|error| format!("Bridge 已重启，但健康结果无法解析：{error}"))?;
         let actual_revision = health
             .get("config_revision")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let source_path = health
-            .get("source_path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let expected_source = format!("{}/proxy.py", project_wsl.trim_end_matches('/'));
-        if actual_revision != expected_revision
-            || source_path.replace('\\', "/") != expected_source.replace('\\', "/")
-        {
+        if actual_revision != expected_revision {
             return Err("Bridge 已响应，但仍未加载刚保存的配置或不是当前 CSA 实例".into());
         }
         eprintln!(
-            "[CSA switch] Bridge health verified: revision={expected_revision}, source=current"
+            "[CSA switch] Bridge health verified: revision={expected_revision}, runtime={}",
+            actual_identity.runtime_id
         );
     }
     Ok(())
@@ -3253,6 +3277,7 @@ fn commit_launcher_settings_with_bridge(
     let _transition = bridge_config_transition_lock()
         .lock()
         .map_err(|_| "Bridge 配置切换锁异常，请重新启动 CSA 后再试".to_string())?;
+    let _service_operation = service_operation_lock("provider-transition")?;
     // Pre-write and fsync Windows settings before touching WSL. This catches a
     // full APPDATA drive without leaving Bridge on a different active Key.
     let prepared_settings = prepare_launcher_settings(settings)?;
@@ -3914,7 +3939,7 @@ async fn get_runtime_update_status() -> Result<RuntimeUpdateStatus, String> {
     run_blocking(get_runtime_update_status_impl).await
 }
 
-fn start_services_raw(distro: &str, user: &str) -> Result<(), String> {
+fn start_services_raw(distro: &str, user: &str) -> Result<RuntimeIdentity, String> {
     let script = project_root()?
         .join("scripts")
         .join("start-claude-science-wsl.ps1");
@@ -3931,11 +3956,13 @@ fn start_services_raw(distro: &str, user: &str) -> Result<(), String> {
         .arg("-Distro")
         .arg(distro)
         .arg("-User")
-        .arg(user);
+        .arg(user)
+        .arg("-PackageVersion")
+        .arg(env!("CARGO_PKG_VERSION"));
     let output =
         command_output_with_timeout(command, Duration::from_secs(45), "Claude Science 启动")?;
     if output.status.success() {
-        Ok(())
+        parse_runtime_identity(&output_text(&output))
     } else {
         Err(format!(
             "Claude Science 启动失败：{}",
@@ -3945,6 +3972,7 @@ fn start_services_raw(distro: &str, user: &str) -> Result<(), String> {
 }
 
 fn start_services_impl() -> Result<SystemStatus, String> {
+    let _service_operation = service_operation_lock("start-services")?;
     let before = current_status();
     if before.state == "running" {
         return Ok(before);
@@ -4007,7 +4035,7 @@ for pid in $claude_pids; do
 done
 deadline=$((SECONDS + 5))
 while [ "$SECONDS" -lt "$deadline" ]; do
-  if ! curl -fsS --connect-timeout 0.3 --max-time 0.6 http://127.0.0.1:9876/health >/dev/null 2>&1 \
+  if ! curl --noproxy '*' -fsS --connect-timeout 0.3 --max-time 0.6 http://127.0.0.1:9876/health >/dev/null 2>&1 \
     && ! ss -ltn 2>/dev/null | grep -qE ':(8765|8766) '; then
     exit 0
   fi
@@ -4030,6 +4058,7 @@ fn stop_services_raw(distro: &str) -> Result<(), String> {
 }
 
 fn stop_services_impl() -> Result<SystemStatus, String> {
+    let _service_operation = service_operation_lock("stop-services")?;
     let before = current_status();
     let Some(distro) = before.distro else {
         return Ok(before);
@@ -4044,6 +4073,7 @@ async fn stop_services() -> Result<SystemStatus, String> {
 }
 
 fn restart_services_impl() -> Result<SystemStatus, String> {
+    let _service_operation = service_operation_lock("restart-services")?;
     let before = current_status();
     if before.restart_blocked {
         return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应或安装包不完整。现有服务不会被停止。".into());
@@ -4073,7 +4103,12 @@ fn get_claude_url_impl() -> Result<String, String> {
     let distro = selected_distro_quick()?;
     let output = wsl_shell(
         &distro,
-        "$HOME/.local/share/claude-science-api-bridge/patched/claude-science url",
+        r#"bin="$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science"
+if [ ! -x "$bin" ]; then
+  bin="$HOME/.local/share/claude-science-api-bridge/patched/claude-science"
+fi
+[ -x "$bin" ] || exit 2
+"$bin" url"#,
     )?;
     if !output.status.success() {
         return Err("无法获取 Claude Science 地址，请先启动服务".into());
@@ -4092,14 +4127,12 @@ async fn get_claude_url() -> Result<String, String> {
 
 fn get_dashboard_url_impl() -> Result<String, String> {
     let distro = selected_distro_quick()?;
-    let project_wsl = project_root()
-        .ok()
-        .and_then(|root| windows_path_to_wsl(&distro, &root))
-        .ok_or_else(|| "无法定位当前 CSA Bridge".to_string())?;
     let health = run_wsl(
         &distro,
         &[
             "curl",
+            "--noproxy",
+            "*",
             "-fsS",
             "--connect-timeout",
             "0.4",
@@ -4110,14 +4143,8 @@ fn get_dashboard_url_impl() -> Result<String, String> {
     )?;
     let health = serde_json::from_str::<serde_json::Value>(&output_text(&health))
         .map_err(|_| "当前 Bridge 健康信息无效，请先从本目录启动/迁移 Bridge".to_string())?;
-    let expected_source = format!("{}/proxy.py", project_wsl.trim_end_matches('/'));
-    let actual_source = health
-        .get("source_path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if actual_source.replace('\\', "/") != expected_source.replace('\\', "/") {
-        return Err("9876 端口不是当前 CSA 目录的 Bridge；请先启动当前包完成迁移".into());
-    }
+    runtime_identity_from_health(&health)
+        .map_err(|_| "9876 端口不是 CSA 受管 Bridge；请先执行修复并重启".to_string())?;
     let script = r#"
 import json
 import pathlib
@@ -4147,6 +4174,7 @@ async fn get_dashboard_url() -> Result<String, String> {
 }
 
 fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
+    let _service_operation = service_operation_lock("stop-legacy-windows-bridge")?;
     let Some(pid) = legacy_windows_bridge_pid() else {
         return Ok(current_status());
     };
@@ -4273,6 +4301,7 @@ mod tests {
         fs::write(root.join("proxy.py"), "").unwrap();
         fs::write(root.join("requirements.txt"), "").unwrap();
         fs::write(root.join("scripts").join("start-claude-science-wsl.sh"), "").unwrap();
+        fs::write(root.join("scripts").join("csa-runtime-layout.sh"), "").unwrap();
 
         assert_eq!(
             find_project_root_from(&nested).as_deref(),
@@ -5137,7 +5166,7 @@ mod tests {
             .find("TOKEN_FILE=")
             .expect("token refresh block should be present");
         let claude_stop = script
-            .find("for pid in $(pgrep -f \"claude-science\"")
+            .find("PREVIOUS_RUNNING_CLAUDE_BIN=\"$(running_claude_binary")
             .expect("Claude Science stop block should be present");
         let claude_start = script
             .find("\"$PATCHED_BIN\" serve")
@@ -5147,6 +5176,28 @@ mod tests {
         assert!(bridge_only < claude_stop);
         assert!(bridge_only < claude_start);
         assert!(script[bridge_only..token_refresh].contains("exit 0"));
+    }
+
+    #[test]
+    fn managed_runtime_layout_is_stable_and_downgrade_guarded() {
+        let start = include_str!("../../../scripts/start-claude-science-wsl.sh");
+        let layout = include_str!("../../../scripts/csa-runtime-layout.sh");
+        let service = include_str!("../../../scripts/install-wsl-bridge-service.sh");
+        let inspect =
+            include_str!("../../../skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh");
+
+        assert!(start.contains("csa_stage_bridge_runtime"));
+        assert!(start.contains("csa_stage_claude_runtime"));
+        assert!(start.contains("trap restore_runtime_after_failure EXIT"));
+        assert!(start.contains("csa_print_bridge_identity"));
+        assert!(start.contains("curl --noproxy '*'"));
+        assert!(layout.contains("Implicit Claude Science downgrade rejected"));
+        assert!(layout.contains("csa_backup_before_downgrade"));
+        assert!(layout.contains("mv -Tf \"$temporary\" \"$link_path\""));
+        assert!(service.contains("BRIDGE_CURRENT=\"$CSA_STATE_ROOT/runtime/bridge/current\""));
+        assert!(service.contains("ExecStart=\"$python_escaped\" \"$proxy_escaped\""));
+        assert!(!service.contains("proxy_escaped=\"$(unit_escape \"$PACKAGE_DIR/proxy.py\")\""));
+        assert!(inspect.contains("bridge_proxy=\"$bridge_current/proxy.py\""));
     }
 
     #[test]
@@ -5224,6 +5275,8 @@ mod tests {
             "--fail",
             "--silent",
             "--show-error",
+            "--noproxy",
+            "*",
             "--connect-timeout",
             "1",
             "--max-time",
@@ -5252,6 +5305,8 @@ mod tests {
             "--fail",
             "--silent",
             "--show-error",
+            "--noproxy",
+            "*",
             "--connect-timeout",
             "2",
             "--max-time",

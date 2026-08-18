@@ -21,17 +21,23 @@ project_dir="${1:-${PROJECT_DIR:-}}"
 systemd_running=false
 if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then systemd_running=true; fi
 
+state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
+legacy_state_root="$HOME/.local/share/claude-science-api-bridge"
 source_bin="$HOME/.local/bin/claude-science"
-managed_bin="$HOME/.local/share/claude-science-api-bridge/bin/claude-science"
-patched_bin="$HOME/.local/share/claude-science-api-bridge/patched/claude-science"
-venv_python="$HOME/.local/share/claude-science-api-bridge/venv/bin/python"
+managed_bin="$state_root/runtime/claude-science/current/claude-science"
+legacy_managed_bin="$legacy_state_root/bin/claude-science"
+patched_bin="$state_root/runtime/claude-science/patched-current/claude-science"
+venv_python="$legacy_state_root/venv/bin/python"
+bridge_current="$state_root/runtime/bridge/current"
+bridge_proxy="$bridge_current/proxy.py"
 bridge_pid="$(ps -eo pid=,args= | awk '/python/ && /proxy.py/ && !/awk/ {print $1; exit}' || true)"
 claude_pid="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1; exit}' || true)"
 bridge_healthy=false
 bridge_health_responding=false
 bridge_source_matches=null
 bridge_source_path=""
-health_payload="$(curl -fsS --connect-timeout 0.4 --max-time 1 http://127.0.0.1:9876/health 2>/dev/null || true)"
+bridge_identity_json=null
+health_payload="$(curl --noproxy '*' -fsS --connect-timeout 0.4 --max-time 1 http://127.0.0.1:9876/health 2>/dev/null || true)"
 if [ -n "$health_payload" ]; then
   bridge_health_responding=true
   health_python=""
@@ -50,6 +56,16 @@ except Exception:
     raise SystemExit
 print(str(health.get("source_path") or ""))
 ' "$health_payload" 2>/dev/null || true)"
+    bridge_identity_json="$("$health_python" -c '
+import json, sys
+try:
+    health = json.loads(sys.argv[1])
+except Exception:
+    print("null")
+    raise SystemExit
+identity = health.get("runtime_identity")
+print(json.dumps(identity, separators=(",", ":")) if isinstance(identity, dict) else "null")
+' "$health_payload" 2>/dev/null || printf null)"
     health_state="$("$health_python" -c '
 import json, os, re, sys
 try:
@@ -59,6 +75,7 @@ except Exception:
     raise SystemExit
 expected = os.path.realpath(sys.argv[1])
 actual = os.path.realpath(str(health.get("source_path") or ""))
+identity = health.get("runtime_identity") or {}
 
 def comparison_key(path):
     # DrvFs paths inherit Windows case-insensitive path identity even though
@@ -69,9 +86,22 @@ print(
     "current"
     if health.get("status") == "ok"
     and comparison_key(actual) == comparison_key(expected)
+    and identity.get("schemaVersion") == 1
+    and identity.get("component") == "bridge"
+    and identity.get("managed") is True
+    and comparison_key(os.path.realpath(str(identity.get("sourcePath") or ""))) == comparison_key(expected)
+    and isinstance(identity.get("runtimeId"), str)
+    and bool(identity.get("runtimeId"))
+    and isinstance(identity.get("buildId"), str)
+    and bool(re.fullmatch(r"[0-9a-fA-F]{16}", identity.get("buildId")))
+    and isinstance(identity.get("sourceSha256"), str)
+    and bool(re.fullmatch(r"[0-9a-fA-F]{64}", identity.get("sourceSha256")))
+    and isinstance(identity.get("pid"), int)
+    and identity.get("pid") > 0
+    and "health" in (identity.get("capabilities") or [])
     else "foreign"
 )
-' "$project_dir/proxy.py" "$health_payload" 2>/dev/null || true)"
+' "$bridge_proxy" "$health_payload" 2>/dev/null || true)"
   fi
   if [ "$health_state" = current ]; then
     bridge_healthy=true
@@ -103,8 +133,8 @@ bridge_service_active=false
 unit_matches_project=null
 if [ "$systemd_running" = true ]; then
   if systemctl --user is-active --quiet claude-science-bridge.service; then bridge_service_active=true; fi
-  if [ -n "$project_dir" ]; then
-    if systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$project_dir/proxy.py" >/dev/null 2>&1; then
+  if [ -n "$bridge_proxy" ]; then
+    if systemctl --user cat claude-science-bridge.service 2>/dev/null | grep -F -- "$bridge_proxy" >/dev/null 2>&1; then
       unit_matches_project=true
     else
       unit_matches_project=false
@@ -125,8 +155,9 @@ printf '},'
 printf '"components":{'
 printf '"python3":%s,' "$(json_bool command -v python3)"
 printf '"curl":%s,' "$(json_bool command -v curl)"
-printf '"source_binary":%s,' "$(json_bool bash -c "test -x '$managed_bin' || test -x '$source_bin'")"
+printf '"source_binary":%s,' "$(json_bool bash -c "test -x '$managed_bin' || test -x '$legacy_managed_bin' || test -x '$source_bin'")"
 printf '"managed_binary":%s,' "$(json_bool test -x "$managed_bin")"
+printf '"legacy_managed_binary":%s,' "$(json_bool test -x "$legacy_managed_bin")"
 printf '"user_binary":%s,' "$(json_bool test -x "$source_bin")"
 printf '"patched_binary":%s,' "$(json_bool test -x "$patched_bin")"
 printf '"bridge_venv":%s,' "$(json_bool test -x "$venv_python")"
@@ -148,6 +179,7 @@ printf '"bridge_healthy":%s,' "$bridge_healthy"
 printf '"bridge_health_responding":%s,' "$bridge_health_responding"
 printf '"bridge_source_path":%s,' "$(printf '%s' "$bridge_source_path" | json_string)"
 printf '"bridge_source_matches":%s,' "$bridge_source_matches"
+printf '"bridge_identity":%s,' "$bridge_identity_json"
 printf '"bridge_service_active":%s,' "$bridge_service_active"
 printf '"unit_matches_project":%s,' "$unit_matches_project"
 printf '"port_9876":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":9876 "')"

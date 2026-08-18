@@ -116,12 +116,22 @@ $skillRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $skillWsl = Get-WslPath $skillRoot
 $dryRun = if ($PlanOnly) { "1" } else { "0" }
 $start = if ($StartServices) { "1" } else { "0" }
+$packageVersion = "0.1.5"
+$cargoTomlPath = Join-Path $ProjectRoot "launcher\src-tauri\Cargo.toml"
+if (Test-Path -LiteralPath $cargoTomlPath) {
+  $cargoToml = Get-Content -LiteralPath $cargoTomlPath -Raw -Encoding UTF8
+  $versionMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"]+)"')
+  if ($versionMatch.Success) {
+    $packageVersion = $versionMatch.Groups[1].Value
+  }
+}
 
 Write-Step $(if ($PlanOnly) { "Preview WSL runtime bootstrap" } else { "Apply WSL runtime bootstrap" })
 $envVars = @(
   "DRY_RUN=$dryRun",
   "START_SERVICES=$start",
-  "PROXY_PORT=$ProxyPort"
+  "PROXY_PORT=$ProxyPort",
+  "CSA_PACKAGE_VERSION=$packageVersion"
 )
 $bootstrapCommand = @("env") + $envVars + @("bash", "$skillWsl/scripts/bootstrap-wsl-runtime.sh", $projectWsl)
 Invoke-Wsl $bootstrapCommand

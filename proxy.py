@@ -2604,6 +2604,26 @@ async def api_anthropic_catch_all(request: Request, path: str):
 # Health check
 # ---------------------------------------------------------------------------
 
+def managed_runtime_identity() -> Optional[dict]:
+    runtime_id = os.environ.get("CSA_BRIDGE_RUNTIME_ID", "").strip()
+    version = os.environ.get("CSA_BRIDGE_VERSION", "").strip()
+    source_sha256 = os.environ.get("CSA_BRIDGE_SOURCE_SHA256", "").strip().lower()
+    managed = os.environ.get("CSA_BRIDGE_MANAGED", "") == "1"
+    if not managed or not runtime_id or not version or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        return None
+    return {
+        "schemaVersion": 1,
+        "component": "bridge",
+        "runtimeId": runtime_id,
+        "version": version,
+        "buildId": source_sha256[:16],
+        "sourcePath": str(Path(__file__).resolve()),
+        "sourceSha256": source_sha256,
+        "pid": os.getpid(),
+        "capabilities": ["anthropicBridge", "configRevision", "health"],
+        "managed": True,
+    }
+
 @app.get("/health")
 async def health():
     return {
@@ -2631,6 +2651,7 @@ async def health():
         "inline_image_policy": config.inline_image_policy,
         "proxy_dir": str(PROXY_DIR),
         "source_path": str(Path(__file__).resolve()),
+        "runtime_identity": managed_runtime_identity(),
         "config_revision": str(config.get("_csa_revision", "") or ""),
     }
 

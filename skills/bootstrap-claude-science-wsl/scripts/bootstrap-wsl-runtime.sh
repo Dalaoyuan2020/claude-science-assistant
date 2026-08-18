@@ -10,11 +10,9 @@ PROJECT_DIR="${1:-}"
 PROXY_PORT="${PROXY_PORT:-9876}"
 START_SERVICES="${START_SERVICES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
-STATE_DIR="$HOME/.local/share/claude-science-api-bridge"
-VENV_DIR="$STATE_DIR/venv"
+LEGACY_STATE_DIR="$HOME/.local/share/claude-science-api-bridge"
+VENV_DIR="$LEGACY_STATE_DIR/venv"
 PYTHON_BIN="$VENV_DIR/bin/python"
-MANAGED_CLAUDE_DIR="$STATE_DIR/bin"
-MANAGED_CLAUDE_BIN="$MANAGED_CLAUDE_DIR/claude-science"
 
 if [ -z "$PROJECT_DIR" ]; then
   echo "Usage: bootstrap-wsl-runtime.sh /path/to/claude-science-api-bridge" >&2
@@ -26,9 +24,13 @@ if [ ! -f "$PROJECT_DIR/proxy.py" ] || [ ! -f "$PROJECT_DIR/requirements.txt" ];
   echo "Project root is invalid: $PROJECT_DIR" >&2
   exit 2
 fi
-BUNDLED_CLAUDE_DIR="$PROJECT_DIR/vendor/claude-science/linux-x64"
-BUNDLED_CLAUDE_BIN="$BUNDLED_CLAUDE_DIR/claude-science"
-BUNDLED_CLAUDE_SHA="$BUNDLED_CLAUDE_DIR/claude-science.sha256"
+RUNTIME_LAYOUT_SCRIPT="$PROJECT_DIR/scripts/csa-runtime-layout.sh"
+if [ ! -f "$RUNTIME_LAYOUT_SCRIPT" ]; then
+  echo "CSA runtime layout helper is missing: $RUNTIME_LAYOUT_SCRIPT" >&2
+  exit 2
+fi
+# shellcheck source=csa-runtime-layout.sh
+source "$RUNTIME_LAYOUT_SCRIPT"
 
 say() { printf '%s\n' "$*"; }
 
@@ -51,6 +53,9 @@ if ! python3 -m venv --help >/dev/null 2>&1; then
 fi
 if ! command -v curl >/dev/null 2>&1; then
   need_packages+=(curl)
+fi
+if ! command -v ss >/dev/null 2>&1; then
+  need_packages+=(iproute2)
 fi
 
 if [ "${#need_packages[@]}" -gt 0 ]; then
@@ -76,28 +81,7 @@ EOF
   fi
 fi
 
-run mkdir -p "$STATE_DIR" "$HOME/.claude-science/logs"
-
-if [ -f "$BUNDLED_CLAUDE_BIN" ]; then
-  say "Bundled Claude Science Linux binary found; it will be installed as the locked product-managed runtime binary."
-  run mkdir -p "$MANAGED_CLAUDE_DIR"
-  run cp -f "$BUNDLED_CLAUDE_BIN" "$MANAGED_CLAUDE_BIN"
-  run chmod 755 "$MANAGED_CLAUDE_BIN"
-  if [ "$DRY_RUN" = "1" ]; then
-    say "+ verify sha256 using $BUNDLED_CLAUDE_SHA"
-  elif [ -f "$BUNDLED_CLAUDE_SHA" ]; then
-    (cd "$MANAGED_CLAUDE_DIR" && sha256sum -c "$BUNDLED_CLAUDE_SHA")
-  fi
-elif [ -x "$HOME/.local/bin/claude-science" ]; then
-  say "Bundled Claude Science binary was not found; falling back to existing ~/.local/bin/claude-science."
-else
-  cat >&2 <<EOF
-Claude Science Linux binary is not installed and no bundled binary was found.
-Use the full portable package that contains vendor/claude-science/linux-x64/claude-science,
-or install the supported Claude Science binary manually before starting services.
-EOF
-  exit 4
-fi
+run mkdir -p "$LEGACY_STATE_DIR" "$HOME/.claude-science/logs"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   run python3 -m venv "$VENV_DIR"
@@ -106,8 +90,23 @@ fi
 run "$PYTHON_BIN" -m pip install --upgrade pip
 run "$PYTHON_BIN" -m pip install -r "$PROJECT_DIR/requirements.txt"
 
+if [ "$DRY_RUN" = "1" ]; then
+  say "+ stage Bridge into $CSA_BRIDGE_ROOT/versions and atomically activate current"
+  say "+ verify Claude Science version/hash, reject implicit downgrade, then activate $CSA_CLAUDE_ROOT/current"
+else
+  csa_stage_bridge_runtime "$PROJECT_DIR" "${CSA_PACKAGE_VERSION:-0.1.5}"
+  csa_stage_claude_runtime "$PROJECT_DIR"
+fi
+
 if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then
-  run env "PROXY_PORT=$PROXY_PORT" "PYTHON=$PYTHON_BIN" bash "$PROJECT_DIR/scripts/install-wsl-bridge-service.sh"
+  if [ "$DRY_RUN" = "1" ]; then
+    say "+ install systemd user service from the stable Bridge current pointer"
+  else
+    run env "PROXY_PORT=$PROXY_PORT" "PYTHON=$PYTHON_BIN" "CSA_STATE_ROOT=$CSA_STATE_ROOT" \
+      "CSA_PACKAGE_DIR=$PROJECT_DIR" "CSA_BRIDGE_RUNTIME_ID=$CSA_BRIDGE_RUNTIME_ID" \
+      "CSA_BRIDGE_VERSION=$CSA_BRIDGE_VERSION" "CSA_BRIDGE_SOURCE_SHA256=$CSA_BRIDGE_SOURCE_SHA256" \
+      bash "$PROJECT_DIR/scripts/install-wsl-bridge-service.sh"
+  fi
 else
   say "systemd is not running as PID 1; start script will use the fallback process mode."
 fi

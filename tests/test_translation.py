@@ -4,6 +4,7 @@ import json
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from starlette.exceptions import StarletteDeprecationWarning
@@ -1099,6 +1100,44 @@ def test_oauth_token_mock_uses_claude_ai_provider_and_scopes():
     assert data["provider"] == "claude_ai"
     for scope in ["user:inference", "user:profile", "user:mcp_servers", "user:plugins"]:
         assert scope in data["scope"].split()
+
+
+def test_managed_runtime_identity_requires_complete_attestation():
+    keys = [
+        "CSA_BRIDGE_RUNTIME_ID",
+        "CSA_BRIDGE_VERSION",
+        "CSA_BRIDGE_SOURCE_SHA256",
+        "CSA_BRIDGE_MANAGED",
+    ]
+    with patch.dict(proxy.os.environ, {}, clear=False):
+        for key in keys:
+            proxy.os.environ.pop(key, None)
+
+        assert proxy.managed_runtime_identity() is None
+
+        proxy.os.environ.update({
+            "CSA_BRIDGE_RUNTIME_ID": "bridge-aabbccdd",
+            "CSA_BRIDGE_VERSION": "0.2.0-restart",
+            "CSA_BRIDGE_SOURCE_SHA256": "a" * 64,
+            "CSA_BRIDGE_MANAGED": "1",
+        })
+        identity = proxy.managed_runtime_identity()
+
+        assert identity == {
+            "schemaVersion": 1,
+            "component": "bridge",
+            "runtimeId": "bridge-aabbccdd",
+            "version": "0.2.0-restart",
+            "buildId": "a" * 16,
+            "sourcePath": str((ROOT / "proxy.py").resolve()),
+            "sourceSha256": "a" * 64,
+            "pid": proxy.os.getpid(),
+            "capabilities": ["anthropicBridge", "configRevision", "health"],
+            "managed": True,
+        }
+
+        proxy.os.environ["CSA_BRIDGE_SOURCE_SHA256"] = "invalid"
+        assert proxy.managed_runtime_identity() is None
 
 
 def test_aggregate_routes_resolve_three_independent_upstreams_and_mask_secrets():

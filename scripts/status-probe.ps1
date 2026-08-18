@@ -157,7 +157,8 @@ $hostStorage = Get-WslHostStorage -Distribution $Distro
 $settingsStorage = Get-DriveSnapshot $env:APPDATA
 
 $projectExists = (Test-Path -LiteralPath (Join-Path $ProjectRoot "proxy.py")) -and
-  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\start-claude-science-wsl.sh"))
+  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\start-claude-science-wsl.sh")) -and
+  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\csa-runtime-layout.sh"))
 
 $projectWsl = ""
 $wslProbe = $null
