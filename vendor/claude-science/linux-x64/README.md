@@ -16,4 +16,4 @@ Then update `manifest.json` and `claude-science.sha256` to match that local bina
 .\scripts\package-launcher-portable.ps1 -Profile release
 ```
 
-Release packaging verifies the binary against `manifest.json`, records the EXE and runtime hashes, and refuses to reuse a skipped build.
+Keep `manifest.json` as UTF-8 without BOM. Release packaging verifies the binary against that manifest, records the Git commit/tree plus EXE and runtime hashes, requires a clean worktree, and refuses to reuse a skipped build.

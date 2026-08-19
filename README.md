@@ -402,6 +402,8 @@ Pop-Location
 .\scripts\package-launcher-portable.ps1 -Profile debug -SkipBuild
 ```
 
+打包默认要求 Git 工作树干净。只有本地 debug 实验可以显式追加 `-AllowDirtySource`；正式 release 永远拒绝脏工作树，并在 manifest 中记录对应的 commit 与 Git tree。
+
 发布前至少确认：
 
 - 前端构建通过。

@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Resolve-Path (Join-Path $ScriptDir "..")
+. (Join-Path $ScriptDir "package-policy.ps1")
 Set-Location $ProjectDir
 
 if (-not (Test-Path $Python)) {
@@ -52,6 +53,7 @@ if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE
 $RuntimeManifestPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\manifest.json"
 $RuntimeBinaryPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\claude-science"
 $StartScriptPath = Join-Path $ProjectDir "scripts\start-claude-science-wsl.sh"
+Assert-CsaUtf8NoBom -Path $RuntimeManifestPath
 $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$RuntimeManifest.version -ne "0.1.25") {
   throw "v0.1.5 must lock Claude Science stable 0.1.25."
@@ -143,5 +145,8 @@ try {
 } finally {
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 }
+
+& (Join-Path $ProjectDir "tests\package_policy_test.ps1")
+if ($LASTEXITCODE -ne 0) { throw "Package policy tests failed (exit $LASTEXITCODE)." }
 
 Write-Host "self-test passed"

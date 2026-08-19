@@ -7,7 +7,7 @@ Before publishing:
 .\scripts\self-test.ps1
 Push-Location launcher\src-tauri
 cargo fmt --check
-cargo test
+cargo test --jobs 1
 Pop-Location
 .\scripts\package-launcher-portable.ps1 -Profile release
 git status --ignored
@@ -30,7 +30,7 @@ If a backend API key is configured locally, optionally run:
 
 Do not publish API keys, OAuth tokens, proxy credentials, generated certificates, or local logs.
 
-Release packaging must compile the EXE; `-SkipBuild` is not allowed for `-Profile release`. Confirm the package manifest records the intended source commit and `sourceTreeDirty=false`, then upload both:
+Release packaging must compile the EXE; `-SkipBuild` and `-AllowDirtySource` are not allowed for `-Profile release`. The script checks the Git state both before and after building. Confirm the package manifest records the intended `sourceCommit`, its `sourceTreeObject`, and `sourceTreeDirty=false`, then upload both:
 
 ```text
 claude-science-assistant-vX.Y.Z-release-portable.zip

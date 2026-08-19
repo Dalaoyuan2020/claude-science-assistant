@@ -1,9 +1,9 @@
-﻿{
-    "product":  "claude-science",
-    "platform":  "linux-x64",
-    "version":  "0.1.25",
-    "profile":  "release, public",
-    "sha256":  "c663367bbc7ec54e7d1e5a9102594a9e70804ed5070f5d7cd1117e665e3c376c",
-    "source":  "Anthropic stable release b7190511 from the official operon-dist bucket",
-    "capturedAt":  "2026-08-08T00:00:00Z"
+{
+  "product": "claude-science",
+  "platform": "linux-x64",
+  "version": "0.1.25",
+  "profile": "release, public",
+  "sha256": "c663367bbc7ec54e7d1e5a9102594a9e70804ed5070f5d7cd1117e665e3c376c",
+  "source": "Anthropic stable release b7190511 from the official operon-dist bucket",
+  "capturedAt": "2026-08-08T00:00:00Z"
 }

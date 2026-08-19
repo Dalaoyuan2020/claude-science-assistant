@@ -5,7 +5,8 @@ param(
   [string]$OutputDir = "",
   [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')]
   [string]$PackageQualifier = "",
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [switch]$AllowDirtySource
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +14,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
+. (Join-Path $ScriptDir "package-policy.ps1")
 $LauncherDir = Join-Path $ProjectDir "launcher"
 $CargoToml = Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\Cargo.toml") -Raw -Encoding UTF8
 $CargoVersionMatch = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"([^"]+)"')
@@ -28,6 +30,8 @@ if ($Version -ne $PackageVersion -or $Version -ne $TauriVersion) {
 if ($Profile -eq "release" -and $SkipBuild) {
   throw "Release packaging must compile the launcher; -SkipBuild is allowed only for debug packages."
 }
+$SourceState = Get-CsaGitSourceState -ProjectDir $ProjectDir
+Assert-CsaPackageSourcePolicy -SourceState $SourceState -Profile $Profile -AllowDirtySource ([bool]$AllowDirtySource)
 
 if (-not $OutputDir) {
   $OutputDir = Join-Path $ProjectDir "dist"
@@ -49,6 +53,12 @@ if (-not $SkipBuild) {
     Pop-Location
   }
 }
+$FinalSourceState = Get-CsaGitSourceState -ProjectDir $ProjectDir
+Assert-CsaPackageSourcePolicy -SourceState $FinalSourceState -Profile $Profile -AllowDirtySource ([bool]$AllowDirtySource)
+if ($FinalSourceState.Commit -ne $SourceState.Commit -or $FinalSourceState.Tree -ne $SourceState.Tree) {
+  throw "The source commit or tree changed during packaging; start again from a stable checkout."
+}
+$SourceState = $FinalSourceState
 
 $TargetProfile = if ($Profile -eq "debug") { "debug" } else { "release" }
 $TargetDir = Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "target") $TargetProfile
@@ -101,8 +111,11 @@ foreach ($file in @("runtimeUpdate.ts", "storageMigration.ts")) {
 foreach ($file in @("lib.rs", "runtime_lifecycle.rs")) {
   Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "src") $file) -Destination (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") $file)
 }
-Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "tests") "test_translation.py") -Destination (Join-Path (Join-Path $PackageRoot "tests") "test_translation.py")
+foreach ($file in @("test_translation.py", "package_policy_test.ps1")) {
+  Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "tests") $file) -Destination (Join-Path (Join-Path $PackageRoot "tests") $file)
+}
 foreach ($file in @(
+  "package-policy.ps1",
   "csa-runtime-layout.sh",
   "install-wsl-bridge-service.sh",
   "start-claude-science-wsl.sh",
@@ -150,6 +163,10 @@ $BundledClaudeManifest = Join-Path $BundledClaudeDir "manifest.json"
 if (-not (Test-Path -LiteralPath $BundledClaudeBin)) {
   throw "Bundled Claude Science Linux binary is required but missing: $BundledClaudeBin"
 }
+if (-not (Test-Path -LiteralPath $BundledClaudeManifest)) {
+  throw "Bundled Claude Science manifest is required but missing: $BundledClaudeManifest"
+}
+Assert-CsaUtf8NoBom -Path $BundledClaudeManifest
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "vendor") "claude-science") -Destination (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse
 Get-ChildItem -LiteralPath (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") -Recurse -File |
   Where-Object { $_.Extension -in @(".rar", ".zip", ".7z") } |
@@ -159,6 +176,9 @@ $BundledClaudeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BundledClaude
 if ([string]$BundledClaudeInfo.sha256 -ne $BundledClaudeHash) {
   throw "Bundled Claude Science hash does not match manifest.json."
 }
+$PackagedClaudeManifest = Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "vendor") "claude-science") "linux-x64") "manifest.json"
+Write-CsaUtf8NoBom -Path $PackagedClaudeManifest -Content (($BundledClaudeInfo | ConvertTo-Json -Depth 4) + [Environment]::NewLine)
+Assert-CsaUtf8NoBom -Path $PackagedClaudeManifest
 
 $ExampleConfig = Get-Content -LiteralPath (Join-Path $ProjectDir "config.example.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($secretField in @("deepseek_api_key", "openai_api_key", "custom_api_key", "proxy_auth_token")) {
@@ -179,19 +199,6 @@ if (
 }
 
 $ExeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ExePath).Hash.ToLowerInvariant()
-$SourceCommit = "unknown"
-try {
-  $SourceCommitCandidate = (& git -C $ProjectDir rev-parse HEAD 2>$null | Select-Object -First 1)
-  if ($? -and $SourceCommitCandidate) {
-    $SourceCommit = [string]$SourceCommitCandidate
-  }
-} catch {
-  $SourceCommit = "unknown"
-}
-$SourceDirty = $false
-if ($SourceCommit -ne "unknown") {
-  $SourceDirty = [bool](& git -C $ProjectDir status --porcelain 2>$null | Select-Object -First 1)
-}
 
 $Manifest = [ordered]@{
   schemaVersion = 1
@@ -201,8 +208,9 @@ $Manifest = [ordered]@{
   profile = $Profile
   packageName = $PackageName
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
-  sourceCommit = [string]$SourceCommit
-  sourceTreeDirty = $SourceDirty
+  sourceCommit = [string]$SourceState.Commit
+  sourceTreeObject = [string]$SourceState.Tree
+  sourceTreeDirty = [bool]$SourceState.Dirty
   entrypoint = "claude-science-assistant.exe"
   entrypointSha256 = $ExeHash
   acceptanceHelper = "scripts/acceptance-v0.1.ps1"
@@ -259,7 +267,9 @@ $Manifest = [ordered]@{
     "vendor/"
   )
 }
-$Manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $PackageRoot "manifest.json") -Encoding UTF8
+$PackageManifestPath = Join-Path $PackageRoot "manifest.json"
+Write-CsaUtf8NoBom -Path $PackageManifestPath -Content (($Manifest | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
+Assert-CsaUtf8NoBom -Path $PackageManifestPath
 
 $Readme = @(
   ("# CSA - Claude Science Assistant v{0} portable package" -f $Version),
