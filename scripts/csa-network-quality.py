@@ -4,7 +4,7 @@
 The default probe is local-only: it reads a process environment, reports only
 proxy variable names and credential-free endpoints, and checks loopback proxy
 TCP listeners.  ``--deep`` additionally sends a no-auth, no-billing canary
-request through Claude Science's own sandbox HTTP forwarders.
+request through Claude Science's canonical analysis SOCKS forwarder.
 """
 
 from __future__ import annotations
@@ -15,13 +15,16 @@ import ipaddress
 import json
 import os
 import re
+import select
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -35,11 +38,15 @@ PROXY_VARIABLES = (
     "all_proxy",
 )
 HEALTHY_PROXY_STATES = {"direct", "reachable"}
-DEFAULT_CANARY_URL = (
-    "https://export.arxiv.org/api/query?search_query=all:electron&start=0&max_results=1"
-)
+DEFAULT_CANARY_URL = "https://api.github.com/zen"
 DEFAULT_CACHE_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_EXPECTED_SANDBOX_FORWARDERS = 3
+SANDBOX_PROBE_IDENTITY = "analysis-socks5h-github-zen-v1"
+# The three built-in role forwarders are spawned together during daemon start.
+# A later replacement can make PID ordering assign the wrong allowlist to a
+# role, so fail closed when their start times are no longer one startup burst.
+SANDBOX_ROLE_START_TICK_WINDOW = 500
+SOCAT_EXECUTABLES = {"/usr/bin/socat", "/usr/bin/socat1", "/bin/socat", "/bin/socat1"}
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,52 @@ class ProxyEndpoint:
             return ipaddress.ip_address(self.host).is_loopback
         except ValueError:
             return False
+
+
+@dataclass(frozen=True)
+class SandboxForwarderProcess:
+    pid: int
+    start_ticks: int
+    socket_directory: str
+    transport: str
+    port: int
+    socket_path: str
+    socket_device: int
+    socket_inode: int
+
+
+@dataclass(frozen=True)
+class SandboxForwarder:
+    role: str
+    socket_directory: str
+    first_pid: int
+    http_port: Optional[int]
+    socks_port: Optional[int]
+    http_socket_path: Optional[str]
+    socks_socket_path: Optional[str]
+    http_socket_device: Optional[int]
+    socks_socket_device: Optional[int]
+    http_socket_inode: Optional[int]
+    socks_socket_inode: Optional[int]
+    member_pids: tuple[int, ...]
+    member_start_ticks: tuple[int, ...]
+    http_process_count: int
+    socks_process_count: int
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.http_process_count == 1
+            and self.socks_process_count == 1
+            and self.http_port is not None
+            and self.socks_port is not None
+            and self.http_socket_path is not None
+            and self.socks_socket_path is not None
+            and self.http_socket_device is not None
+            and self.socks_socket_device is not None
+            and bool(self.http_socket_inode)
+            and bool(self.socks_socket_inode)
+        )
 
 
 def parse_proxy_endpoint(value: str) -> Optional[ProxyEndpoint]:
@@ -192,28 +245,314 @@ def process_start_ticks(pid: int) -> Optional[int]:
         return None
 
 
-def sandbox_http_forwarders(claude_pid: int) -> list[int]:
-    ports = set()
-    for process_dir in Path("/proc").iterdir():
+def process_owner_home(pid: int) -> Optional[PurePosixPath]:
+    """Resolve the daemon owner's canonical passwd home, independent of HOME."""
+    try:
+        status_lines = Path(f"/proc/{pid}/status").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        uid_line = next(line for line in status_lines if line.startswith("Uid:"))
+        uid = int(uid_line.split()[1])
+        import pwd
+
+        home = PurePosixPath(pwd.getpwuid(uid).pw_dir)
+    except (ImportError, OSError, KeyError, StopIteration, ValueError, IndexError):
+        return None
+    return home if home.is_absolute() else None
+
+
+def parse_sandbox_forwarder_command(
+    pid: int,
+    start_ticks: int,
+    arguments: list[str],
+    claude_pid: Optional[int] = None,
+    sandbox_root: Optional[PurePosixPath] = None,
+) -> Optional[SandboxForwarderProcess]:
+    """Parse one direct socat child without trusting arbitrary TCP targets."""
+    if not arguments or PurePosixPath(arguments[0]).name != "socat":
+        return None
+    listeners = [
+        argument for argument in arguments[1:] if argument.startswith("UNIX-LISTEN:")
+    ]
+    targets = [
+        argument
+        for argument in arguments[1:]
+        if re.match(r"^TCP(?:4|6)?:", argument)
+    ]
+    if len(listeners) != 1 or len(targets) != 1:
+        return None
+    listener = listeners[0]
+    target = targets[0]
+
+    socket_path = listener.split(":", 1)[1].split(",", 1)[0]
+    parsed_socket_path = PurePosixPath(socket_path)
+    if not parsed_socket_path.is_absolute():
+        return None
+    socket_name = parsed_socket_path.name
+    if socket_name == "http.sock":
+        transport = "http"
+    elif socket_name == "socks.sock":
+        transport = "socks"
+    else:
+        return None
+    socket_directory = parsed_socket_path.parent
+    if claude_pid is not None or sandbox_root is not None:
+        if claude_pid is None or sandbox_root is None:
+            return None
+        expected_name = re.compile(rf"^sock-{claude_pid}-[A-Za-z0-9_-]+$")
+        if (
+            socket_directory.parent != sandbox_root
+            or not expected_name.fullmatch(socket_directory.name)
+        ):
+            return None
+    match = re.match(
+        r"^TCP(?:4|6)?:(?:localhost|127\.0\.0\.1|\[?::1\]?):(\d+)(?:,|$)",
+        target,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    port = int(match.group(1))
+    if not (1 <= port <= 65535):
+        return None
+    return SandboxForwarderProcess(
+        pid=pid,
+        start_ticks=start_ticks,
+        socket_directory=str(socket_directory),
+        transport=transport,
+        port=port,
+        socket_path=str(parsed_socket_path),
+        socket_device=0,
+        socket_inode=0,
+    )
+
+
+def group_sandbox_forwarders(
+    processes: list[SandboxForwarderProcess],
+) -> list[SandboxForwarder]:
+    """Group HTTP/SOCKS listeners and map daemon spawn order to known roles."""
+    grouped: dict[str, list[SandboxForwarderProcess]] = {}
+    for process in sorted(processes, key=lambda item: item.pid):
+        grouped.setdefault(process.socket_directory, []).append(process)
+
+    ordered_groups = sorted(
+        grouped.items(), key=lambda item: min(process.pid for process in item[1])
+    )
+    known_roles = ("analysis", "operon", "byoc")
+    forwarders = []
+    for index, (socket_directory, members) in enumerate(ordered_groups):
+        role = known_roles[index] if index < len(known_roles) else f"infer-{index - 2}"
+        http_members = [item for item in members if item.transport == "http"]
+        socks_members = [item for item in members if item.transport == "socks"]
+        forwarders.append(
+            SandboxForwarder(
+                role=role,
+                socket_directory=socket_directory,
+                first_pid=min(item.pid for item in members),
+                http_port=http_members[0].port if http_members else None,
+                socks_port=socks_members[0].port if socks_members else None,
+                http_socket_path=http_members[0].socket_path if http_members else None,
+                socks_socket_path=socks_members[0].socket_path if socks_members else None,
+                http_socket_device=http_members[0].socket_device if http_members else None,
+                socks_socket_device=socks_members[0].socket_device if socks_members else None,
+                http_socket_inode=http_members[0].socket_inode if http_members else None,
+                socks_socket_inode=socks_members[0].socket_inode if socks_members else None,
+                member_pids=tuple(sorted(item.pid for item in members)),
+                member_start_ticks=tuple(
+                    item.start_ticks for item in sorted(members, key=lambda item: item.pid)
+                ),
+                http_process_count=len(http_members),
+                socks_process_count=len(socks_members),
+            )
+        )
+    return forwarders
+
+
+def sandbox_forwarders(claude_pid: int) -> list[SandboxForwarder]:
+    processes = []
+    owner_home = process_owner_home(claude_pid)
+    if owner_home is None:
+        return []
+    sandbox_root = owner_home / ".claude-science" / "sbx-bind-src"
+    try:
+        process_directories = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for process_dir in process_directories:
         if not process_dir.name.isdigit():
             continue
         pid = int(process_dir.name)
-        if process_parent_pid(pid) != claude_pid:
+        parent_before = process_parent_pid(pid)
+        start_ticks_before = process_start_ticks(pid)
+        if parent_before != claude_pid or start_ticks_before is None:
             continue
         try:
-            command = (process_dir / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", errors="replace"
-            )
+            executable_before = os.readlink(process_dir / "exe")
+            payload = (process_dir / "cmdline").read_bytes()
         except OSError:
             continue
-        if "socat" not in command or "/http.sock" not in command:
+        parent_after = process_parent_pid(pid)
+        start_ticks_after = process_start_ticks(pid)
+        try:
+            executable_after = os.readlink(process_dir / "exe")
+        except OSError:
             continue
-        match = re.search(r"\bTCP:(?:localhost|127\.0\.0\.1):(\d+)\b", command)
-        if match:
-            port = int(match.group(1))
-            if 1 <= port <= 65535:
-                ports.add(port)
-    return sorted(ports)
+        if (
+            executable_before != executable_after
+            or executable_after not in SOCAT_EXECUTABLES
+            or parent_after != claude_pid
+            or start_ticks_after != start_ticks_before
+        ):
+            continue
+        arguments = [
+            item.decode("utf-8", errors="replace")
+            for item in payload.split(b"\0")
+            if item
+        ]
+        parsed = parse_sandbox_forwarder_command(
+            pid, start_ticks_before, arguments, claude_pid, sandbox_root
+        )
+        if parsed is None:
+            continue
+        try:
+            socket_metadata = os.lstat(parsed.socket_path)
+        except OSError:
+            continue
+        if not stat.S_ISSOCK(socket_metadata.st_mode):
+            continue
+        processes.append(
+            replace(
+                parsed,
+                socket_device=socket_metadata.st_dev,
+                socket_inode=socket_metadata.st_ino,
+            )
+        )
+    return group_sandbox_forwarders(processes)
+
+
+def sandbox_forwarder_fingerprint(forwarders: list[SandboxForwarder]) -> Optional[str]:
+    if not forwarders:
+        return None
+    identity = "|".join(
+        ":".join(
+            (
+                item.role,
+                item.socket_directory,
+                str(item.first_pid),
+                ",".join(str(pid) for pid in item.member_pids),
+                ",".join(str(ticks) for ticks in item.member_start_ticks),
+                str(item.http_port or 0),
+                str(item.socks_port or 0),
+                item.http_socket_path or "-",
+                item.socks_socket_path or "-",
+                str(item.http_socket_device or 0),
+                str(item.socks_socket_device or 0),
+                str(item.http_socket_inode or 0),
+                str(item.socks_socket_inode or 0),
+                str(item.http_process_count),
+                str(item.socks_process_count),
+            )
+        )
+        for item in forwarders
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def socket_identity_matches(path: str, device: int, inode: int) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISSOCK(metadata.st_mode)
+        and metadata.st_dev == device
+        and metadata.st_ino == inode
+    )
+
+
+class UnixSocketTcpAdapter:
+    """Expose one Unix SOCKS socket on an ephemeral loopback TCP listener."""
+
+    def __init__(self, unix_socket_path: str):
+        self.unix_socket_path = unix_socket_path
+        self.listener: Optional[socket.socket] = None
+        self.client: Optional[socket.socket] = None
+        self.upstream: Optional[socket.socket] = None
+        self.thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.port = 0
+        self.error: Optional[str] = None
+
+    def __enter__(self) -> "UnixSocketTcpAdapter":
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.2)
+        self.listener = listener
+        self.port = int(listener.getsockname()[1])
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        return self
+
+    def _serve(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    client, _address = self.listener.accept() if self.listener else (None, None)
+                except socket.timeout:
+                    continue
+                if client is None:
+                    return
+                self.client = client
+                break
+            if self.client is None or self.stop_event.is_set():
+                return
+
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            upstream.settimeout(3)
+            upstream.connect(self.unix_socket_path)
+            upstream.settimeout(None)
+            self.upstream = upstream
+            peers = {self.client: upstream, upstream: self.client}
+            while peers and not self.stop_event.is_set():
+                readable, _writable, _exceptional = select.select(
+                    list(peers), [], [], 0.2
+                )
+                for source in readable:
+                    target = peers[source]
+                    data = source.recv(64 * 1024)
+                    if data:
+                        target.sendall(data)
+                        continue
+                    peers.pop(source, None)
+                    try:
+                        target.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+        except OSError as error:
+            if not self.stop_event.is_set():
+                self.error = type(error).__name__
+        finally:
+            self._close_socket(self.client)
+            self._close_socket(self.upstream)
+
+    @staticmethod
+    def _close_socket(candidate: Optional[socket.socket]) -> None:
+        if candidate is None:
+            return
+        try:
+            candidate.close()
+        except OSError:
+            pass
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.stop_event.set()
+        self._close_socket(self.listener)
+        self._close_socket(self.client)
+        self._close_socket(self.upstream)
+        if self.thread is not None:
+            self.thread.join(timeout=1)
 
 
 def canary_target(
@@ -249,113 +588,152 @@ def canary_target(
 
 
 def probe_sandbox_egress(
-    ports: list[int],
+    forwarders: list[SandboxForwarder],
     url: str,
     deep: bool,
     expected_forwarders: int = DEFAULT_EXPECTED_SANDBOX_FORWARDERS,
 ) -> dict:
     target, valid_target, canary_identity, canary_fingerprint = canary_target(url)
-    topology_state = (
-        "incomplete"
-        if len(ports) < expected_forwarders
-        else "expected"
-        if len(ports) == expected_forwarders
-        else "unexpected_extra"
+    complete_forwarders = [item for item in forwarders if item.complete]
+    http_count = sum(item.http_process_count for item in forwarders)
+    socks_count = sum(item.socks_process_count for item in forwarders)
+    builtin_start_ticks = [
+        ticks
+        for item in forwarders[:expected_forwarders]
+        for ticks in item.member_start_ticks
+    ]
+    roles_stable = (
+        len(forwarders) >= expected_forwarders
+        and len(builtin_start_ticks) == expected_forwarders * 2
+        and max(builtin_start_ticks) - min(builtin_start_ticks)
+        <= SANDBOX_ROLE_START_TICK_WINDOW
+    )
+    builtin_forwarders = forwarders[:expected_forwarders]
+    if len(builtin_forwarders) < expected_forwarders or any(
+        not item.complete for item in builtin_forwarders
+    ):
+        topology_state = "incomplete"
+    elif not roles_stable:
+        topology_state = "unstable"
+    elif len(forwarders) == expected_forwarders:
+        topology_state = "expected"
+    else:
+        topology_state = "extended"
+    incomplete_extra_count = sum(
+        1 for item in forwarders[expected_forwarders:] if not item.complete
     )
     result = {
         "deep_checked": bool(deep),
-        "sandbox_forwarder_count": len(ports),
+        "sandbox_forwarder_count": len(complete_forwarders),
+        "sandbox_forwarder_group_count": len(forwarders),
+        "sandbox_http_forwarder_count": http_count,
+        "sandbox_socks_forwarder_count": socks_count,
         "sandbox_forwarder_expected_count": expected_forwarders,
         "sandbox_forwarder_topology_state": topology_state,
-        "sandbox_forwarder_fingerprint": (
-            hashlib.sha256(",".join(str(port) for port in ports).encode()).hexdigest()[:16]
-            if ports
-            else None
-        ),
+        "sandbox_forwarder_incomplete_extra_count": incomplete_extra_count,
+        "sandbox_forwarder_fingerprint": sandbox_forwarder_fingerprint(forwarders),
+        "sandbox_probe_identity": SANDBOX_PROBE_IDENTITY,
+        "sandbox_probe_role": "analysis",
+        "sandbox_probe_transport": "socks5h",
         "sandbox_egress_state": "not_checked",
         "sandbox_egress_target": target,
         "sandbox_egress_canary_identity": canary_identity,
         "sandbox_egress_canary_fingerprint": canary_fingerprint,
         "sandbox_egress_http_status": None,
         "sandbox_egress_http_statuses": [],
+        "sandbox_forwarder_probe_count": 0,
         "sandbox_forwarder_passed_count": 0,
         "sandbox_forwarder_failed_count": 0,
     }
     if not deep:
         return result
-    if not valid_target:
+    if not valid_target or url != DEFAULT_CANARY_URL:
         result["sandbox_egress_state"] = "invalid_target"
         return result
-    if not ports:
-        result["sandbox_egress_state"] = "unavailable"
+    analysis = next((item for item in forwarders if item.role == "analysis"), None)
+    if analysis is None or not analysis.complete or analysis.socks_port is None:
+        result["sandbox_egress_state"] = (
+            "topology_incomplete" if topology_state == "incomplete" else "unavailable"
+        )
         return result
     curl = shutil.which("curl")
     if not curl:
         result["sandbox_egress_state"] = "unavailable"
         return result
 
-    attempts = []
-    for port in ports:
-        command = [
-            curl,
-            "--silent",
-            "--show-error",
-            "--output",
-            os.devnull,
-            "--write-out",
-            "%{http_code}",
-            "--noproxy",
-            "",
-            "--proxy",
-            f"http://127.0.0.1:{port}",
-            "--connect-timeout",
-            "1",
-            "--max-time",
-            "4",
-            "--retry",
-            "0",
-            "--user-agent",
-            "CSA-Network-Quality/1",
-            url,
-        ]
-        clean_environment = dict(os.environ)
-        for name in PROXY_VARIABLES:
-            clean_environment.pop(name, None)
-        try:
+    clean_environment = dict(os.environ)
+    for name in (*PROXY_VARIABLES, "NO_PROXY", "no_proxy"):
+        clean_environment.pop(name, None)
+    status = 0
+    process_passed = False
+    adapter_error = "unavailable"
+    try:
+        with UnixSocketTcpAdapter(analysis.socks_socket_path) as adapter:
+            command = [
+                curl,
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--output",
+                os.devnull,
+                "--write-out",
+                "%{http_code}",
+                "--noproxy",
+                "",
+                "--socks5-hostname",
+                f"127.0.0.1:{adapter.port}",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "8",
+                "--retry",
+                "0",
+                "--user-agent",
+                "CSA-Network-Quality/1",
+                url,
+            ]
             completed = subprocess.run(
                 command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=5,
+                timeout=10,
                 check=False,
                 env=clean_environment,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            attempts.append((0, False))
-            continue
-        try:
-            status = int(completed.stdout.strip() or "0")
-        except ValueError:
-            status = 0
-        attempts.append((status, completed.returncode == 0 and 200 <= status < 300))
+            try:
+                status = int(completed.stdout.strip() or "0")
+            except ValueError:
+                status = 0
+            process_passed = completed.returncode == 0 and 200 <= status < 300
+        adapter_error = adapter.error
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    passed = (
+        process_passed
+        and adapter_error is None
+        and socket_identity_matches(
+            analysis.socks_socket_path,
+            analysis.socks_socket_device,
+            analysis.socks_socket_inode,
+        )
+    )
 
-    statuses = [status for status, _passed in attempts]
-    passed_count = sum(1 for _status, passed in attempts if passed)
-    failed_count = len(attempts) - passed_count
+    statuses = [status]
+    passed_count = int(passed)
+    failed_count = int(not passed)
     nonzero_statuses = [status for status in statuses if status]
     unique_statuses = sorted(set(nonzero_statuses))
     result["sandbox_egress_http_statuses"] = unique_statuses
+    result["sandbox_forwarder_probe_count"] = 1
     result["sandbox_forwarder_passed_count"] = passed_count
     result["sandbox_forwarder_failed_count"] = failed_count
 
-    if topology_state == "incomplete":
-        result["sandbox_egress_state"] = "topology_incomplete"
-    elif passed_count == len(ports):
+    if topology_state not in {"expected", "extended"}:
+        result["sandbox_egress_state"] = f"topology_{topology_state}"
+    elif passed:
         result["sandbox_egress_state"] = "ok"
-    elif passed_count:
-        result["sandbox_egress_state"] = "partial_failure"
     elif unique_statuses == [502]:
         result["sandbox_egress_state"] = "http_502"
     elif unique_statuses == [403]:
@@ -391,15 +769,39 @@ def build_report(
             }
         else:
             proxy_report = inspect_proxy_environment(environment)
-        forwarders = sandbox_http_forwarders(pid) if process_state == "ok" else []
         start_ticks = process_start_ticks(pid) if process_state == "ok" else None
+        forwarders = (
+            sandbox_forwarders(pid)
+            if process_state == "ok" and start_ticks is not None
+            else []
+        )
+
+    egress_report = probe_sandbox_egress(
+        forwarders, canary_url, deep, expected_forwarders
+    )
+    contract_stable_during_probe = None
+    if deep:
+        contract_stable_during_probe = False
+        if pid is not None and start_ticks is not None:
+            refreshed_start_ticks = process_start_ticks(pid)
+            refreshed_forwarders = sandbox_forwarders(pid)
+            contract_stable_during_probe = (
+                refreshed_start_ticks == start_ticks
+                and sandbox_forwarder_fingerprint(refreshed_forwarders)
+                == sandbox_forwarder_fingerprint(forwarders)
+            )
+        if not contract_stable_during_probe:
+            egress_report["sandbox_egress_state"] = "contract_changed"
+    egress_report["sandbox_contract_stable_during_probe"] = (
+        contract_stable_during_probe
+    )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "claude_pid": pid,
         "claude_start_ticks": start_ticks,
         **proxy_report,
-        **probe_sandbox_egress(forwarders, canary_url, deep, expected_forwarders),
+        **egress_report,
         "deep_checked_at_unix": int(time.time()) if deep else None,
         "secrets_included": False,
     }
@@ -417,18 +819,31 @@ def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> d
     if age < 0 or age > max_age_seconds:
         return report
     identity_fields = (
+        "schema_version",
         "claude_pid",
         "claude_start_ticks",
         "proxy_state",
         "proxy_endpoints",
         "sandbox_forwarder_count",
+        "sandbox_forwarder_group_count",
+        "sandbox_http_forwarder_count",
+        "sandbox_socks_forwarder_count",
         "sandbox_forwarder_expected_count",
+        "sandbox_forwarder_topology_state",
+        "sandbox_forwarder_incomplete_extra_count",
         "sandbox_forwarder_fingerprint",
+        "sandbox_probe_identity",
+        "sandbox_probe_role",
+        "sandbox_probe_transport",
         "sandbox_egress_canary_fingerprint",
     )
     if any(cached.get(name) != report.get(name) for name in identity_fields):
         return report
     if cached.get("deep_checked") is not True:
+        return report
+    if report.get("claude_pid") is not None and not isinstance(
+        report.get("claude_start_ticks"), int
+    ):
         return report
     for name in (
         "deep_checked",
@@ -439,6 +854,8 @@ def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> d
         "sandbox_egress_canary_fingerprint",
         "sandbox_egress_http_status",
         "sandbox_egress_http_statuses",
+        "sandbox_contract_stable_during_probe",
+        "sandbox_forwarder_probe_count",
         "sandbox_forwarder_passed_count",
         "sandbox_forwarder_failed_count",
     ):
@@ -472,11 +889,11 @@ def parse_args() -> argparse.Namespace:
     target.add_argument("--pid", type=int, help="Claude Science daemon PID to inspect")
     target.add_argument("--current", action="store_true", help="Inspect this process environment")
     parser.add_argument("--deep", action="store_true", help="Run the sandbox egress canary")
-    parser.add_argument("--canary-url", default=DEFAULT_CANARY_URL)
     parser.add_argument(
         "--expected-forwarders",
         type=int,
         default=DEFAULT_EXPECTED_SANDBOX_FORWARDERS,
+        help="Built-in pair contract (fixed at 3 for Claude Science 0.1.25)",
     )
     parser.add_argument("--cache-file", type=Path)
     parser.add_argument(
@@ -500,11 +917,13 @@ def main() -> int:
         raise SystemExit("--pid must be positive")
     if args.cache_max_age < 0:
         raise SystemExit("--cache-max-age must not be negative")
-    if args.expected_forwarders < 1:
-        raise SystemExit("--expected-forwarders must be positive")
+    if args.expected_forwarders != DEFAULT_EXPECTED_SANDBOX_FORWARDERS:
+        raise SystemExit("--expected-forwarders must be exactly 3 for Claude Science 0.1.25")
     if args.write_cache and (not args.deep or args.cache_file is None):
         raise SystemExit("--write-cache requires --deep and --cache-file")
-    report = build_report(args.pid, args.deep, args.canary_url, args.expected_forwarders)
+    report = build_report(
+        args.pid, args.deep, DEFAULT_CANARY_URL, args.expected_forwarders
+    )
     cache_written = True
     if args.deep and args.write_cache and args.cache_file is not None:
         cache_written = write_cache(report, args.cache_file)
@@ -514,12 +933,11 @@ def main() -> int:
         proxy_state = report["proxy_state"]
         if proxy_state not in HEALTHY_PROXY_STATES:
             print(proxy_state)
-        elif (
-            args.pid is not None
-            and report["sandbox_forwarder_count"]
-            < report["sandbox_forwarder_expected_count"]
-        ):
-            print("sandbox_incomplete")
+        elif args.pid is not None and report["sandbox_forwarder_topology_state"] not in {
+            "expected",
+            "extended",
+        }:
+            print(f"sandbox_{report['sandbox_forwarder_topology_state']}")
         elif args.deep and report["sandbox_egress_state"] != "ok":
             print(f"egress_{report['sandbox_egress_state']}")
         elif args.write_cache and not cache_written:

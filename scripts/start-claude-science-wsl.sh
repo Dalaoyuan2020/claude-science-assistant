@@ -104,7 +104,7 @@ record_deep_network_quality() {
     --pid "$pid" --deep --cache-file "$NETWORK_CACHE_FILE" --write-cache --contract-only \
     2>/dev/null || printf 'unknown\n')"
   if [ "$verdict" = "ready" ]; then
-    echo "Claude Science sandbox egress canary passed (anonymous, non-billable arXiv request)."
+    echo "Claude Science sandbox egress canary passed (anonymous, non-billable HTTPS API request to GitHub Zen)."
     return 0
   fi
   echo "Warning: Claude Science local services started, but sandbox egress quality is $verdict. The degraded result was cached for diagnostics; no model request was made." >&2

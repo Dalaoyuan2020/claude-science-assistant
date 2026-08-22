@@ -76,8 +76,13 @@ remain open after the daemon's inherited upstream proxy has stopped. Run:
 ```
 
 The report separates four facts: managed process ownership, inherited proxy endpoint reachability,
-sandbox HTTP forwarder ownership, and an anonymous/non-billable arXiv request through the real
-sandbox route. Proxy URLs are reduced to scheme/host/port and credentials are never included.
+all three built-in HTTP/SOCKS sandbox pairs, and an anonymous, non-billable HTTPS API request to
+GitHub Zen through the canonical `analysis` SOCKS5H route. The Operon and BYOC pairs have different
+allowlists, so topology is verified for all roles while the egress canary intentionally probes only
+`analysis`. The fixed canary cannot be replaced by an environment variable, and a short-lived
+loopback adapter sends the probe through the real `analysis/socks.sock` Unix socket rather than
+bypassing it through the backing TCP port. Proxy URLs are reduced to scheme/host/port and credentials
+are never included.
 
 If `proxy_state` is `unreachable` or `conflict`, use the launcher's **修复并重启** action after the
 current experiment finishes. A Bridge-only restart cannot refresh proxy variables already inherited

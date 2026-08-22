@@ -103,6 +103,7 @@ if (Test-Path -LiteralPath $packageScriptPath) {
   foreach ($portableRuntimeFile in @(
     '"csa-network-quality.py"',
     '"test_network_quality.py"',
+    '"unix_socket_adapter_integration_test.py"',
     '"runtime_activation_integration_test.sh"',
     '"runtime_network_contract_functions_test.sh"',
     '"runtime_lifecycle_20cycle_test.sh"'

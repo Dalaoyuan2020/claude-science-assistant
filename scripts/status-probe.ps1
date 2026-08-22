@@ -23,6 +23,14 @@ function Try-Value {
   try { & $Action } catch { $Fallback }
 }
 
+function Get-OptionalProperty {
+  param($InputObject, [string]$Name, $Fallback = $null)
+  if ($null -eq $InputObject) { return $Fallback }
+  $property = $InputObject.PSObject.Properties[$Name]
+  if ($null -eq $property) { return $Fallback }
+  return $property.Value
+}
+
 function Get-Distros {
   $raw = ((& wsl.exe --list --quiet 2>$null) -replace [char]0, "")
   @($raw | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^docker-desktop' })
@@ -282,8 +290,51 @@ $systemdRunning = [bool]($wslProbe -and $wslProbe.wsl.systemd)
 $unitMatchesProject = [bool]($wslProbe -and ((-not $systemdRunning) -or $wslProbe.runtime.unit_matches_project -eq $true))
 $proxyState = if ($wslProbe -and $wslProbe.network) { [string]$wslProbe.network.proxy_state } else { "unknown" }
 $proxyContractReady = $proxyState -in @("direct", "reachable")
-$sandboxForwardersReady = [bool]($wslProbe -and $wslProbe.network.sandbox_forwarder_count -gt 0)
-$deepEgressReady = [bool]($wslProbe -and $wslProbe.network.deep_checked -and $wslProbe.network.sandbox_egress_state -eq "ok")
+$networkProbe = if ($wslProbe) { $wslProbe.network } else { $null }
+$sandboxPairCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_count" 0)
+$sandboxExpectedCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_expected_count" 0)
+$sandboxHttpCount = [int](Get-OptionalProperty $networkProbe "sandbox_http_forwarder_count" 0)
+$sandboxSocksCount = [int](Get-OptionalProperty $networkProbe "sandbox_socks_forwarder_count" 0)
+$sandboxTopologyState = [string](Get-OptionalProperty $networkProbe "sandbox_forwarder_topology_state" "incomplete")
+$sandboxProbeIdentity = [string](Get-OptionalProperty $networkProbe "sandbox_probe_identity" "")
+$sandboxProbeRole = [string](Get-OptionalProperty $networkProbe "sandbox_probe_role" "")
+$sandboxProbeTransport = [string](Get-OptionalProperty $networkProbe "sandbox_probe_transport" "")
+$sandboxEgressTarget = [string](Get-OptionalProperty $networkProbe "sandbox_egress_target" "")
+$sandboxCanaryIdentity = [string](Get-OptionalProperty $networkProbe "sandbox_egress_canary_identity" "")
+$sandboxDeepChecked = [bool](Get-OptionalProperty $networkProbe "deep_checked" $false)
+$sandboxEgressState = [string](Get-OptionalProperty $networkProbe "sandbox_egress_state" "not_checked")
+$sandboxContractStable = [bool](Get-OptionalProperty $networkProbe "sandbox_contract_stable_during_probe" $false)
+$sandboxProbeCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_probe_count" 0)
+$sandboxProbePassedCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_passed_count" 0)
+$sandboxProbeFailedCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_failed_count" 0)
+$sandboxEgressHttpStatus = [int](Get-OptionalProperty $networkProbe "sandbox_egress_http_status" 0)
+$sandboxProbeContractReady = [bool](
+  $sandboxProbeIdentity -eq "analysis-socks5h-github-zen-v1" -and
+  $sandboxProbeRole -eq "analysis" -and
+  $sandboxProbeTransport -eq "socks5h" -and
+  $sandboxEgressTarget -eq "api.github.com" -and
+  $sandboxCanaryIdentity -eq "https://api.github.com/zen"
+)
+$sandboxForwardersReady = [bool](
+  $wslProbe -and
+  $sandboxExpectedCount -ge 3 -and
+  $sandboxPairCount -ge $sandboxExpectedCount -and
+  $sandboxHttpCount -ge $sandboxExpectedCount -and
+  $sandboxSocksCount -ge $sandboxExpectedCount -and
+  $sandboxProbeContractReady -and
+  $sandboxTopologyState -in @("expected", "extended")
+)
+$deepEgressReady = [bool](
+  $wslProbe -and
+  $sandboxDeepChecked -and
+  $sandboxContractStable -and
+  $sandboxEgressState -eq "ok" -and
+  $sandboxProbeCount -eq 1 -and
+  $sandboxProbePassedCount -eq 1 -and
+  $sandboxProbeFailedCount -eq 0 -and
+  $sandboxEgressHttpStatus -ge 200 -and
+  $sandboxEgressHttpStatus -lt 300
+)
 $networkReady = [bool]($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and $deepEgressReady)
 
 if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid", "unknown")) {
@@ -292,13 +343,13 @@ if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid",
   $warnings.Add("Claude Science outbound proxy contract is $proxyState ($endpoints). Local ports can remain open while sandbox/API requests fail.")
 }
 if ($claudeDetected -and -not $sandboxForwardersReady) {
-  $warnings.Add("Claude Science is listening, but no owned sandbox HTTP forwarder was detected.")
+  $warnings.Add("Claude Science is listening, but its owned sandbox HTTP/SOCKS pair topology is not ready ($sandboxPairCount/$sandboxExpectedCount, state=$sandboxTopologyState).")
 }
-if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -not $wslProbe.network.deep_checked) {
+if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -not $sandboxDeepChecked) {
   $warnings.Add("Sandbox egress has not passed a fresh end-to-end canary. Re-run with -DeepNetworkProbe.")
 }
-if ($wslProbe -and $wslProbe.network.deep_checked -and -not $deepEgressReady) {
-  $warnings.Add("Sandbox egress canary failed: $($wslProbe.network.sandbox_egress_state). No billable model request was made.")
+if ($wslProbe -and $sandboxDeepChecked -and -not $deepEgressReady) {
+  $warnings.Add("Sandbox egress canary failed: $sandboxEgressState. No billable model request was made.")
 }
 
 $overall = "not_ready"

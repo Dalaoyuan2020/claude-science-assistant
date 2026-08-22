@@ -130,6 +130,7 @@ foreach ($file in @("lib.rs", "runtime_lifecycle.rs")) {
 foreach ($file in @(
   "test_translation.py",
   "test_network_quality.py",
+  "unix_socket_adapter_integration_test.py",
   "package_policy_test.ps1",
   "runtime_layout_test.sh",
   "runtime_activation_integration_test.sh",

@@ -119,6 +119,9 @@ try {
   Invoke-GateStep "WSL runtime network contract functions" $ProjectDir {
     & wsl.exe -d $Distro -- bash "$projectWsl/tests/runtime_network_contract_functions_test.sh" "$projectWsl"
   }
+  Invoke-GateStep "WSL Unix socket adapter" $ProjectDir {
+    & wsl.exe -d $Distro -- python3 "$projectWsl/tests/unix_socket_adapter_integration_test.py" "$projectWsl"
+  }
   Invoke-GateStep "WSL 20-cycle lifecycle" $ProjectDir {
     & wsl.exe -d $Distro -- bash "$projectWsl/tests/runtime_lifecycle_20cycle_test.sh" "$projectWsl"
   }

@@ -32,6 +32,8 @@ const BUNDLED_CLAUDE_SCIENCE_VERSION: &str = "0.1.25";
 const BUNDLED_CLAUDE_SCIENCE_SHA8: &str = "b7190511";
 const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
 const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
+const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-github-zen-v1";
+const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://api.github.com/zen";
 
 fn deep_network_result_is_fresh(
     deep_checked: bool,
@@ -206,6 +208,12 @@ struct NetworkQualityStatus {
     proxy_endpoints: Vec<String>,
     proxy_conflict: bool,
     sandbox_forwarder_count: u32,
+    sandbox_forwarder_expected_count: u32,
+    sandbox_forwarder_topology_state: String,
+    sandbox_http_forwarder_count: u32,
+    sandbox_socks_forwarder_count: u32,
+    sandbox_probe_role: String,
+    sandbox_probe_transport: String,
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
     sandbox_egress_state: String,
@@ -223,6 +231,12 @@ impl Default for NetworkQualityStatus {
             proxy_endpoints: Vec::new(),
             proxy_conflict: false,
             sandbox_forwarder_count: 0,
+            sandbox_forwarder_expected_count: 3,
+            sandbox_forwarder_topology_state: "incomplete".into(),
+            sandbox_http_forwarder_count: 0,
+            sandbox_socks_forwarder_count: 0,
+            sandbox_probe_role: "analysis".into(),
+            sandbox_probe_transport: "socks5h".into(),
             deep_checked: false,
             deep_checked_at_unix: None,
             sandbox_egress_state: "not_checked".into(),
@@ -358,12 +372,61 @@ struct WslProbeNetwork {
     #[serde(default)]
     sandbox_forwarder_count: u32,
     #[serde(default)]
+    sandbox_forwarder_expected_count: u32,
+    #[serde(default)]
+    sandbox_forwarder_topology_state: String,
+    #[serde(default)]
+    sandbox_http_forwarder_count: u32,
+    #[serde(default)]
+    sandbox_socks_forwarder_count: u32,
+    #[serde(default)]
+    sandbox_probe_identity: String,
+    #[serde(default)]
+    sandbox_probe_role: String,
+    #[serde(default)]
+    sandbox_probe_transport: String,
+    #[serde(default)]
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
     #[serde(default)]
+    sandbox_contract_stable_during_probe: bool,
+    #[serde(default)]
     sandbox_egress_state: String,
     sandbox_egress_target: Option<String>,
+    sandbox_egress_canary_identity: Option<String>,
     sandbox_egress_http_status: Option<u16>,
+    #[serde(default)]
+    sandbox_forwarder_probe_count: u32,
+    #[serde(default)]
+    sandbox_forwarder_passed_count: u32,
+    #[serde(default)]
+    sandbox_forwarder_failed_count: u32,
+}
+
+fn sandbox_forwarder_topology_is_ready(network: &WslProbeNetwork) -> bool {
+    network.sandbox_forwarder_expected_count >= 3
+        && network.sandbox_forwarder_count >= network.sandbox_forwarder_expected_count
+        && network.sandbox_http_forwarder_count >= network.sandbox_forwarder_expected_count
+        && network.sandbox_socks_forwarder_count >= network.sandbox_forwarder_expected_count
+        && matches!(
+            network.sandbox_forwarder_topology_state.as_str(),
+            "expected" | "extended"
+        )
+        && network.sandbox_probe_identity == SANDBOX_NETWORK_PROBE_IDENTITY
+        && network.sandbox_probe_role == "analysis"
+        && network.sandbox_probe_transport == "socks5h"
+        && network.sandbox_egress_target.as_deref() == Some("api.github.com")
+        && network.sandbox_egress_canary_identity.as_deref()
+            == Some(SANDBOX_NETWORK_CANARY_IDENTITY)
+}
+
+fn sandbox_deep_egress_is_ready(network: &WslProbeNetwork) -> bool {
+    network.sandbox_contract_stable_during_probe
+        && network.sandbox_egress_state == "ok"
+        && network.sandbox_forwarder_probe_count == 1
+        && network.sandbox_forwarder_passed_count == 1
+        && network.sandbox_forwarder_failed_count == 0
+        && matches!(network.sandbox_egress_http_status, Some(status) if (200..300).contains(&status))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1009,7 +1072,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         probe.network.proxy_state.clone()
     };
     let proxy_contract_ok = matches!(proxy_state.as_str(), "direct" | "reachable");
-    let sandbox_forwarders_ready = probe.network.sandbox_forwarder_count > 0;
+    let sandbox_forwarders_ready = sandbox_forwarder_topology_is_ready(&probe.network);
     let local_network_ready = claude_running && proxy_contract_ok && sandbox_forwarders_ready;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1021,7 +1084,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         now_unix,
     );
     let network_ready =
-        local_network_ready && deep_result_fresh && probe.network.sandbox_egress_state == "ok";
+        local_network_ready && deep_result_fresh && sandbox_deep_egress_is_ready(&probe.network);
     let network = NetworkQualityStatus {
         proxy_state: proxy_state.clone(),
         local_ready: local_network_ready,
@@ -1030,6 +1093,12 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         proxy_endpoints: probe.network.proxy_endpoints.clone(),
         proxy_conflict: probe.network.proxy_conflict,
         sandbox_forwarder_count: probe.network.sandbox_forwarder_count,
+        sandbox_forwarder_expected_count: probe.network.sandbox_forwarder_expected_count,
+        sandbox_forwarder_topology_state: probe.network.sandbox_forwarder_topology_state.clone(),
+        sandbox_http_forwarder_count: probe.network.sandbox_http_forwarder_count,
+        sandbox_socks_forwarder_count: probe.network.sandbox_socks_forwarder_count,
+        sandbox_probe_role: probe.network.sandbox_probe_role.clone(),
+        sandbox_probe_transport: probe.network.sandbox_probe_transport.clone(),
         deep_checked: deep_result_fresh,
         deep_checked_at_unix: probe.network.deep_checked_at_unix,
         sandbox_egress_state: if probe.network.sandbox_egress_state.trim().is_empty() {
@@ -1130,10 +1199,15 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         ));
     }
     if claude_running && !sandbox_forwarders_ready {
-        warnings.push("Claude Science is listening locally, but no owned sandbox HTTP forwarder was found; sandbox egress is not ready.".into());
+        warnings.push(format!(
+            "Claude Science is listening locally, but its owned sandbox HTTP/SOCKS pair topology is not ready ({}/{}, state={}); sandbox egress is not ready.",
+            probe.network.sandbox_forwarder_count,
+            probe.network.sandbox_forwarder_expected_count,
+            probe.network.sandbox_forwarder_topology_state
+        ));
     }
     if local_network_ready && !deep_result_fresh {
-        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable arXiv deep check before treating external APIs as ready.".into());
+        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable HTTPS API deep check (GitHub Zen) before treating external APIs as ready.".into());
     }
     if deep_result_fresh
         && !matches!(
@@ -5661,6 +5735,67 @@ mod tests {
         assert!(!deep_network_result_is_fresh(true, Some(now + 1), now));
         assert!(!deep_network_result_is_fresh(true, None, now));
         assert!(!deep_network_result_is_fresh(false, Some(now), now));
+    }
+
+    #[test]
+    fn sandbox_readiness_requires_three_complete_role_pairs() {
+        let mut network = WslProbeNetwork {
+            sandbox_forwarder_count: 3,
+            sandbox_forwarder_expected_count: 3,
+            sandbox_forwarder_topology_state: "expected".into(),
+            sandbox_http_forwarder_count: 3,
+            sandbox_socks_forwarder_count: 3,
+            sandbox_probe_identity: SANDBOX_NETWORK_PROBE_IDENTITY.into(),
+            sandbox_probe_role: "analysis".into(),
+            sandbox_probe_transport: "socks5h".into(),
+            sandbox_egress_target: Some("api.github.com".into()),
+            sandbox_egress_canary_identity: Some(SANDBOX_NETWORK_CANARY_IDENTITY.into()),
+            ..Default::default()
+        };
+        assert!(sandbox_forwarder_topology_is_ready(&network));
+
+        network.sandbox_forwarder_topology_state = "extended".into();
+        network.sandbox_forwarder_count = 4;
+        assert!(sandbox_forwarder_topology_is_ready(&network));
+
+        network.sandbox_forwarder_topology_state = "incomplete".into();
+        network.sandbox_forwarder_count = 3;
+        assert!(!sandbox_forwarder_topology_is_ready(&network));
+
+        network.sandbox_forwarder_topology_state = "expected".into();
+        network.sandbox_forwarder_count = 2;
+        assert!(!sandbox_forwarder_topology_is_ready(&network));
+
+        network.sandbox_forwarder_count = 3;
+        network.sandbox_forwarder_expected_count = 1;
+        assert!(!sandbox_forwarder_topology_is_ready(&network));
+
+        network.sandbox_forwarder_expected_count = 3;
+        network.sandbox_probe_transport = "http".into();
+        assert!(!sandbox_forwarder_topology_is_ready(&network));
+    }
+
+    #[test]
+    fn sandbox_deep_readiness_binds_the_stable_single_probe_result() {
+        let mut network = WslProbeNetwork {
+            sandbox_contract_stable_during_probe: true,
+            sandbox_egress_state: "ok".into(),
+            sandbox_egress_http_status: Some(200),
+            sandbox_forwarder_probe_count: 1,
+            sandbox_forwarder_passed_count: 1,
+            sandbox_forwarder_failed_count: 0,
+            ..Default::default()
+        };
+        assert!(sandbox_deep_egress_is_ready(&network));
+
+        network.sandbox_contract_stable_during_probe = false;
+        assert!(!sandbox_deep_egress_is_ready(&network));
+        network.sandbox_contract_stable_during_probe = true;
+        network.sandbox_forwarder_failed_count = 1;
+        assert!(!sandbox_deep_egress_is_ready(&network));
+        network.sandbox_forwarder_failed_count = 0;
+        network.sandbox_egress_http_status = Some(302);
+        assert!(!sandbox_deep_egress_is_ready(&network));
     }
 
     #[test]

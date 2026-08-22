@@ -59,6 +59,7 @@ $required = @(
   "static\dashboard.html",
   "tests\test_translation.py",
   "tests\test_network_quality.py",
+  "tests\unix_socket_adapter_integration_test.py",
   "tests\package_policy_test.ps1",
   "tests\runtime_layout_test.sh",
   "tests\runtime_activation_integration_test.sh",

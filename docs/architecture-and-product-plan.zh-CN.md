@@ -381,7 +381,7 @@ v0.1.5 的维护修订不再把“端口正在监听”直接等同于“系统�
 1. `9876` 的监听进程、Bridge `/health` 身份和当前受管运行时一致。
 2. `8765`、`8766` 由同一个 CSA 受管 Claude Science 可执行文件监听。
 3. Claude Science 实际继承的代理环境为直连或代理端点可达，且不存在大小写代理变量冲突。
-4. 沙盒 HTTP 转发器完整，并且最近 15 分钟内的匿名、非计费 arXiv 出口探针成功。
+4. 三个内置角色的沙盒 HTTP/SOCKS 转发器均成对完整，并且最近 15 分钟内经 `analysis` 角色真实 `socks.sock` Unix socket 与 SOCKS5H 路由执行的固定、匿名、非计费 HTTPS API 出口探针（GitHub Zen）成功；Operon 与 BYOC 使用不同白名单，不以同一 URL 误测。socket 路径、inode、设备号及子进程启动身份均绑定缓存，旧 HTTP/arXiv 结果不会复用。
 
 启动或修复发现失联、冲突或无效代理变量时，只从新建 Claude Science 子进程的环境中移除这些变量；不修改 Windows/WSL 系统代理、VPN、DNS、hosts、证书或网络工具。服务切换由 WSL 生命周期锁串行化，运行时使用内容寻址目录、原子指针和失败回滚；停止逻辑只向已经通过端口、可执行路径和运行时身份联合验证的 PID 发送信号。
 

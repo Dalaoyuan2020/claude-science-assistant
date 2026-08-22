@@ -22,6 +22,12 @@ interface NetworkQualityStatus {
   proxyEndpoints: string[];
   proxyConflict: boolean;
   sandboxForwarderCount: number;
+  sandboxForwarderExpectedCount: number;
+  sandboxForwarderTopologyState: string;
+  sandboxHttpForwarderCount: number;
+  sandboxSocksForwarderCount: number;
+  sandboxProbeRole: string;
+  sandboxProbeTransport: string;
   deepChecked: boolean;
   deepCheckedAtUnix?: number;
   sandboxEgressState: string;
@@ -213,6 +219,12 @@ const initialStatus: SystemStatus = {
     proxyEndpoints: [],
     proxyConflict: false,
     sandboxForwarderCount: 0,
+    sandboxForwarderExpectedCount: 3,
+    sandboxForwarderTopologyState: "incomplete",
+    sandboxHttpForwarderCount: 0,
+    sandboxSocksForwarderCount: 0,
+    sandboxProbeRole: "analysis",
+    sandboxProbeTransport: "socks5h",
     deepChecked: false,
     sandboxEgressState: "not_checked",
   },
@@ -247,6 +259,12 @@ const browserPreviewStatus: SystemStatus = {
     proxyEndpoints: [],
     proxyConflict: false,
     sandboxForwarderCount: 0,
+    sandboxForwarderExpectedCount: 3,
+    sandboxForwarderTopologyState: "incomplete",
+    sandboxHttpForwarderCount: 0,
+    sandboxSocksForwarderCount: 0,
+    sandboxProbeRole: "analysis",
+    sandboxProbeTransport: "socks5h",
     deepChecked: false,
     sandboxEgressState: "not_checked",
   },
@@ -616,7 +634,7 @@ function App() {
             ...browserPreviewStatus.network,
             deepChecked: true,
             sandboxEgressState: "ok",
-            sandboxEgressTarget: "export.arxiv.org",
+            sandboxEgressTarget: "api.github.com",
             sandboxEgressHttpStatus: 200,
           },
         });
@@ -1156,7 +1174,7 @@ function App() {
       : ` · 实链路失败（${status.network.sandboxEgressState}）`
     : " · 可深度检测";
   const networkDetail = status.claudeRunning
-    ? `${proxyStateLabel[status.network.proxyState] || status.network.proxyState} · ${status.network.sandboxForwarderCount} 个沙盒出口${deepEgressLabel}`
+    ? `${proxyStateLabel[status.network.proxyState] || status.network.proxyState} · ${status.network.sandboxForwarderCount}/${status.network.sandboxForwarderExpectedCount} 组 HTTP/SOCKS 沙盒出口（${status.network.sandboxForwarderTopologyState}） · ${status.network.sandboxProbeRole}/${status.network.sandboxProbeTransport.toUpperCase()} 探针${deepEgressLabel}`
     : "Claude Science 启动后检查";
   const networkOk = status.network.ready
     && (!status.network.deepChecked || status.network.sandboxEgressState === "ok");
