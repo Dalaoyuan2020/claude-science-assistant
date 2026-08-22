@@ -112,7 +112,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "la
 New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") | Out-Null
 
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PackageRoot "claude-science-assistant.exe")
-foreach ($file in @("proxy.py", "setup-token.py", "forward-443.py", "requirements.txt", "requirements-dev.txt", "config.example.json")) {
+foreach ($file in @("proxy.py", "setup-token.py", "requirements.txt", "requirements-dev.txt", "config.example.json", "LICENSE", "SECURITY.md")) {
   Copy-Item -LiteralPath (Join-Path $ProjectDir $file) -Destination (Join-Path $PackageRoot $file)
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "static") "dashboard.html") -Destination (Join-Path (Join-Path $PackageRoot "static") "dashboard.html")
@@ -282,6 +282,8 @@ $Manifest = [ordered]@{
     apiKeyStorage = "Windows current-user DPAPI for launcher list; active WSL runtime config is chmod 0600"
   }
   expectedRootFiles = @(
+    "LICENSE",
+    "SECURITY.md",
     "proxy.py",
     "requirements.txt",
     "requirements-dev.txt",

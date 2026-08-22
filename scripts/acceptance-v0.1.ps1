@@ -49,9 +49,10 @@ Write-Step "Portable package structure"
 $required = @(
   "claude-science-assistant.exe",
   "manifest.json",
+  "LICENSE",
+  "SECURITY.md",
   "proxy.py",
   "setup-token.py",
-  "forward-443.py",
   "requirements.txt",
   "requirements-dev.txt",
   "config.example.json",

@@ -89,6 +89,17 @@ if (Test-Path -LiteralPath $packageScriptPath) {
   if ($acceptanceText.Contains('scripts\release-gate.ps1')) {
     throw "Portable acceptance must not require the build-only release gate."
   }
+  $selfTestText = Get-Content -LiteralPath (Join-Path $ProjectDir "scripts\self-test.ps1") -Raw -Encoding UTF8
+  foreach ($portablePolicyText in @($packageScriptText, $acceptanceText, $selfTestText)) {
+    if ($portablePolicyText.Contains('forward-443.py')) {
+      throw "The legacy privileged-port forwarder must remain excluded from the supported portable package path."
+    }
+  }
+  foreach ($requiredPolicyFile in @('"LICENSE"', '"SECURITY.md"')) {
+    if (-not $packageScriptText.Contains($requiredPolicyFile) -or -not $acceptanceText.Contains($requiredPolicyFile.Trim('"'))) {
+      throw "Portable package policy is missing $requiredPolicyFile."
+    }
+  }
   foreach ($portableRuntimeFile in @(
     '"csa-network-quality.py"',
     '"test_network_quality.py"',

@@ -366,7 +366,10 @@ if not identity and health.get("status") == "ok" and os.path.isfile(source):
     try:
         command = [item.decode(errors="replace") for item in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if item]
         package_root = os.path.dirname(source)
-        manifest = json.load(open(os.path.join(package_root, "manifest.json"), encoding="utf-8"))
+        # Older v0.1.x portable manifests were written by Windows PowerShell
+        # and may contain a UTF-8 BOM.  Accept that historical encoding while
+        # keeping every other legacy-owner check strict.
+        manifest = json.load(open(os.path.join(package_root, "manifest.json"), encoding="utf-8-sig"))
         legacy_valid = (
             bool(command)
             and os.path.normpath(command[0]).startswith(os.path.join(legacy_root, "venv") + os.sep)

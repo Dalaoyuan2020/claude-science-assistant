@@ -56,6 +56,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The published v0.1.5 manifest was emitted by Windows PowerShell with a
+# UTF-8 BOM.  Migration must recognize that exact historical package without
+# weakening the process/path/manifest ownership checks.
+grep -Fq 'encoding="utf-8-sig"' "$PROJECT_SOURCE/scripts/start-claude-science-wsl.sh" || {
+  echo "Legacy Bridge verification no longer accepts the published UTF-8 BOM manifest." >&2
+  exit 1
+}
+printf '\357\273\277{"schemaVersion":1}\n' >"$TEST_ROOT/legacy-manifest.json"
+python3 - "$TEST_ROOT/legacy-manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8-sig") as handle:
+    assert json.load(handle)["schemaVersion"] == 1
+PY
+
 python_source="$(command -v python3)"
 PATCHED_BIN="$TEST_ROOT/claude-science"
 cp "$python_source" "$PATCHED_BIN"

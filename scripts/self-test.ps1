@@ -88,7 +88,7 @@ if ($LASTEXITCODE -ne 0) {
   if ($LASTEXITCODE -ne 0) { throw "Failed to install locked test requirements (exit $LASTEXITCODE)." }
 }
 
-& $Python -m py_compile proxy.py setup-token.py forward-443.py scripts/csa-network-quality.py
+& $Python -m py_compile proxy.py setup-token.py scripts/csa-network-quality.py
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
 $RuntimeManifestPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\manifest.json"
