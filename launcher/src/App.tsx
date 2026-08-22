@@ -14,6 +14,21 @@ const APP_VERSION = "V0.1.5";
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
 
+interface NetworkQualityStatus {
+  proxyState: "unknown" | "not_running" | "direct" | "reachable" | "unreachable" | "conflict" | "invalid";
+  localReady: boolean;
+  ready: boolean;
+  proxyReachable?: boolean;
+  proxyEndpoints: string[];
+  proxyConflict: boolean;
+  sandboxForwarderCount: number;
+  deepChecked: boolean;
+  deepCheckedAtUnix?: number;
+  sandboxEgressState: string;
+  sandboxEgressTarget?: string;
+  sandboxEgressHttpStatus?: number;
+}
+
 interface SystemStatus {
   state: SystemState;
   wslInstalled: boolean;
@@ -38,6 +53,7 @@ interface SystemStatus {
   storageWarning: boolean;
   storageBlocked: boolean;
   restartBlocked: boolean;
+  network: NetworkQualityStatus;
   warnings: string[];
 }
 
@@ -190,6 +206,16 @@ const initialStatus: SystemStatus = {
   storageWarning: false,
   storageBlocked: false,
   restartBlocked: false,
+  network: {
+    proxyState: "unknown",
+    localReady: false,
+    ready: false,
+    proxyEndpoints: [],
+    proxyConflict: false,
+    sandboxForwarderCount: 0,
+    deepChecked: false,
+    sandboxEgressState: "not_checked",
+  },
   warnings: [],
 };
 
@@ -214,6 +240,16 @@ const browserPreviewStatus: SystemStatus = {
   storageWarning: false,
   storageBlocked: false,
   restartBlocked: false,
+  network: {
+    proxyState: "not_running",
+    localReady: false,
+    ready: false,
+    proxyEndpoints: [],
+    proxyConflict: false,
+    sandboxForwarderCount: 0,
+    deepChecked: false,
+    sandboxEgressState: "not_checked",
+  },
   warnings: [],
 };
 
@@ -222,7 +258,7 @@ const stateText: Record<SystemState, { title: string; detail: string }> = {
   notInstalled: { title: "环境尚未就绪", detail: "需要用体检 Skill 安装或修复 WSL2 / Claude Science 运行环境" },
   stopped: { title: "Claude Science 已停止", detail: "环境完整，可以安全启动" },
   degraded: { title: "服务需要修复", detail: "部分组件正在运行，请查看诊断信息" },
-  running: { title: "Claude Science 已准备好", detail: "Bridge 与应用均正常运行" },
+  running: { title: "Claude Science 已准备好", detail: "Bridge、本地端口与沙盒真实出口均已验证" },
   error: { title: "无法读取系统状态", detail: "请查看错误详情后重试" },
 };
 
@@ -448,7 +484,10 @@ function App() {
         setStatus(browserPreviewStatus);
         return;
       }
-      const next = await invoke<SystemStatus>("get_system_status");
+      let next = await invoke<SystemStatus>("get_system_status");
+      if (next.claudeRunning && next.network.localReady && !next.network.deepChecked) {
+        next = await invoke<SystemStatus>("run_network_quality_check");
+      }
       setStatus(next);
       setError("");
     } catch (reason) {
@@ -563,6 +602,32 @@ function App() {
 
   function updateDraftRoleModel(role: SubscriptionRole, model: string) {
     applyDraftRoleModels({ ...draftRoleModels, [role]: model });
+  }
+
+  async function runNetworkQualityCheck() {
+    if (busy) return;
+    updateBusy(true);
+    setError("");
+    try {
+      if (!isTauri) {
+        setStatus({
+          ...browserPreviewStatus,
+          network: {
+            ...browserPreviewStatus.network,
+            deepChecked: true,
+            sandboxEgressState: "ok",
+            sandboxEgressTarget: "export.arxiv.org",
+            sandboxEgressHttpStatus: 200,
+          },
+        });
+      } else {
+        setStatus(await invoke<SystemStatus>("run_network_quality_check"));
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      updateBusy(false);
+    }
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
@@ -1076,6 +1141,25 @@ function App() {
   const claudeDetail = status.claudeRunning
     ? (status.claudePid ? `PID ${status.claudePid}` : "端口已监听")
     : "已停止";
+  const proxyStateLabel: Record<string, string> = {
+    direct: "直连环境",
+    reachable: "代理可达",
+    unreachable: "代理端口失联",
+    conflict: "代理配置冲突",
+    invalid: "代理配置无效",
+    unknown: "代理状态未知",
+    not_running: "待启动",
+  };
+  const deepEgressLabel = status.network.deepChecked
+    ? status.network.sandboxEgressState === "ok"
+      ? ` · 实链路通过${status.network.sandboxEgressHttpStatus ? ` HTTP ${status.network.sandboxEgressHttpStatus}` : ""}`
+      : ` · 实链路失败（${status.network.sandboxEgressState}）`
+    : " · 可深度检测";
+  const networkDetail = status.claudeRunning
+    ? `${proxyStateLabel[status.network.proxyState] || status.network.proxyState} · ${status.network.sandboxForwarderCount} 个沙盒出口${deepEgressLabel}`
+    : "Claude Science 启动后检查";
+  const networkOk = status.network.ready
+    && (!status.network.deepChecked || status.network.sandboxEgressState === "ok");
   const storageDetail = status.wslStoragePath
     ? `${status.wslStoragePath}${typeof status.wslStorageFreeGb === "number" ? ` · 宿主盘剩余 ${status.wslStorageFreeGb.toFixed(1)} GB` : ""}${typeof status.wslRootFreeGb === "number" ? ` · Linux 剩余 ${status.wslRootFreeGb.toFixed(1)} GB` : ""}`
     : "未定位 WSL 虚拟磁盘";
@@ -1110,7 +1194,7 @@ function App() {
         <div className="health-panel-head">
           <div>
             <strong>环境状态</strong>
-            <small>{healthCollapsed ? "6 项状态已收起" : "6 项状态 · 2 行 × 3 列"}</small>
+            <small>{healthCollapsed ? "7 项状态已收起" : "7 项状态（含沙盒真实出口）"}</small>
           </div>
           <button
             type="button"
@@ -1131,6 +1215,14 @@ function App() {
             <HealthItem label="运行时" ok={status.runtimeReady} detail={status.runtimeReady ? "已准备" : "需体检/修复"} />
             <HealthItem label="Bridge" ok={status.bridgeHealthy} detail={bridgeDetail} />
             <HealthItem label="Claude Science" ok={status.claudeRunning} detail={claudeDetail} />
+            <HealthItem
+              label="沙盒 / API 出口"
+              ok={networkOk}
+              detail={networkDetail}
+              actionLabel="深度检测"
+              onAction={runNetworkQualityCheck}
+              actionDisabled={busy || !status.claudeRunning}
+            />
             <HealthItem
               label="WSL 存储"
               ok={!status.storageWarning}
@@ -1728,18 +1820,19 @@ function App() {
   );
 }
 
-function HealthItem({ label, ok, detail, actionLabel, onAction }: {
+function HealthItem({ label, ok, detail, actionLabel, onAction, actionDisabled }: {
   label: string;
   ok: boolean;
   detail: string;
   actionLabel?: string;
   onAction?: () => void;
+  actionDisabled?: boolean;
 }) {
   return (
     <div className="health-item">
       <span className={`health-check ${ok ? "ok" : ""}`}>{ok ? "✓" : "—"}</span>
       <div className="health-item-copy"><strong>{label}</strong><small>{detail}</small></div>
-      {actionLabel && onAction && <button className="health-item-action" onClick={onAction}>{actionLabel}</button>}
+      {actionLabel && onAction && <button className="health-item-action" onClick={onAction} disabled={actionDisabled}>{actionLabel}</button>}
     </div>
   );
 }

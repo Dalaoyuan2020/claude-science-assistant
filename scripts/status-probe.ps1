@@ -4,7 +4,8 @@ param(
   [string]$Distro = "",
   [string]$User = "",
   [int]$ProxyPort = 9876,
-  [switch]$IncludeWindowsPorts
+  [switch]$IncludeWindowsPorts,
+  [switch]$DeepNetworkProbe
 )
 
 Set-StrictMode -Version Latest
@@ -137,7 +138,7 @@ function Get-WindowsListeners {
             port = $_.LocalPort
             pid = $_.OwningProcess
             process = if ($process) { $process.Name } else { "unknown" }
-            command = if ($process) { $process.CommandLine } else { "" }
+            command_line_included = $false
           }
         }
     )
@@ -158,7 +159,8 @@ $settingsStorage = Get-DriveSnapshot $env:APPDATA
 
 $projectExists = (Test-Path -LiteralPath (Join-Path $ProjectRoot "proxy.py")) -and
   (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\start-claude-science-wsl.sh")) -and
-  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\csa-runtime-layout.sh"))
+  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\csa-runtime-layout.sh")) -and
+  (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\csa-network-quality.py"))
 
 $projectWsl = ""
 $wslProbe = $null
@@ -174,7 +176,11 @@ if (-not $distros.Count -or -not $Distro) {
   try {
     $projectWsl = Convert-ToWslPath $ProjectRoot
     $inspectWsl = "$projectWsl/skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh"
-    $rawProbe = ((Invoke-Wsl @("env", "PROJECT_DIR=$projectWsl", "PROXY_PORT=$ProxyPort", "bash", $inspectWsl, $projectWsl)) -replace [char]0, "")
+    $probeEnvironment = @("env", "PROJECT_DIR=$projectWsl", "PROXY_PORT=$ProxyPort")
+    if ($DeepNetworkProbe) {
+      $probeEnvironment += @("CSA_DEEP_NETWORK_PROBE=1", "CSA_WRITE_NETWORK_CACHE=1")
+    }
+    $rawProbe = ((Invoke-Wsl @($probeEnvironment + @("bash", $inspectWsl, $projectWsl))) -replace [char]0, "")
     $jsonLine = @(
       $rawProbe |
         ForEach-Object { "$_".Trim() } |
@@ -268,11 +274,35 @@ if ($wslProbe -and $wslProbe.storage.bridge_log_bytes -gt 52428800) {
 $bridgeHealthy = [bool]($wslProbe -and $wslProbe.runtime.bridge_healthy)
 $bridgePidDetected = [bool]($wslProbe -and $null -ne $wslProbe.runtime.bridge_pid)
 $bridgeServiceActive = [bool]($wslProbe -and $wslProbe.runtime.bridge_service_active)
-$claudeDetected = [bool]($wslProbe -and ($null -ne $wslProbe.runtime.claude_pid -or $wslProbe.runtime.port_8765 -or $wslProbe.runtime.port_8766))
-$unitMatchesProject = [bool]($wslProbe -and ($wslProbe.runtime.unit_matches_project -eq $true -or $null -eq $wslProbe.runtime.unit_matches_project))
+$claudeDetected = [bool]($wslProbe -and $wslProbe.runtime.claude_owner_verified -and $null -ne $wslProbe.runtime.claude_pid -and $wslProbe.runtime.port_8765 -and $wslProbe.runtime.port_8766)
+if ($wslProbe -and ($wslProbe.runtime.port_8765 -or $wslProbe.runtime.port_8766) -and -not $wslProbe.runtime.claude_owner_verified) {
+  $warnings.Add("Claude Science port 8765/8766 has an unverified owner; CSA will not treat it as running or stop it automatically.")
+}
+$systemdRunning = [bool]($wslProbe -and $wslProbe.wsl.systemd)
+$unitMatchesProject = [bool]($wslProbe -and ((-not $systemdRunning) -or $wslProbe.runtime.unit_matches_project -eq $true))
+$proxyState = if ($wslProbe -and $wslProbe.network) { [string]$wslProbe.network.proxy_state } else { "unknown" }
+$proxyContractReady = $proxyState -in @("direct", "reachable")
+$sandboxForwardersReady = [bool]($wslProbe -and $wslProbe.network.sandbox_forwarder_count -gt 0)
+$deepEgressReady = [bool]($wslProbe -and $wslProbe.network.deep_checked -and $wslProbe.network.sandbox_egress_state -eq "ok")
+$networkReady = [bool]($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and $deepEgressReady)
+
+if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid", "unknown")) {
+  $endpoints = @($wslProbe.network.proxy_endpoints) -join ", "
+  if (-not $endpoints) { $endpoints = "unknown" }
+  $warnings.Add("Claude Science outbound proxy contract is $proxyState ($endpoints). Local ports can remain open while sandbox/API requests fail.")
+}
+if ($claudeDetected -and -not $sandboxForwardersReady) {
+  $warnings.Add("Claude Science is listening, but no owned sandbox HTTP forwarder was detected.")
+}
+if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -not $wslProbe.network.deep_checked) {
+  $warnings.Add("Sandbox egress has not passed a fresh end-to-end canary. Re-run with -DeepNetworkProbe.")
+}
+if ($wslProbe -and $wslProbe.network.deep_checked -and -not $deepEgressReady) {
+  $warnings.Add("Sandbox egress canary failed: $($wslProbe.network.sandbox_egress_state). No billable model request was made.")
+}
 
 $overall = "not_ready"
-if ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject) {
+if ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject -and $networkReady) {
   $overall = if ($storageWarning) { "ready_with_storage_warning" } else { "ready" }
 } elseif ($bridgeHealthy) {
   $overall = "bridge_ready"
@@ -292,7 +322,7 @@ if ($bridgeHealthy) {
 }
 
 $report = [ordered]@{
-  schema_version = 1
+  schema_version = 2
   generated_at = (Get-Date).ToUniversalTime().ToString("o")
   overall = $overall
   bridge_evidence = $bridgeEvidence
@@ -301,6 +331,7 @@ $report = [ordered]@{
   bridge_service_active = $bridgeServiceActive
   claude_detected = $claudeDetected
   unit_matches_project = $unitMatchesProject
+  network_ready = $networkReady
   project_root = $ProjectRoot
   project_wsl = $projectWsl
   wsl = [ordered]@{
@@ -309,6 +340,7 @@ $report = [ordered]@{
     distros = $distros
   }
   runtime = if ($wslProbe) { $wslProbe.runtime } else { $null }
+  network = if ($wslProbe) { $wslProbe.network } else { $null }
   components = if ($wslProbe) { $wslProbe.components } else { $null }
   storage = [ordered]@{
     blocked = $storageBlocked

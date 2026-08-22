@@ -45,7 +45,10 @@ Then restart the proxy and rerun:
 
 ## Requests Do Not Use Local Node
 
-This project does not read `HTTP_PROXY` or `HTTPS_PROXY`, because backend clients use `trust_env=False`.
+The CSA Bridge does not use ambient `HTTP_PROXY` / `HTTPS_PROXY`; its backend client uses
+`trust_env=False`. Claude Science and its sandbox network process are separate: the daemon can
+inherit proxy variables when it starts. The managed launcher now validates every inherited
+HTTP/HTTPS/ALL proxy endpoint and refuses to reuse a daemon whose proxy has gone away.
 
 Set the explicit outbound proxy:
 
@@ -62,6 +65,24 @@ Then restart:
 ```
 
 Do not change Clash, v2rayN, sing-box, DNS, TUN, Windows system proxy, hosts, certificates, or port 443 just to make this project use a node.
+
+## OpenAlex / arXiv or Other Sandbox Requests Return 502
+
+Do not diagnose this from ports `8765`, `8766`, or the sandbox forwarder alone. Those listeners can
+remain open after the daemon's inherited upstream proxy has stopped. Run:
+
+```powershell
+.\scripts\status-probe.ps1 -DeepNetworkProbe
+```
+
+The report separates four facts: managed process ownership, inherited proxy endpoint reachability,
+sandbox HTTP forwarder ownership, and an anonymous/non-billable arXiv request through the real
+sandbox route. Proxy URLs are reduced to scheme/host/port and credentials are never included.
+
+If `proxy_state` is `unreachable` or `conflict`, use the launcher's **修复并重启** action after the
+current experiment finishes. A Bridge-only restart cannot refresh proxy variables already inherited
+by Claude Science. The controlled restart does not modify the Windows/WSL system proxy, VPN, DNS,
+hosts, certificates, or port 443.
 
 ## Tool Call Markers Appear As Text
 

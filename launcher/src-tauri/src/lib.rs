@@ -31,6 +31,21 @@ const CLAUDE_SCIENCE_CHANGELOG_URL: &str = "https://claude.com/docs/claude-scien
 const BUNDLED_CLAUDE_SCIENCE_VERSION: &str = "0.1.25";
 const BUNDLED_CLAUDE_SCIENCE_SHA8: &str = "b7190511";
 const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
+const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
+
+fn deep_network_result_is_fresh(
+    deep_checked: bool,
+    checked_at_unix: Option<u64>,
+    now_unix: u64,
+) -> bool {
+    if !deep_checked {
+        return false;
+    }
+    checked_at_unix
+        .and_then(|checked_at| now_unix.checked_sub(checked_at))
+        .map(|age| age <= NETWORK_DEEP_CACHE_MAX_AGE_SECONDS)
+        .unwrap_or(false)
+}
 
 // Provider changes update the WSL Bridge config and restart its listener. Keep
 // the whole write/restart/verify transaction single-flight to prevent a second
@@ -177,7 +192,44 @@ struct SystemStatus {
     storage_warning: bool,
     storage_blocked: bool,
     restart_blocked: bool,
+    network: NetworkQualityStatus,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkQualityStatus {
+    proxy_state: String,
+    local_ready: bool,
+    ready: bool,
+    proxy_reachable: Option<bool>,
+    proxy_endpoints: Vec<String>,
+    proxy_conflict: bool,
+    sandbox_forwarder_count: u32,
+    deep_checked: bool,
+    deep_checked_at_unix: Option<u64>,
+    sandbox_egress_state: String,
+    sandbox_egress_target: Option<String>,
+    sandbox_egress_http_status: Option<u16>,
+}
+
+impl Default for NetworkQualityStatus {
+    fn default() -> Self {
+        Self {
+            proxy_state: "unknown".into(),
+            local_ready: false,
+            ready: false,
+            proxy_reachable: None,
+            proxy_endpoints: Vec::new(),
+            proxy_conflict: false,
+            sandbox_forwarder_count: 0,
+            deep_checked: false,
+            deep_checked_at_unix: None,
+            sandbox_egress_state: "not_checked".into(),
+            sandbox_egress_target: None,
+            sandbox_egress_http_status: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,6 +277,8 @@ struct WindowsStorageSnapshot {
 #[derive(Debug, Default, Deserialize)]
 struct WslProbeReport {
     #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
     wsl: WslProbeIdentity,
     #[serde(default)]
     components: WslProbeComponents,
@@ -232,12 +286,16 @@ struct WslProbeReport {
     storage: WslProbeStorage,
     #[serde(default)]
     runtime: WslProbeRuntime,
+    #[serde(default)]
+    network: WslProbeNetwork,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct WslProbeIdentity {
     #[serde(default)]
     user: String,
+    #[serde(default)]
+    systemd: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,6 +325,9 @@ struct WslProbeStorage {
 struct WslProbeRuntime {
     bridge_pid: Option<u32>,
     claude_pid: Option<u32>,
+    claude_unverified_pid: Option<u32>,
+    #[serde(default)]
+    claude_owner_verified: bool,
     bridge_source_path: Option<String>,
     bridge_source_matches: Option<bool>,
     bridge_identity: Option<RuntimeIdentity>,
@@ -283,6 +344,26 @@ struct WslProbeRuntime {
     port_8765: bool,
     #[serde(default)]
     port_8766: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeNetwork {
+    #[serde(default)]
+    proxy_state: String,
+    proxy_reachable: Option<bool>,
+    #[serde(default)]
+    proxy_endpoints: Vec<String>,
+    #[serde(default)]
+    proxy_conflict: bool,
+    #[serde(default)]
+    sandbox_forwarder_count: u32,
+    #[serde(default)]
+    deep_checked: bool,
+    deep_checked_at_unix: Option<u64>,
+    #[serde(default)]
+    sandbox_egress_state: String,
+    sandbox_egress_target: Option<String>,
+    sandbox_egress_http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -720,23 +801,35 @@ fn is_windows_system_drive(drive: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn inspect_wsl_runtime(distro: &str, project_wsl: &str) -> Result<WslProbeReport, String> {
+fn inspect_wsl_runtime(
+    distro: &str,
+    project_wsl: &str,
+    deep_network_probe: bool,
+) -> Result<WslProbeReport, String> {
     let inspect_script = format!(
         "{}/skills/bootstrap-claude-science-wsl/scripts/inspect-wsl.sh",
         project_wsl.trim_end_matches('/')
     );
     let project_env = format!("PROJECT_DIR={project_wsl}");
+    let mut owned_args = vec![
+        "env".to_string(),
+        project_env,
+        "PROXY_PORT=9876".to_string(),
+    ];
+    if deep_network_probe {
+        owned_args.push("CSA_DEEP_NETWORK_PROBE=1".to_string());
+        owned_args.push("CSA_WRITE_NETWORK_CACHE=1".to_string());
+    }
+    owned_args.extend(["bash".to_string(), inspect_script, project_wsl.to_string()]);
+    let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = run_wsl_with_timeout(
         distro,
-        &[
-            "env",
-            &project_env,
-            "PROXY_PORT=9876",
-            "bash",
-            &inspect_script,
-            project_wsl,
-        ],
-        Duration::from_secs(8),
+        &args,
+        if deep_network_probe {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(8)
+        },
     )?;
     if !output.status.success() {
         return Err(format!("WSL 只读体检失败：{}", command_error_text(&output)));
@@ -747,10 +840,18 @@ fn inspect_wsl_runtime(distro: &str, project_wsl: &str) -> Result<WslProbeReport
         .rev()
         .find(|line| line.trim_start().starts_with('{'))
         .ok_or_else(|| "WSL 只读体检没有返回 JSON 结果".to_string())?;
-    serde_json::from_str(json).map_err(|error| format!("WSL 体检结果解析失败：{error}"))
+    let report: WslProbeReport =
+        serde_json::from_str(json).map_err(|error| format!("WSL 体检结果解析失败：{error}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "WSL 体检 schema 不受支持：{}（期望 1）",
+            report.schema_version
+        ));
+    }
+    Ok(report)
 }
 
-fn current_status() -> SystemStatus {
+fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
     let mut warnings = Vec::new();
     let distros = match discover_distros() {
         Ok(items) => items,
@@ -781,6 +882,7 @@ fn current_status() -> SystemStatus {
                 storage_warning: false,
                 storage_blocked: false,
                 restart_blocked: false,
+                network: NetworkQualityStatus::default(),
                 warnings,
             };
         }
@@ -813,6 +915,7 @@ fn current_status() -> SystemStatus {
             storage_warning: false,
             storage_blocked: false,
             restart_blocked: false,
+            network: NetworkQualityStatus::default(),
             warnings,
         };
     };
@@ -836,7 +939,7 @@ fn current_status() -> SystemStatus {
     let probe = project_wsl
         .as_deref()
         .ok_or_else(|| "无法把当前 CSA 目录转换为 WSL 路径".to_string())
-        .and_then(|path| inspect_wsl_runtime(&distro, path));
+        .and_then(|path| inspect_wsl_runtime(&distro, path, deep_network_probe));
     let probe = match probe {
         Ok(probe) => probe,
         Err(error) => {
@@ -872,6 +975,7 @@ fn current_status() -> SystemStatus {
                 storage_warning: storage_blocked,
                 storage_blocked,
                 restart_blocked: true,
+                network: NetworkQualityStatus::default(),
                 warnings,
             };
         }
@@ -893,8 +997,49 @@ fn current_status() -> SystemStatus {
         || probe.runtime.bridge_health_responding
         || probe.runtime.bridge_service_active
         || probe.runtime.port_9876;
-    let claude_running = claude_pid.is_some() || probe.runtime.port_8765 || probe.runtime.port_8766;
+    let claude_running = probe.runtime.claude_owner_verified
+        && claude_pid.is_some()
+        && probe.runtime.port_8765
+        && probe.runtime.port_8766;
     let unit_matches_project = probe.runtime.unit_matches_project;
+    let unit_contract_ok = !probe.wsl.systemd || unit_matches_project == Some(true);
+    let proxy_state = if probe.network.proxy_state.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        probe.network.proxy_state.clone()
+    };
+    let proxy_contract_ok = matches!(proxy_state.as_str(), "direct" | "reachable");
+    let sandbox_forwarders_ready = probe.network.sandbox_forwarder_count > 0;
+    let local_network_ready = claude_running && proxy_contract_ok && sandbox_forwarders_ready;
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let deep_result_fresh = deep_network_result_is_fresh(
+        probe.network.deep_checked,
+        probe.network.deep_checked_at_unix,
+        now_unix,
+    );
+    let network_ready =
+        local_network_ready && deep_result_fresh && probe.network.sandbox_egress_state == "ok";
+    let network = NetworkQualityStatus {
+        proxy_state: proxy_state.clone(),
+        local_ready: local_network_ready,
+        ready: network_ready,
+        proxy_reachable: probe.network.proxy_reachable,
+        proxy_endpoints: probe.network.proxy_endpoints.clone(),
+        proxy_conflict: probe.network.proxy_conflict,
+        sandbox_forwarder_count: probe.network.sandbox_forwarder_count,
+        deep_checked: deep_result_fresh,
+        deep_checked_at_unix: probe.network.deep_checked_at_unix,
+        sandbox_egress_state: if probe.network.sandbox_egress_state.trim().is_empty() {
+            "not_checked".into()
+        } else {
+            probe.network.sandbox_egress_state.clone()
+        },
+        sandbox_egress_target: probe.network.sandbox_egress_target.clone(),
+        sandbox_egress_http_status: probe.network.sandbox_egress_http_status,
+    };
     let wsl_root_free_gb = probe.storage.root_free_kb.map(rounded_gb_from_kb);
     let root_free_ratio = probe
         .storage
@@ -951,8 +1096,65 @@ fn current_status() -> SystemStatus {
     if bridge_running && !claude_running {
         warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
     }
+    if probe.runtime.claude_unverified_pid.is_some()
+        || ((probe.runtime.port_8765 || probe.runtime.port_8766)
+            && !probe.runtime.claude_owner_verified)
+    {
+        let owner = probe
+            .runtime
+            .claude_unverified_pid
+            .map(|pid| format!("PID {pid}"))
+            .unwrap_or_else(|| "an unknown owner".into());
+        warnings.push(format!(
+            "Claude Science port 8765/8766 is occupied by {owner}, but its executable is not a CSA managed runtime; CSA will not report it ready or stop it automatically."
+        ));
+    }
     if unit_matches_project == Some(false) {
         warnings.push("WSL Bridge service does not point to the stable CSA managed runtime; run repair and restart to migrate it.".into());
+    }
+    if probe.wsl.systemd && unit_matches_project.is_none() {
+        warnings.push("WSL systemd is active, but CSA could not verify the Bridge unit identity; unknown service ownership is not treated as healthy.".into());
+    }
+    if claude_running && matches!(proxy_state.as_str(), "unreachable" | "conflict") {
+        let endpoints = if probe.network.proxy_endpoints.is_empty() {
+            "unknown proxy endpoint".to_string()
+        } else {
+            probe.network.proxy_endpoints.join(", ")
+        };
+        warnings.push(format!(
+            "Claude Science inherited an unreachable or conflicting outbound proxy ({endpoints}). Local ports can still look healthy while sandbox/API requests fail with 502. Repair and restart to refresh the daemon environment."
+        ));
+    } else if claude_running && matches!(proxy_state.as_str(), "invalid" | "unknown") {
+        warnings.push(format!(
+            "Claude Science outbound proxy contract is {proxy_state}; CSA will not report the runtime as ready until it can be validated."
+        ));
+    }
+    if claude_running && !sandbox_forwarders_ready {
+        warnings.push("Claude Science is listening locally, but no owned sandbox HTTP forwarder was found; sandbox egress is not ready.".into());
+    }
+    if local_network_ready && !deep_result_fresh {
+        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable arXiv deep check before treating external APIs as ready.".into());
+    }
+    if deep_result_fresh
+        && !matches!(
+            probe.network.sandbox_egress_state.as_str(),
+            "ok" | "not_checked"
+        )
+    {
+        let target = probe
+            .network
+            .sandbox_egress_target
+            .as_deref()
+            .unwrap_or("research API canary");
+        let status = probe
+            .network
+            .sandbox_egress_http_status
+            .map(|value| format!(", HTTP {value}"))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "Sandbox deep egress check to {target} failed ({}{}). This can be a local proxy, policy, DNS/TLS, or remote-service issue; the probe does not make a billable model request.",
+            probe.network.sandbox_egress_state, status
+        ));
     }
 
     if bridge_pid.is_some() && claude_pid.is_none() {
@@ -1036,7 +1238,7 @@ fn current_status() -> SystemStatus {
         );
     }
 
-    let state = if bridge_healthy && claude_running && unit_matches_project != Some(false) {
+    let state = if bridge_healthy && claude_running && unit_contract_ok && network_ready {
         "running"
     } else if storage_blocked || !wsl_runtime_writable {
         "degraded"
@@ -1075,8 +1277,13 @@ fn current_status() -> SystemStatus {
         storage_warning,
         storage_blocked,
         restart_blocked,
+        network,
         warnings,
     }
+}
+
+fn current_status() -> SystemStatus {
+    current_status_with_options(false)
 }
 
 fn project_runtime_files_present() -> bool {
@@ -1089,6 +1296,10 @@ fn project_runtime_files_present() -> bool {
                     .join("start-claude-science-wsl.sh")
                     .is_file()
                 && root.join("scripts").join("csa-runtime-layout.sh").is_file()
+                && root
+                    .join("scripts")
+                    .join("csa-network-quality.py")
+                    .is_file()
                 && root
                     .join("skills")
                     .join("bootstrap-claude-science-wsl")
@@ -3736,6 +3947,11 @@ async fn get_system_status() -> Result<SystemStatus, String> {
     run_blocking(|| Ok(current_status())).await
 }
 
+#[tauri::command]
+async fn run_network_quality_check() -> Result<SystemStatus, String> {
+    run_blocking(|| Ok(current_status_with_options(true))).await
+}
+
 fn valid_release_sha8(value: &str) -> bool {
     value.len() == 8
         && value
@@ -3930,7 +4146,7 @@ fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
             .map(|duration| duration.as_secs())
             .unwrap_or_default(),
         release_notes_url: CLAUDE_SCIENCE_CHANGELOG_URL.into(),
-        note: "CSA v0.1.4 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
+        note: "CSA v0.1.5 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
     })
 }
 
@@ -3939,7 +4155,11 @@ async fn get_runtime_update_status() -> Result<RuntimeUpdateStatus, String> {
     run_blocking(get_runtime_update_status_impl).await
 }
 
-fn start_services_raw(distro: &str, user: &str) -> Result<RuntimeIdentity, String> {
+fn start_services_raw(
+    distro: &str,
+    user: &str,
+    force_restart: bool,
+) -> Result<RuntimeIdentity, String> {
     let script = project_root()?
         .join("scripts")
         .join("start-claude-science-wsl.ps1");
@@ -3959,6 +4179,9 @@ fn start_services_raw(distro: &str, user: &str) -> Result<RuntimeIdentity, Strin
         .arg(user)
         .arg("-PackageVersion")
         .arg(env!("CARGO_PKG_VERSION"));
+    if force_restart {
+        command.arg("-ForceRestart");
+    }
     let output =
         command_output_with_timeout(command, Duration::from_secs(45), "Claude Science 启动")?;
     if output.status.success() {
@@ -3992,7 +4215,7 @@ fn start_services_impl() -> Result<SystemStatus, String> {
     let user = before
         .linux_user
         .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
-    start_services_raw(&distro, &user)?;
+    start_services_raw(&distro, &user, false)?;
     Ok(current_status())
 }
 
@@ -4003,17 +4226,173 @@ async fn start_services() -> Result<SystemStatus, String> {
 
 const STOP_SERVICES_SHELL: &str = "bash";
 const STOP_SERVICES_SCRIPT: &str = r#"
-systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
-claude_pids="$(ps -eo pid=,args= | awk '/claude-science/ && /serve/ && !/awk/ {print $1}')"
+set -u
+state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
+legacy_root="$HOME/.local/share/claude-science-api-bridge"
+lifecycle_lock="$state_root/runtime/lifecycle.lock"
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "CSA lifecycle lock requires flock (util-linux); refusing an unlocked stop." >&2
+  exit 1
+fi
+if ! mkdir -p "$(dirname "$lifecycle_lock")"; then
+  echo "Cannot create CSA lifecycle lock directory; refusing an unlocked stop." >&2
+  exit 1
+fi
+if ! exec 9>"$lifecycle_lock"; then
+  echo "Cannot open CSA lifecycle lock; refusing an unlocked stop." >&2
+  exit 1
+fi
+if ! flock -w "${CSA_LIFECYCLE_LOCK_TIMEOUT:-8}" 9; then
+  echo "Another CSA lifecycle operation owns $lifecycle_lock; wait for it to finish and retry." >&2
+  exit 1
+fi
+
+listener_pids() {
+  local port="$1"
+  ss -ltnp "sport = :$port" 2>/dev/null \
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+
+managed_claude_pid() {
+  local pid="$1" executable cmd
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  case "$executable" in
+    "$state_root"/runtime/claude-science/patched/*/claude-science|"$legacy_root"/patched/claude-science) ;;
+    *) return 1;;
+  esac
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmd" == *"$executable serve"* ]]
+}
+
+verified_bridge_pid() {
+  local pid="$1" payload
+  command -v python3 >/dev/null 2>&1 || return 1
+  payload="$(curl --noproxy '*' -fsS --connect-timeout 0.4 --max-time 1 \
+    http://127.0.0.1:9876/health 2>/dev/null)" || return 1
+  python3 - "$pid" "$state_root" "$legacy_root" "$payload" <<'PY' >/dev/null 2>&1
+import hashlib, json, os, sys
+pid = int(sys.argv[1])
+root = os.path.realpath(sys.argv[2])
+legacy = os.path.realpath(sys.argv[3])
+health = json.loads(sys.argv[4])
+identity = health.get("runtime_identity") or {}
+source = os.path.realpath(str(identity.get("sourcePath") or health.get("source_path") or ""))
+managed_valid = (
+    health.get("status") == "ok"
+    and identity.get("schemaVersion") == 1
+    and identity.get("component") == "bridge"
+    and identity.get("managed") is True
+    and identity.get("pid") == pid
+    and source.startswith(os.path.join(root, "runtime", "bridge", "versions") + os.sep)
+    and os.path.isfile(source)
+)
+if managed_valid:
+    with open(source, "rb") as handle:
+        managed_valid = hashlib.sha256(handle.read()).hexdigest().casefold() == str(identity.get("sourceSha256") or "").casefold()
+legacy_valid = False
+if not identity and health.get("status") == "ok" and os.path.isfile(source):
+    try:
+        command = [item.decode(errors="replace") for item in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if item]
+        package_root = os.path.dirname(source)
+        manifest = json.load(open(os.path.join(package_root, "manifest.json"), encoding="utf-8"))
+        legacy_valid = (
+            bool(command)
+            and os.path.normpath(command[0]).startswith(os.path.join(legacy, "venv") + os.sep)
+            and any(os.path.realpath(item) == source for item in command if item.endswith("proxy.py"))
+            and manifest.get("schemaVersion") == 1
+            and manifest.get("product") == "CSA - Claude Science Assistant"
+            and manifest.get("profile") in {"release", "debug"}
+            and "proxy.py" in (manifest.get("expectedRootFiles") or [])
+            and os.path.isfile(os.path.join(package_root, "requirements.txt"))
+            and os.path.isfile(os.path.join(package_root, "setup-token.py"))
+        )
+    except (OSError, ValueError, TypeError):
+        legacy_valid = False
+raise SystemExit(0 if managed_valid or legacy_valid else 1)
+PY
+}
+
+bridge_health_source() {
+  local payload
+  command -v python3 >/dev/null 2>&1 || return 1
+  payload="$(curl --noproxy '*' -fsS --connect-timeout 0.4 --max-time 1 \
+    http://127.0.0.1:9876/health 2>/dev/null)" || return 1
+  python3 - "$payload" <<'PY'
+import json, os, sys
+try:
+    health = json.loads(sys.argv[1])
+except (ValueError, TypeError):
+    raise SystemExit(1)
+identity = health.get("runtime_identity") or {}
+source = os.path.realpath(str(identity.get("sourcePath") or health.get("source_path") or ""))
+if not source:
+    raise SystemExit(1)
+print(source)
+PY
+}
+
+bridge_unit_property() {
+  local property="$1"
+  systemctl --user show claude-science-bridge.service \
+    --property="$property" --value 2>/dev/null || true
+}
+
+bridge_unit_matches_managed_runtime() {
+  local exec_start environment
+  exec_start="$(bridge_unit_property ExecStart)"
+  environment="$(bridge_unit_property Environment)"
+  [[ "$exec_start" == *"$state_root/runtime/bridge/current/proxy.py"* ]] \
+    && [[ " $environment " == *" CSA_BRIDGE_MANAGED=1 "* ]] \
+    && [[ " $environment " == *" PROXY_PORT=9876 "* ]]
+}
+
+bridge_unit_matches_verified_listener() {
+  local exec_start source
+  [ -n "$bridge_pids" ] || return 1
+  source="$(bridge_health_source)" || return 1
+  exec_start="$(bridge_unit_property ExecStart)"
+  [ -n "$exec_start" ] && [[ "$exec_start" == *"$source"* ]]
+}
+
+claude_pids="$(for port in 8765 8766; do listener_pids "$port"; done | sort -u)"
+bridge_pids="$(listener_pids 9876)"
 for pid in $claude_pids; do
-  kill "$pid" 2>/dev/null || true
+  managed_claude_pid "$pid" || {
+    echo "Refusing to stop unverified owner PID $pid on Claude Science port." >&2
+    exit 1
+  }
 done
-for pid in $(ss -ltnp "sport = :9876" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
-  case "$pid" in ''|*[!0-9]*) continue;; esac
-  if [ -r "/proc/$pid/cmdline" ]; then
-    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    case "$cmd" in *"/proxy.py"*) kill "$pid" 2>/dev/null || true;; esac
-  fi
+for pid in $bridge_pids; do
+  verified_bridge_pid "$pid" || {
+    echo "Refusing to stop unverified owner PID $pid on Bridge port 9876." >&2
+    exit 1
+  }
+done
+
+bridge_unit_owned=0
+if bridge_unit_matches_managed_runtime || bridge_unit_matches_verified_listener; then
+  bridge_unit_owned=1
+fi
+bridge_unit_active_state="$(bridge_unit_property ActiveState)"
+case "$bridge_unit_active_state" in
+  active|activating|reloading|deactivating)
+    if [ "$bridge_unit_owned" != "1" ]; then
+      echo "Refusing to stop claude-science-bridge.service because its unit identity is not owned by this CSA runtime." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+if [ "$bridge_unit_owned" = "1" ]; then
+  systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
+fi
+for pid in $claude_pids; do
+  managed_claude_pid "$pid" && kill "$pid" 2>/dev/null || true
+done
+for pid in $bridge_pids; do
+  verified_bridge_pid "$pid" && kill "$pid" 2>/dev/null || true
 done
 grace_deadline=$((SECONDS + 4))
 while [ "$SECONDS" -lt "$grace_deadline" ]; do
@@ -4028,10 +4407,7 @@ while [ "$SECONDS" -lt "$grace_deadline" ]; do
   sleep 0.25
 done
 for pid in $claude_pids; do
-  if [ -r "/proc/$pid/cmdline" ]; then
-    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    case "$cmd" in *"claude-science"*"serve"*) kill -9 "$pid" 2>/dev/null || true;; esac
-  fi
+  managed_claude_pid "$pid" && kill -9 "$pid" 2>/dev/null || true
 done
 deadline=$((SECONDS + 5))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -4049,7 +4425,7 @@ fn stop_services_raw(distro: &str) -> Result<(), String> {
     let output = run_wsl_with_timeout(
         distro,
         &[STOP_SERVICES_SHELL, "-lc", STOP_SERVICES_SCRIPT],
-        Duration::from_secs(10),
+        Duration::from_secs(22),
     )?;
     if !output.status.success() {
         return Err(format!("停止服务失败：{}", command_error_text(&output)));
@@ -4084,8 +4460,7 @@ fn restart_services_impl() -> Result<SystemStatus, String> {
     let user = before
         .linux_user
         .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
-    stop_services_raw(&distro)?;
-    start_services_raw(&distro, &user)?;
+    start_services_raw(&distro, &user, true)?;
     Ok(current_status())
 }
 
@@ -4203,6 +4578,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_system_status,
+            run_network_quality_check,
             get_runtime_update_status,
             start_services,
             stop_services,
@@ -5268,6 +5644,43 @@ mod tests {
         assert!(!is_windows_system_drive(None));
     }
 
+    #[test]
+    fn deep_network_readiness_requires_a_recent_nonfuture_timestamp() {
+        let now = 10_000;
+        assert!(deep_network_result_is_fresh(true, Some(now), now));
+        assert!(deep_network_result_is_fresh(
+            true,
+            Some(now - NETWORK_DEEP_CACHE_MAX_AGE_SECONDS),
+            now
+        ));
+        assert!(!deep_network_result_is_fresh(
+            true,
+            Some(now - NETWORK_DEEP_CACHE_MAX_AGE_SECONDS - 1),
+            now
+        ));
+        assert!(!deep_network_result_is_fresh(true, Some(now + 1), now));
+        assert!(!deep_network_result_is_fresh(true, None, now));
+        assert!(!deep_network_result_is_fresh(false, Some(now), now));
+    }
+
+    #[test]
+    fn browser_preview_does_not_claim_network_readiness_while_stopped() {
+        let source = include_str!("../../src/App.tsx");
+        let preview_start = source
+            .find("const browserPreviewStatus: SystemStatus = {")
+            .expect("browser preview should exist");
+        let preview_end = source[preview_start..]
+            .find("const stateText:")
+            .map(|offset| preview_start + offset)
+            .expect("state text should follow browser preview");
+        let preview = &source[preview_start..preview_end];
+        assert!(preview.contains("state: \"stopped\""));
+        assert!(preview.contains("proxyState: \"not_running\""));
+        assert!(preview.contains("localReady: false"));
+        assert!(preview.contains("ready: false"));
+        assert!(preview.contains("deepChecked: false"));
+    }
+
     #[cfg(windows)]
     fn live_bridge_json(path: &str) -> Result<serde_json::Value, String> {
         let mut command = background_command("curl.exe");
@@ -5506,9 +5919,22 @@ mod tests {
     }
 
     #[test]
-    fn stop_services_uses_bash_and_rejects_empty_listener_pids() {
+    fn stop_services_uses_bash_and_requires_verified_listener_owners() {
         assert_eq!(STOP_SERVICES_SHELL, "bash");
         assert!(STOP_SERVICES_SCRIPT.contains("grep -oE 'pid=[0-9]+'"));
-        assert!(STOP_SERVICES_SCRIPT.contains("case \"$pid\" in ''|*[!0-9]*) continue"));
+        assert!(STOP_SERVICES_SCRIPT.contains("runtime/lifecycle.lock"));
+        assert!(STOP_SERVICES_SCRIPT.contains("flock -w"));
+        assert!(STOP_SERVICES_SCRIPT.contains("managed_claude_pid \"$pid\" ||"));
+        assert!(STOP_SERVICES_SCRIPT.contains("verified_bridge_pid \"$pid\" ||"));
+        assert!(STOP_SERVICES_SCRIPT.contains("Refusing to stop unverified owner PID"));
+        assert!(STOP_SERVICES_SCRIPT.contains("bridge_unit_matches_managed_runtime"));
+        assert!(STOP_SERVICES_SCRIPT.contains("bridge_unit_matches_verified_listener"));
+        assert!(STOP_SERVICES_SCRIPT.contains(
+            "Refusing to stop claude-science-bridge.service because its unit identity is not owned"
+        ));
+        assert!(STOP_SERVICES_SCRIPT
+            .contains("if [ \"$bridge_unit_owned\" = \"1\" ]; then\n  systemctl --user stop"));
+        assert!(STOP_SERVICES_SCRIPT.contains("manifest.get(\"product\")"));
+        assert!(!STOP_SERVICES_SCRIPT.contains("ps -eo pid=,args="));
     }
 }

@@ -6,6 +6,7 @@ param(
   [int]$ClaudeSciencePort = 8765,
   [ValidatePattern('^[A-Za-z0-9._-]+$')]
   [string]$PackageVersion = "0.1.5",
+  [switch]$ForceRestart,
   [switch]$Open
 )
 
@@ -72,11 +73,14 @@ $ProjectWsl = [string]$ProjectWsl[0]
 $previousErrorAction = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-  $output = @(& wsl.exe -d $Distro -u $User -- env `
-    "PROXY_PORT=$ProxyPort" `
-    "CLAUDE_SCIENCE_PORT=$ClaudeSciencePort" `
-    "CSA_PACKAGE_VERSION=$PackageVersion" `
-    "CSA_MERGE_STDERR=1" `
+  $startEnvironment = @(
+    "PROXY_PORT=$ProxyPort"
+    "CLAUDE_SCIENCE_PORT=$ClaudeSciencePort"
+    "CSA_PACKAGE_VERSION=$PackageVersion"
+    "CSA_MERGE_STDERR=1"
+  )
+  if ($ForceRestart) { $startEnvironment += "CSA_FORCE_RESTART=1" }
+  $output = @(& wsl.exe -d $Distro -u $User -- env @startEnvironment `
     bash "$ProjectWsl/scripts/start-claude-science-wsl.sh" 2>$null)
   $exitCode = $LASTEXITCODE
 } finally {

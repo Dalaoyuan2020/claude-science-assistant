@@ -12,6 +12,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-CsaPortablePackageName {
+  param(
+    [Parameter(Mandatory = $true)][string]$Version,
+    [string]$Qualifier = "",
+    [Parameter(Mandatory = $true)][ValidateSet("debug", "release")][string]$BuildProfile
+  )
+
+  $qualifiedVersion = if ($Qualifier) { "v$Version-$Qualifier" } else { "v$Version" }
+  return "claude-science-assistant-$qualifiedVersion-$BuildProfile-portable"
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 . (Join-Path $ScriptDir "package-policy.ps1")
@@ -32,6 +43,12 @@ if ($Profile -eq "release" -and $SkipBuild) {
 }
 $SourceState = Get-CsaGitSourceState -ProjectDir $ProjectDir
 Assert-CsaPackageSourcePolicy -SourceState $SourceState -Profile $Profile -AllowDirtySource ([bool]$AllowDirtySource)
+if ($Profile -eq "release") {
+  & (Join-Path $ScriptDir "release-gate.ps1") -Offline
+  if ($LASTEXITCODE -ne 0) {
+    throw "Offline release gate failed with exit code $LASTEXITCODE"
+  }
+}
 
 if (-not $OutputDir) {
   $OutputDir = Join-Path $ProjectDir "dist"
@@ -67,8 +84,7 @@ if (-not (Test-Path -LiteralPath $ExePath)) {
   throw "Launcher exe not found: $ExePath"
 }
 
-$QualifiedVersion = if ($PackageQualifier) { "v$Version-$PackageQualifier" } else { "v$Version" }
-$PackageName = "claude-science-assistant-$QualifiedVersion-$Profile-portable"
+$PackageName = Get-CsaPortablePackageName -Version $Version -Qualifier $PackageQualifier -BuildProfile $Profile
 $PackageRoot = Join-Path $OutputDir $PackageName
 $ZipPath = Join-Path $OutputDir "$PackageName.zip"
 $ShaPath = Join-Path $OutputDir "$PackageName.zip.sha256"
@@ -96,7 +112,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $PackageRoot "la
 New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") | Out-Null
 
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PackageRoot "claude-science-assistant.exe")
-foreach ($file in @("proxy.py", "setup-token.py", "forward-443.py", "requirements.txt", "config.example.json")) {
+foreach ($file in @("proxy.py", "setup-token.py", "forward-443.py", "requirements.txt", "requirements-dev.txt", "config.example.json")) {
   Copy-Item -LiteralPath (Join-Path $ProjectDir $file) -Destination (Join-Path $PackageRoot $file)
 }
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "static") "dashboard.html") -Destination (Join-Path (Join-Path $PackageRoot "static") "dashboard.html")
@@ -111,12 +127,21 @@ foreach ($file in @("runtimeUpdate.ts", "storageMigration.ts")) {
 foreach ($file in @("lib.rs", "runtime_lifecycle.rs")) {
   Copy-Item -LiteralPath (Join-Path (Join-Path (Join-Path $LauncherDir "src-tauri") "src") $file) -Destination (Join-Path (Join-Path (Join-Path (Join-Path $PackageRoot "launcher") "src-tauri") "src") $file)
 }
-foreach ($file in @("test_translation.py", "package_policy_test.ps1")) {
+foreach ($file in @(
+  "test_translation.py",
+  "test_network_quality.py",
+  "package_policy_test.ps1",
+  "runtime_layout_test.sh",
+  "runtime_activation_integration_test.sh",
+  "runtime_network_contract_functions_test.sh",
+  "runtime_lifecycle_20cycle_test.sh"
+)) {
   Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "tests") $file) -Destination (Join-Path (Join-Path $PackageRoot "tests") $file)
 }
 foreach ($file in @(
   "package-policy.ps1",
   "csa-runtime-layout.sh",
+  "csa-network-quality.py",
   "install-wsl-bridge-service.sh",
   "start-claude-science-wsl.sh",
   "start-claude-science-wsl.ps1",
@@ -259,6 +284,7 @@ $Manifest = [ordered]@{
   expectedRootFiles = @(
     "proxy.py",
     "requirements.txt",
+    "requirements-dev.txt",
     "scripts/",
     "static/",
     "tests/",

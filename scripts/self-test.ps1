@@ -1,39 +1,67 @@
 param(
-  [string]$Python = $(if ($env:PYTHON) { $env:PYTHON } else { ".\.venv\Scripts\python.exe" })
+  [string]$Python = "",
+  [switch]$Offline
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectDir = Resolve-Path (Join-Path $ScriptDir "..")
+$ProjectDir = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 . (Join-Path $ScriptDir "package-policy.ps1")
 Set-Location $ProjectDir
 
-if (-not (Test-Path $Python)) {
-  $defaultPython = ".\.venv\Scripts\python.exe"
-  if ($Python -ne $defaultPython -or $env:PYTHON) {
-    throw "Python not found: $Python"
-  }
-
-  $venvDir = Join-Path $ProjectDir ".venv"
-  $py = Get-Command py -ErrorAction SilentlyContinue
-  $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-  if ($py) {
-    & $py.Source -3 -m venv $venvDir
-  } elseif ($pythonCommand) {
-    & $pythonCommand.Source -m venv $venvDir
+$defaultPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
+if (-not $Python) {
+  if (Test-Path -LiteralPath $defaultPython) {
+    $Python = $defaultPython
+  } elseif ($env:PYTHON) {
+    $Python = $env:PYTHON
+  } elseif ($Offline) {
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+      $Python = $pythonCommand.Source
+    } else {
+      throw "Offline self-test requires a prepared project .venv or a usable PYTHON/python interpreter; none was found."
+    }
   } else {
-    throw "Python not found. Install Python 3 or set PYTHON to python.exe."
+    $Python = $defaultPython
   }
-  if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment (exit $LASTEXITCODE)." }
-  $Python = $defaultPython
+}
+
+if (-not (Test-Path -LiteralPath $Python)) {
+  $pythonCommand = Get-Command $Python -ErrorAction SilentlyContinue
+  if ($pythonCommand) {
+    $Python = $pythonCommand.Source
+  } elseif ($Offline -or $Python -ne $defaultPython) {
+    throw "Python not found: $Python"
+  } else {
+    $venvDir = Join-Path $ProjectDir ".venv"
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    $systemPython = Get-Command python -ErrorAction SilentlyContinue
+    if ($py) {
+      & $py.Source -3 -m venv $venvDir
+    } elseif ($systemPython) {
+      & $systemPython.Source -m venv $venvDir
+    } else {
+      throw "Python not found. Install Python 3 or set PYTHON to python.exe."
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment (exit $LASTEXITCODE)." }
+    $Python = $defaultPython
+  }
 }
 
 $Python = (Resolve-Path -LiteralPath $Python).Path
+$pythonIdentity = @(& $Python -c "import sys; print('CSA_PYTHON_' + str(sys.version_info[0]))" 2>$null)
+if ($LASTEXITCODE -ne 0 -or "CSA_PYTHON_3" -notin $pythonIdentity) {
+  throw "Configured interpreter is not a usable Python 3 executable: $Python"
+}
 & $Python -c "import fastapi, httpx, starlette, uvicorn"
 $dependenciesReady = ($LASTEXITCODE -eq 0)
 if (-not $dependenciesReady) {
+  if ($Offline) {
+    throw "Offline self-test cannot install missing runtime dependencies. Prepare $Python from requirements.txt first."
+  }
   Write-Host "Python test dependencies are missing or incomplete; repairing the local venv."
   & $Python -m pip install --upgrade pip
   if ($LASTEXITCODE -ne 0) { throw "Failed to install pip (exit $LASTEXITCODE)." }
@@ -47,7 +75,20 @@ if (-not $dependenciesReady) {
   if ($LASTEXITCODE -ne 0) { throw "Python requirements were installed but imports still fail (exit $LASTEXITCODE)." }
 }
 
-& $Python -m py_compile proxy.py setup-token.py forward-443.py
+& $Python -c "import pytest"
+if ($LASTEXITCODE -ne 0) {
+  if ($Offline) {
+    throw "Offline self-test cannot install pytest. Prepare $Python from requirements-dev.txt first."
+  }
+  Write-Host "pytest is missing; installing the locked test requirements."
+  & $Python -m pip install -r (Join-Path $ProjectDir "requirements-dev.txt")
+  if ($LASTEXITCODE -ne 0) {
+    & $Python -m pip install --index-url https://pypi.org/simple -r (Join-Path $ProjectDir "requirements-dev.txt")
+  }
+  if ($LASTEXITCODE -ne 0) { throw "Failed to install locked test requirements (exit $LASTEXITCODE)." }
+}
+
+& $Python -m py_compile proxy.py setup-token.py forward-443.py scripts/csa-network-quality.py
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
 $RuntimeManifestPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\manifest.json"
@@ -148,5 +189,8 @@ try {
 
 & (Join-Path $ProjectDir "tests\package_policy_test.ps1")
 if ($LASTEXITCODE -ne 0) { throw "Package policy tests failed (exit $LASTEXITCODE)." }
+
+& $Python -m pytest tests/test_network_quality.py -q
+if ($LASTEXITCODE -ne 0) { throw "Network quality tests failed (exit $LASTEXITCODE)." }
 
 Write-Host "self-test passed"

@@ -61,6 +61,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 Environment="PROXY_HOST=127.0.0.1"
 Environment="PROXY_PORT=$PROXY_PORT"
 Environment="CLAUDE_SCIENCE_PROXY_DIR=$config_dir_escaped"

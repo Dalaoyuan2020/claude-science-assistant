@@ -25,12 +25,18 @@ CLAUDE_SCIENCE_PORT="${CLAUDE_SCIENCE_PORT:-8765}"
 CSA_PACKAGE_VERSION="${CSA_PACKAGE_VERSION:-unknown}"
 LEGACY_STATE_DIR="$HOME/.local/share/claude-science-api-bridge"
 RUNTIME_LAYOUT_SCRIPT="$PROJECT_DIR/scripts/csa-runtime-layout.sh"
+NETWORK_QUALITY_HELPER="$PROJECT_DIR/scripts/csa-network-quality.py"
 if [ ! -f "$RUNTIME_LAYOUT_SCRIPT" ]; then
   echo "CSA runtime layout helper is missing: $RUNTIME_LAYOUT_SCRIPT" >&2
   exit 2
 fi
+if [ ! -f "$NETWORK_QUALITY_HELPER" ]; then
+  echo "CSA network quality helper is missing: $NETWORK_QUALITY_HELPER" >&2
+  exit 2
+fi
 # shellcheck source=csa-runtime-layout.sh
 source "$RUNTIME_LAYOUT_SCRIPT"
+NETWORK_CACHE_FILE="$CSA_STATE_ROOT/runtime/network-quality.json"
 BRIDGE_PROXY="$CSA_BRIDGE_ROOT/current/proxy.py"
 BRIDGE_STATIC="$CSA_BRIDGE_ROOT/current/static"
 PATCH_DIR_OVERRIDE="${PATCH_DIR:-}"
@@ -42,6 +48,91 @@ if [ -x "$LEGACY_STATE_DIR/venv/bin/python" ]; then
 else
   PYTHON_BIN="${PYTHON:-python3}"
 fi
+
+current_proxy_state() {
+  "$PYTHON_BIN" "$NETWORK_QUALITY_HELPER" --current --state-only 2>/dev/null \
+    || printf 'unknown\n'
+}
+
+listener_pids_for_port() {
+  local port="$1"
+  ss -ltnp "sport = :$port" 2>/dev/null \
+    | grep -o 'pid=[0-9]*' \
+    | cut -d= -f2 \
+    | sort -u
+}
+
+claude_primary_pid() {
+  local primary_pids auxiliary_pids primary_pid auxiliary_pid
+  primary_pids="$(listener_pids_for_port "$CLAUDE_SCIENCE_PORT" || true)"
+  auxiliary_pids="$(listener_pids_for_port 8766 || true)"
+  [ "$(printf '%s\n' "$primary_pids" | sed '/^$/d' | wc -l)" = "1" ] || return 1
+  [ "$(printf '%s\n' "$auxiliary_pids" | sed '/^$/d' | wc -l)" = "1" ] || return 1
+  primary_pid="$(printf '%s\n' "$primary_pids" | sed '/^$/d' | head -1)"
+  auxiliary_pid="$(printf '%s\n' "$auxiliary_pids" | sed '/^$/d' | head -1)"
+  case "$primary_pid:$auxiliary_pid" in
+    *[!0-9:]*) return 1;;
+  esac
+  [ "$primary_pid" = "$auxiliary_pid" ] || return 1
+  printf '%s\n' "$primary_pid"
+}
+
+check_claude_network_contract() {
+  local pid state
+  pid="$(claude_primary_pid)" || return 1
+  state="$("$PYTHON_BIN" "$NETWORK_QUALITY_HELPER" --pid "$pid" --contract-only 2>/dev/null \
+    || printf 'unknown\n')"
+  [ "$state" = "ready" ]
+}
+
+wait_claude_network_contract() {
+  local timeout="${1:-5}"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if check_claude_network_contract; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+record_deep_network_quality() {
+  local pid verdict
+  pid="$(claude_primary_pid)" || return 1
+  verdict="$("$PYTHON_BIN" "$NETWORK_QUALITY_HELPER" \
+    --pid "$pid" --deep --cache-file "$NETWORK_CACHE_FILE" --write-cache --contract-only \
+    2>/dev/null || printf 'unknown\n')"
+  if [ "$verdict" = "ready" ]; then
+    echo "Claude Science sandbox egress canary passed (anonymous, non-billable arXiv request)."
+    return 0
+  fi
+  echo "Warning: Claude Science local services started, but sandbox egress quality is $verdict. The degraded result was cached for diagnostics; no model request was made." >&2
+  return 1
+}
+
+sanitize_daemon_proxy_environment() {
+  local state
+  state="$(current_proxy_state)"
+  case "$state" in
+    direct)
+      echo "Claude Science outbound proxy: direct environment"
+      ;;
+    reachable)
+      echo "Claude Science outbound proxy: configured endpoint is reachable"
+      ;;
+    unreachable|invalid|conflict)
+      # This changes only the child daemon environment. It does not modify the
+      # WSL/Windows proxy, VPN, DNS, certificates, hosts, or any user file.
+      unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy
+      echo "Warning: removed unusable/conflicting proxy variables from the new Claude Science daemon environment; system proxy settings were not changed." >&2
+      ;;
+    *)
+      echo "CSA could not validate the Claude Science outbound proxy environment; refusing a blind start." >&2
+      return 1
+      ;;
+  esac
+}
 
 check_bridge_health() {
   local payload
@@ -100,10 +191,98 @@ bridge_listener_pids() {
 
 claude_listener_pids() {
   for port in "$CLAUDE_SCIENCE_PORT" 8766; do
-    ss -ltnp "sport = :$port" 2>/dev/null \
-      | grep -o 'pid=[0-9]*' \
-      | cut -d= -f2
+    listener_pids_for_port "$port"
   done | sort -u
+}
+
+managed_claude_pid() {
+  local pid="$1" executable cmd
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  case "$executable" in
+    "$CSA_CLAUDE_ROOT"/patched/*/claude-science|"$LEGACY_STATE_DIR"/patched/claude-science) ;;
+    *) return 1;;
+  esac
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmd" == *"$executable serve"* ]]
+}
+
+exact_executable_serve_tokens() {
+  local expected_bin="$1" expected_executable process_dir pid executable stat suffix start_ticks
+  local -a argv=()
+  expected_executable="$(readlink -f "$expected_bin" 2>/dev/null || true)"
+  [ -n "$expected_executable" ] || return 0
+  for process_dir in /proc/[0-9]*; do
+    [ -d "$process_dir" ] || continue
+    pid="${process_dir##*/}"
+    executable="$(readlink -f "$process_dir/exe" 2>/dev/null || true)"
+    [ "$executable" = "$expected_executable" ] || continue
+    argv=()
+    mapfile -d '' -t argv <"$process_dir/cmdline" 2>/dev/null || true
+    [ "${argv[1]:-}" = "serve" ] || continue
+    stat="$(<"$process_dir/stat")" 2>/dev/null || continue
+    suffix="${stat##*) }"
+    # starttime is field 22; suffix begins at field 3 (process state).
+    set -- $suffix
+    start_ticks="${20:-}"
+    case "$start_ticks" in ''|*[!0-9]*) continue;; esac
+    printf '%s:%s\n' "$pid" "$start_ticks"
+  done
+}
+
+candidate_token_is_baseline() {
+  local token="$1"
+  printf '%s\n' "${CLAUDE_CANDIDATE_BASELINE_TOKENS:-}" \
+    | grep -Fx -- "$token" >/dev/null 2>&1
+}
+
+cleanup_failed_candidate_processes() {
+  [ "${CLAUDE_CANDIDATE_LAUNCHED:-0}" = "1" ] || return 0
+  [ -n "${PATCHED_BIN:-}" ] || return 0
+  local token pid current_tokens deadline candidate_process_found
+  current_tokens="$(exact_executable_serve_tokens "$PATCHED_BIN" || true)"
+  for token in $current_tokens; do
+    candidate_token_is_baseline "$token" && continue
+    pid="${token%%:*}"
+    # Recheck the PID+start-time token immediately before signalling so PID
+    # reuse cannot redirect cleanup to an unrelated process.
+    if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  deadline=$((SECONDS + 3))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    current_tokens="$(exact_executable_serve_tokens "$PATCHED_BIN" || true)"
+    candidate_process_found=0
+    for token in $current_tokens; do
+      candidate_token_is_baseline "$token" && continue
+      candidate_process_found=1
+      pid="${token%%:*}"
+      if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done
+    [ "$candidate_process_found" = "0" ] && return 0
+    sleep 0.1
+  done
+  current_tokens="$(exact_executable_serve_tokens "$PATCHED_BIN" || true)"
+  for token in $current_tokens; do
+    candidate_token_is_baseline "$token" && continue
+    pid="${token%%:*}"
+    if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  deadline=$((SECONDS + 1))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    candidate_process_found=0
+    for token in $(exact_executable_serve_tokens "$PATCHED_BIN" || true); do
+      candidate_token_is_baseline "$token" || candidate_process_found=1
+    done
+    [ "$candidate_process_found" = "0" ] && return 0
+    sleep 0.05
+  done
+  return 1
 }
 
 running_claude_binary() {
@@ -123,17 +302,14 @@ running_claude_binary() {
 }
 
 check_claude_health() {
-  local expected_bin="$1" pids pid cmd count=0
-  pids="$(claude_listener_pids || true)"
-  [ -n "$pids" ] || return 1
-  for pid in $pids; do
-    case "$pid" in ''|*[!0-9]*) return 1;; esac
-    [ -r "/proc/$pid/cmdline" ] || return 1
-    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    [[ "$cmd" == *"$expected_bin serve"* ]] || return 1
-    count=$((count + 1))
-  done
-  [ "$count" = "1" ] || return 1
+  local expected_bin="$1" pid cmd executable expected_executable
+  expected_executable="$(readlink -f "$expected_bin" 2>/dev/null || true)"
+  pid="$(claude_primary_pid)" || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  [ -n "$expected_executable" ] && [ "$executable" = "$expected_executable" ] || return 1
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmd" == *"$expected_bin serve"* ]] || return 1
   curl --noproxy '*' -sS -o /dev/null --connect-timeout 0.5 --max-time 1 \
     "http://127.0.0.1:$CLAUDE_SCIENCE_PORT/" 2>/dev/null
 }
@@ -154,8 +330,62 @@ wait_claude_health() {
   return 1
 }
 
+verified_bridge_listener() {
+  local pid="$1" payload
+  payload="$(curl --noproxy '*' -fsS --connect-timeout 0.4 --max-time 1 \
+    "http://127.0.0.1:$PROXY_PORT/health" 2>/dev/null)" || return 1
+  "$PYTHON_BIN" - "$pid" "$CSA_STATE_ROOT" "$LEGACY_STATE_DIR" "$payload" <<'PY' >/dev/null 2>&1
+import hashlib
+import json
+import os
+import sys
+
+pid = int(sys.argv[1])
+state_root = os.path.realpath(sys.argv[2])
+legacy_root = os.path.realpath(sys.argv[3])
+health = json.loads(sys.argv[4])
+identity = health.get("runtime_identity") or {}
+source = os.path.realpath(str(identity.get("sourcePath") or health.get("source_path") or ""))
+versions_root = os.path.join(state_root, "runtime", "bridge", "versions") + os.sep
+managed_valid = (
+    health.get("status") == "ok"
+    and identity.get("schemaVersion") == 1
+    and identity.get("component") == "bridge"
+    and identity.get("managed") is True
+    and identity.get("pid") == pid
+    and source.startswith(versions_root)
+    and os.path.isfile(source)
+)
+if managed_valid:
+    with open(source, "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    managed_valid = digest.casefold() == str(identity.get("sourceSha256") or "").casefold()
+
+legacy_valid = False
+if not identity and health.get("status") == "ok" and os.path.isfile(source):
+    try:
+        command = [item.decode(errors="replace") for item in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if item]
+        package_root = os.path.dirname(source)
+        manifest = json.load(open(os.path.join(package_root, "manifest.json"), encoding="utf-8"))
+        legacy_valid = (
+            bool(command)
+            and os.path.normpath(command[0]).startswith(os.path.join(legacy_root, "venv") + os.sep)
+            and any(os.path.realpath(item) == source for item in command if item.endswith("proxy.py"))
+            and manifest.get("schemaVersion") == 1
+            and manifest.get("product") == "CSA - Claude Science Assistant"
+            and manifest.get("profile") in {"release", "debug"}
+            and "proxy.py" in (manifest.get("expectedRootFiles") or [])
+            and os.path.isfile(os.path.join(package_root, "requirements.txt"))
+            and os.path.isfile(os.path.join(package_root, "setup-token.py"))
+        )
+    except (OSError, ValueError, TypeError):
+        legacy_valid = False
+raise SystemExit(0 if managed_valid or legacy_valid else 1)
+PY
+}
+
 stop_stale_bridge_listener() {
-  local pids pid cmdline stopped=0
+  local pids pid stopped=0
   pids="$(bridge_listener_pids || true)"
   if [ -z "$pids" ]; then
     if ss -ltn "sport = :$PROXY_PORT" 2>/dev/null | grep -q LISTEN; then
@@ -165,18 +395,19 @@ stop_stale_bridge_listener() {
     return 0
   fi
   for pid in $pids; do
-    cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-    case "$cmdline" in
-      *"/proxy.py"*)
-        echo "Stopping stale CSA Bridge listener (PID $pid)"
-        kill "$pid" 2>/dev/null || true
-        stopped=1
-        ;;
-      *)
-        echo "Port $PROXY_PORT is occupied by a non-CSA process (PID $pid)." >&2
-        return 1
-        ;;
-    esac
+    if ! verified_bridge_listener "$pid"; then
+      echo "Port $PROXY_PORT is occupied by an unverified process (PID $pid); CSA will not stop it." >&2
+      return 1
+    fi
+  done
+  for pid in $pids; do
+    if ! verified_bridge_listener "$pid"; then
+      echo "Bridge owner changed during verification; refusing to signal PID $pid." >&2
+      return 1
+    fi
+    echo "Stopping verified stale CSA Bridge listener (PID $pid)"
+    kill "$pid" 2>/dev/null || true
+    stopped=1
   done
   if [ "$stopped" = "1" ]; then
     local deadline=$((SECONDS + 3))
@@ -218,7 +449,10 @@ service_matches_runtime() {
   local unit
   unit="$(systemctl --user cat claude-science-bridge.service 2>/dev/null || true)"
   grep -F -- "$BRIDGE_PROXY" <<<"$unit" >/dev/null 2>&1 \
-    && grep -F -- "CSA_BRIDGE_RUNTIME_ID=$CSA_BRIDGE_RUNTIME_ID" <<<"$unit" >/dev/null 2>&1
+    && grep -F -- "CSA_BRIDGE_RUNTIME_ID=$CSA_BRIDGE_RUNTIME_ID" <<<"$unit" >/dev/null 2>&1 \
+    && grep -F -- "CSA_BRIDGE_SOURCE_SHA256=$CSA_BRIDGE_SOURCE_SHA256" <<<"$unit" >/dev/null 2>&1 \
+    && grep -F -- "PROXY_PORT=$PROXY_PORT" <<<"$unit" >/dev/null 2>&1 \
+    && grep -F -- "UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy" <<<"$unit" >/dev/null 2>&1
 }
 
 start_fallback_proxy() {
@@ -306,6 +540,12 @@ start_systemd_proxy() {
   fi
 }
 
+# Unit tests source the function layer without entering the lifecycle mutation
+# path.  Normal execution always continues below.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 if [ "${#PROXY_PORT}" -ne 4 ]; then
   echo "PROXY_PORT must be four digits for byte-length-preserving URL patches. Current: $PROXY_PORT" >&2
   exit 1
@@ -334,6 +574,18 @@ else
   LOG_FILE="/dev/null"
 fi
 
+if ! command -v flock >/dev/null 2>&1; then
+  echo "CSA lifecycle lock requires flock (util-linux); refusing an unlocked runtime mutation." >&2
+  exit 1
+fi
+LIFECYCLE_LOCK_FILE="$CSA_STATE_ROOT/runtime/lifecycle.lock"
+mkdir -p "$(dirname "$LIFECYCLE_LOCK_FILE")"
+exec {CSA_LIFECYCLE_LOCK_FD}>"$LIFECYCLE_LOCK_FILE"
+if ! flock -w "${CSA_LIFECYCLE_LOCK_TIMEOUT:-8}" "$CSA_LIFECYCLE_LOCK_FD"; then
+  echo "Another CSA lifecycle operation owns $LIFECYCLE_LOCK_FILE; wait for it to finish and retry." >&2
+  exit 1
+fi
+
 BRIDGE_POINTER_CHANGED=0
 BRIDGE_PREVIOUS_RUNTIME=""
 BRIDGE_CANDIDATE_RUNTIME=""
@@ -344,12 +596,23 @@ CLAUDE_CANDIDATE_RUNTIME=""
 CLAUDE_VALIDATED=0
 CLAUDE_STOPPED_FOR_ACTIVATION=0
 PREVIOUS_RUNNING_CLAUDE_BIN=""
+CLAUDE_CANDIDATE_LAUNCHED=0
+CLAUDE_CANDIDATE_BASELINE_TOKENS=""
 START_COMPLETED=0
 
 rollback_runtime_pointer() {
   local root="$1" previous="$2" candidate="$3" label="$4" current
+  current="$(csa_current_target "$root")"
+  if [ -z "$candidate" ] || [ "$current" != "$candidate" ]; then
+    echo "Refusing to roll back $label: current pointer no longer belongs to this activation transaction." >&2
+    return 1
+  fi
   if [ -n "$previous" ]; then
-    if csa_restore_previous_pointer "$root"; then
+    if [ -d "$previous" ]; then
+      csa_atomic_symlink "$previous" "$root/current"
+      if [ -d "$candidate" ] && [ "$candidate" != "$previous" ]; then
+        csa_atomic_symlink "$candidate" "$root/previous"
+      fi
       echo "Restored previous $label runtime pointer after failed activation." >&2
       return 0
     fi
@@ -357,8 +620,7 @@ rollback_runtime_pointer() {
     return 1
   fi
 
-  current="$(csa_current_target "$root")"
-  if [ -n "$candidate" ] && [ "$current" = "$candidate" ] && [ -L "$root/current" ]; then
+  if [ -L "$root/current" ]; then
     rm -f "$root/current"
     echo "Removed the failed first $label runtime pointer; no previous managed runtime existed." >&2
     return 0
@@ -373,17 +635,9 @@ restore_runtime_after_failure() {
   if [ "$exit_code" -ne 0 ] && [ "$START_COMPLETED" != "1" ]; then
     set +e
     set +u
+    cleanup_failed_candidate_processes || \
+      echo "Failed Claude Science candidate did not exit within 3 seconds." >&2
     if [ "$CLAUDE_POINTER_CHANGED" = "1" ]; then
-      if [ -n "${PATCHED_BIN:-}" ]; then
-        for pid in $(pgrep -x "claude-science" 2>/dev/null || true); do
-          if [ -r "/proc/$pid/cmdline" ]; then
-            cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-            if [[ "$cmd" == *"$PATCHED_BIN serve"* ]]; then
-              kill "$pid" 2>/dev/null || true
-            fi
-          fi
-        done
-      fi
       rollback_runtime_pointer \
         "$CSA_CLAUDE_ROOT" "$CLAUDE_PREVIOUS_RUNTIME" "$CLAUDE_CANDIDATE_RUNTIME" \
         "Claude Science" || true
@@ -474,17 +728,23 @@ echo "Using Claude Science Linux binary: $SOURCE_BIN"
 if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
   && check_bridge_health \
   && { ! systemd_runtime_available || service_matches_runtime; } \
-  && ps -eo args= | grep -F -- "$PATCHED_BIN serve" | grep -v grep >/dev/null 2>&1; then
+  && check_claude_health "$PATCHED_BIN" \
+  && check_claude_network_contract; then
   echo "Claude Science and WSL BYOK proxy are already running; using fast start path."
-  if [ -x "$PATCHED_BIN" ]; then
+  if record_deep_network_quality && [ -x "$PATCHED_BIN" ]; then
     echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
   else
-    echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT."
+    echo "Claude Science local services are ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT; see network diagnostics for egress status."
   fi
   csa_print_bridge_identity
   START_COMPLETED=1
   exit 0
 fi
+
+if [ -n "$(claude_listener_pids || true)" ] && ! check_claude_network_contract; then
+  echo "Existing Claude Science daemon failed its outbound proxy contract; replacing it through the controlled start path." >&2
+fi
+sanitize_daemon_proxy_environment
 
 TOKEN_FILE="$HOME/.claude-science/.oauth-tokens/byok-user-000000000000000000.enc"
 if [ -f "$HOME/.claude-science/encryption.key" ]; then
@@ -607,12 +867,19 @@ fi
 
 PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary || true)"
 claude_pids="$(claude_listener_pids || true)"
+for pid in $claude_pids; do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
+  if ! managed_claude_pid "$pid"; then
+    echo "Claude Science port is owned by an unverified process (PID $pid); CSA will not stop it." >&2
+    exit 1
+  fi
+done
 if [ -n "$claude_pids" ]; then
   CLAUDE_STOPPED_FOR_ACTIVATION=1
 fi
 for pid in $claude_pids; do
   case "$pid" in ''|*[!0-9]*) continue;; esac
-  if [ -r "/proc/$pid/cmdline" ]; then
+  if managed_claude_pid "$pid"; then
     cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
     if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
       kill "$pid" 2>/dev/null || true
@@ -626,7 +893,7 @@ done
 if [ -n "$(claude_listener_pids || true)" ]; then
   for pid in $(claude_listener_pids || true); do
     case "$pid" in ''|*[!0-9]*) continue;; esac
-    if [ -r "/proc/$pid/cmdline" ]; then
+    if managed_claude_pid "$pid"; then
       cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
       if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
         kill -9 "$pid" 2>/dev/null || true
@@ -640,11 +907,18 @@ if [ -n "$(claude_listener_pids || true)" ]; then
 fi
 
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+CLAUDE_CANDIDATE_BASELINE_TOKENS="$(exact_executable_serve_tokens "$PATCHED_BIN" || true)"
+CLAUDE_CANDIDATE_LAUNCHED=1
 ANTHROPIC_BASE_URL="$PROXY_URL" "$PATCHED_BIN" serve --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update
 if ! wait_claude_health "$PATCHED_BIN" 15; then
   echo "Claude Science candidate did not become healthy on 127.0.0.1:$CLAUDE_SCIENCE_PORT." >&2
   exit 1
 fi
+if ! wait_claude_network_contract 5; then
+  echo "Claude Science candidate started locally but failed its outbound proxy contract." >&2
+  exit 1
+fi
+record_deep_network_quality || true
 csa_atomic_symlink "$PATCH_DIR" "$CSA_CLAUDE_ROOT/patched-current"
 CLAUDE_VALIDATED=1
 
