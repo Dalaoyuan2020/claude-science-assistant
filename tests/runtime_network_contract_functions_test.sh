@@ -56,6 +56,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The detached daemon must inherit its verified Linux runtime directory, not
+# the portable package's /mnt/c or /mnt/e working directory.
+launch_fixture_dir="$TEST_ROOT/runtime"
+launch_fixture="$launch_fixture_dir/claude-science"
+launch_cwd_file="$TEST_ROOT/launch-cwd"
+mkdir -p "$launch_fixture_dir"
+cat >"$launch_fixture" <<'SH'
+#!/usr/bin/env bash
+pwd -P >"$CSA_TEST_LAUNCH_CWD_FILE"
+printf '%s\n' "$ANTHROPIC_BASE_URL" >"$CSA_TEST_LAUNCH_BASE_URL_FILE"
+SH
+chmod +x "$launch_fixture"
+CSA_TEST_LAUNCH_CWD_FILE="$launch_cwd_file" \
+CSA_TEST_LAUNCH_BASE_URL_FILE="$TEST_ROOT/launch-base-url" \
+launch_claude_daemon "$launch_fixture" "http://127.0.0.1:9876"
+[ "$(cat "$launch_cwd_file")" = "$launch_fixture_dir" ] || {
+  echo "Claude Science inherited the caller/package working directory." >&2
+  exit 1
+}
+[ "$(cat "$TEST_ROOT/launch-base-url")" = "http://127.0.0.1:9876" ] || {
+  echo "Claude Science launch lost its local Bridge base URL." >&2
+  exit 1
+}
+
 # The published v0.1.5 manifest was emitted by Windows PowerShell with a
 # UTF-8 BOM.  Migration must recognize that exact historical package without
 # weakening the process/path/manifest ownership checks.
@@ -102,5 +126,103 @@ if kill -0 "$candidate_pid" 2>/dev/null; then
 fi
 wait "$candidate_pid" 2>/dev/null || true
 candidate_pid=""
+
+# Startup readiness requires two adjacent successful deep probes.  A success
+# separated by a daemon-busy sample must reset the streak, and an all-busy
+# sequence must remain degraded without claiming readiness.
+cat >"$TEST_ROOT/deep-helper.py" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+sequence_path = Path(os.environ["CSA_TEST_DEEP_SEQUENCE_FILE"])
+counter_path = Path(os.environ["CSA_TEST_DEEP_COUNTER_FILE"])
+sequence = [line.strip() for line in sequence_path.read_text().splitlines() if line.strip()]
+index = int(counter_path.read_text() or "0") if counter_path.exists() else 0
+counter_path.write_text(str(index + 1))
+verdict = sequence[min(index, len(sequence) - 1)]
+final_cache = Path(os.environ["CSA_TEST_FINAL_CACHE"])
+if final_cache.exists():
+    verdict = "transient_cache_exposed"
+if "--cache-file" in sys.argv:
+    cache_path = Path(sys.argv[sys.argv.index("--cache-file") + 1])
+    cache_path.write_text(json.dumps({
+        "claude_pid": 101,
+        "claude_start_ticks": 1000,
+        "sandbox_forwarder_fingerprint": "fixture-forwarders",
+        "sandbox_egress_state": "ok" if verdict == "ready" else verdict,
+    }))
+print(verdict)
+PY
+NETWORK_QUALITY_HELPER="$TEST_ROOT/deep-helper.py"
+NETWORK_CACHE_FILE="$TEST_ROOT/network-quality.json"
+PYTHON_BIN="$(command -v python3)"
+CSA_TEST_DEEP_SEQUENCE_FILE="$TEST_ROOT/deep-sequence"
+CSA_TEST_DEEP_COUNTER_FILE="$TEST_ROOT/deep-counter"
+CSA_TEST_FINAL_CACHE="$NETWORK_CACHE_FILE"
+export CSA_TEST_DEEP_SEQUENCE_FILE CSA_TEST_DEEP_COUNTER_FILE CSA_TEST_FINAL_CACHE
+sleep() { :; }
+
+printf '%s\n' ready egress_daemon_busy ready ready >"$CSA_TEST_DEEP_SEQUENCE_FILE"
+: >"$CSA_TEST_DEEP_COUNTER_FILE"
+if ! record_deep_network_quality >"$TEST_ROOT/deep-output" 2>&1; then
+  echo "Two consecutive deep successes were not accepted." >&2
+  exit 1
+fi
+[ "$(cat "$CSA_TEST_DEEP_COUNTER_FILE")" = 4 ] || {
+  echo "A non-consecutive deep success was incorrectly counted." >&2
+  exit 1
+}
+[ "$(grep -c 'passed twice consecutively' "$TEST_ROOT/deep-output")" = 1 ] || {
+  echo "Deep readiness success was not reported exactly once." >&2
+  exit 1
+}
+[ -f "$NETWORK_CACHE_FILE" ] || {
+  echo "The consecutively validated deep result was not promoted to the final cache." >&2
+  exit 1
+}
+[ ! -e "${NETWORK_CACHE_FILE}.pending.$$" ] || {
+  echo "A pending deep-probe cache leaked after validation." >&2
+  exit 1
+}
+
+printf '%s\n' egress_daemon_mount_io_busy >"$CSA_TEST_DEEP_SEQUENCE_FILE"
+: >"$CSA_TEST_DEEP_COUNTER_FILE"
+if record_deep_network_quality >"$TEST_ROOT/deep-output-busy" 2>&1; then
+  echo "A persistently I/O-blocked daemon was incorrectly reported ready." >&2
+  exit 1
+fi
+grep -Fq 'daemon was kept running' "$TEST_ROOT/deep-output-busy" || {
+  echo "Busy-daemon diagnostics did not preserve the running process." >&2
+  exit 1
+}
+
+printf '%s\n' egress_daemon_busy egress_daemon_busy egress_daemon_busy ready >"$CSA_TEST_DEEP_SEQUENCE_FILE"
+: >"$CSA_TEST_DEEP_COUNTER_FILE"
+if record_deep_network_quality >"$TEST_ROOT/deep-output-isolated-ready" 2>&1; then
+  echo "A final isolated success was incorrectly accepted as a consecutive pair." >&2
+  exit 1
+fi
+[ "$DEEP_NETWORK_VERDICT" = "insufficient_consecutive_successes" ] || {
+  echo "An isolated final success produced a misleading ready verdict." >&2
+  exit 1
+}
+python3 - "$NETWORK_CACHE_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+assert report["sandbox_egress_state"] != "ok"
+PY
+
+# Lifecycle scripts may recommend manual recovery, but must never execute a
+# global WSL shutdown or distro termination as an automatic repair step.
+if grep -nE '^[[:space:]]*(wsl|wsl\.exe)[[:space:]].*--(shutdown|terminate)' \
+  "$PROJECT_SOURCE/scripts/start-claude-science-wsl.sh"; then
+  echo "Startup script contains an automatic WSL shutdown/terminate command." >&2
+  exit 1
+fi
 
 echo "runtime network contract function test passed"

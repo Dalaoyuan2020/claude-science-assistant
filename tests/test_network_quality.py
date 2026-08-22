@@ -151,10 +151,27 @@ def test_process_start_ticks_are_available_for_the_current_process():
     assert ticks > 0
 
 
+def test_process_runtime_snapshot_classifies_drvfs_wait(monkeypatch):
+    def fake_read_text(path, **_kwargs):
+        normalized = str(path).replace("\\", "/")
+        if normalized.endswith("/stat"):
+            return "42 (claude science) D 1 2 3 4 5"
+        if normalized.endswith("/wchan"):
+            return "p9_client_rpc\n"
+        raise AssertionError(path)
+
+    monkeypatch.setattr(network_quality.Path, "read_text", fake_read_text)
+    snapshot = network_quality.process_runtime_snapshot(42)
+    assert snapshot.state == "D"
+    assert snapshot.wait_channel == "p9_client_rpc"
+    assert snapshot.io_blocked is True
+    assert snapshot.mount_io_blocked is True
+
+
 def test_deep_cache_is_reused_only_for_the_same_daemon_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(network_quality.time, "time", lambda: 1_000)
     cached = {
-        "schema_version": 2,
+        "schema_version": network_quality.NETWORK_REPORT_SCHEMA_VERSION,
         "claude_pid": 42,
         "claude_start_ticks": 123456,
         "proxy_state": "reachable",
@@ -173,8 +190,8 @@ def test_deep_cache_is_reused_only_for_the_same_daemon_contract(tmp_path, monkey
         "deep_checked": True,
         "deep_checked_at_unix": 950,
         "sandbox_egress_state": "ok",
-        "sandbox_egress_target": "api.github.com",
-        "sandbox_egress_canary_identity": "https://api.github.com/zen",
+        "sandbox_egress_target": "pypi.org",
+        "sandbox_egress_canary_identity": "https://pypi.org/simple/pip/",
         "sandbox_egress_canary_fingerprint": "a" * 64,
         "sandbox_egress_http_status": 200,
         "sandbox_egress_http_statuses": [200],
@@ -189,6 +206,8 @@ def test_deep_cache_is_reused_only_for_the_same_daemon_contract(tmp_path, monkey
 
     current = {
         **cached,
+        "claude_process_state": "S",
+        "claude_io_blocked": False,
         "deep_checked": False,
         "deep_checked_at_unix": None,
         "sandbox_egress_state": "not_checked",
@@ -196,6 +215,15 @@ def test_deep_cache_is_reused_only_for_the_same_daemon_contract(tmp_path, monkey
     merged = network_quality.merge_fresh_cache(current, cache_file, 900)
     assert merged["deep_checked"] is True
     assert merged["sandbox_egress_state"] == "ok"
+
+    blocked_current = {
+        **current,
+        "claude_process_state": "D",
+        "claude_io_blocked": True,
+    }
+    rejected = network_quality.merge_fresh_cache(blocked_current, cache_file, 900)
+    assert rejected["deep_checked"] is False
+    assert rejected["sandbox_egress_state"] == "not_checked"
 
     changed_pid = {**current, "claude_pid": 43, "deep_checked": False}
     rejected = network_quality.merge_fresh_cache(changed_pid, cache_file, 900)
@@ -295,6 +323,11 @@ def run_fake_socks_canary(monkeypatch, forwarders=None, status=204, returncode=0
     adapter_paths = []
     monkeypatch.setattr(network_quality.shutil, "which", lambda _name: "/usr/bin/curl")
     monkeypatch.setattr(network_quality, "socket_identity_matches", lambda *_args: True)
+    monkeypatch.setattr(
+        network_quality,
+        "probe_socks_handshake",
+        lambda *_args: ("connected", "ok", None),
+    )
 
     class FakeUnixSocketTcpAdapter:
         def __init__(self, socket_path):
@@ -376,6 +409,9 @@ def test_deep_canary_uses_only_analysis_socks5h(monkeypatch):
     assert report["deep_checked"] is True
     assert report["sandbox_egress_state"] == "ok"
     assert report["sandbox_egress_http_status"] == 204
+    assert report["sandbox_unix_socket_state"] == "connected"
+    assert report["sandbox_socks_handshake_state"] == "ok"
+    assert report["sandbox_egress_failure_stage"] == "none"
     assert report["sandbox_forwarder_probe_count"] == 1
     assert report["sandbox_forwarder_passed_count"] == 1
     assert len(calls) == 1
@@ -396,6 +432,30 @@ def test_deep_canary_does_not_misclassify_remote_502_as_local_proxy_failure(monk
     report, _calls, _paths = run_fake_socks_canary(monkeypatch, status=502)
     assert report["sandbox_egress_state"] == "http_502"
     assert report["sandbox_egress_http_status"] == 502
+    assert report["sandbox_egress_failure_stage"] == "https_request"
+
+
+def test_deep_canary_stops_at_failed_socks_handshake(monkeypatch):
+    monkeypatch.setattr(network_quality.shutil, "which", lambda _name: "/usr/bin/curl")
+    monkeypatch.setattr(network_quality, "socket_identity_matches", lambda *_args: True)
+    monkeypatch.setattr(
+        network_quality,
+        "probe_socks_handshake",
+        lambda *_args: ("connected", "timeout", "TimeoutError"),
+    )
+    monkeypatch.setattr(
+        network_quality.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("curl must not run after handshake timeout"),
+    )
+    report = network_quality.probe_sandbox_egress(
+        make_forwarders(), network_quality.DEFAULT_CANARY_URL, True
+    )
+    assert report["sandbox_socks_handshake_state"] == "timeout"
+    assert report["sandbox_egress_state"] == "socks_handshake_failed"
+    assert report["sandbox_egress_failure_stage"] == "socks_handshake"
+    assert report["sandbox_forwarder_probe_count"] == 1
+    assert report["sandbox_forwarder_failed_count"] == 1
 
 
 def test_deep_canary_target_is_fixed_and_cannot_be_overridden():
@@ -451,6 +511,11 @@ def test_deep_canary_tolerates_a_transient_incomplete_extra_pair(monkeypatch):
 def test_deep_canary_rejects_replaced_analysis_unix_socket(monkeypatch):
     monkeypatch.setattr(network_quality.shutil, "which", lambda _name: "/usr/bin/curl")
     monkeypatch.setattr(network_quality, "socket_identity_matches", lambda *_args: False)
+    monkeypatch.setattr(
+        network_quality,
+        "probe_socks_handshake",
+        lambda *_args: ("connected", "ok", None),
+    )
 
     class FakeUnixSocketTcpAdapter:
         port = 32999
@@ -476,8 +541,69 @@ def test_deep_canary_rejects_replaced_analysis_unix_socket(monkeypatch):
     report = network_quality.probe_sandbox_egress(
         make_forwarders(), network_quality.DEFAULT_CANARY_URL, True
     )
-    assert report["sandbox_egress_state"] == "failed"
+    assert report["sandbox_egress_state"] == "unix_socket_failed"
+    assert report["sandbox_egress_failure_stage"] == "unix_socket"
     assert report["sandbox_forwarder_failed_count"] == 1
+
+
+def test_build_report_classifies_local_proxy_timeout_while_daemon_is_blocked(monkeypatch):
+    forwarders = make_forwarders()
+    blocked = network_quality.ProcessRuntimeSnapshot(
+        "D", "p9_client_rpc", True, True
+    )
+    monkeypatch.setattr(network_quality, "process_runtime_snapshot", lambda _pid: blocked)
+    monkeypatch.setattr(network_quality, "process_environment", lambda _pid: ({}, "ok"))
+    monkeypatch.setattr(network_quality, "process_start_ticks", lambda _pid: 1_000)
+    monkeypatch.setattr(network_quality, "sandbox_forwarders", lambda _pid: forwarders)
+    monkeypatch.setattr(
+        network_quality,
+        "probe_sandbox_egress",
+        lambda *_args: {
+            "deep_checked": True,
+            "sandbox_egress_state": "socks_handshake_failed",
+            "sandbox_egress_failure_stage": "socks_handshake",
+            "sandbox_egress_http_status": None,
+        },
+    )
+    report = network_quality.build_report(
+        42, True, network_quality.DEFAULT_CANARY_URL
+    )
+    assert report["sandbox_egress_state"] == "daemon_mount_io_busy"
+    assert report["sandbox_egress_failure_stage"] == "daemon_event_loop"
+    assert report["sandbox_probe_daemon_mount_io_blocked"] is True
+    assert report["claude_mount_io_blocked"] is True
+
+
+def test_build_report_never_reports_ready_when_daemon_blocks_during_success(monkeypatch):
+    forwarders = make_forwarders()
+    snapshots = iter(
+        (
+            network_quality.ProcessRuntimeSnapshot("S", "ep_poll", False, False),
+            network_quality.ProcessRuntimeSnapshot("D", "p9_client_rpc", True, True),
+        )
+    )
+    monkeypatch.setattr(
+        network_quality, "process_runtime_snapshot", lambda _pid: next(snapshots)
+    )
+    monkeypatch.setattr(network_quality, "process_environment", lambda _pid: ({}, "ok"))
+    monkeypatch.setattr(network_quality, "process_start_ticks", lambda _pid: 1_000)
+    monkeypatch.setattr(network_quality, "sandbox_forwarders", lambda _pid: forwarders)
+    monkeypatch.setattr(
+        network_quality,
+        "probe_sandbox_egress",
+        lambda *_args: {
+            "deep_checked": True,
+            "sandbox_egress_state": "ok",
+            "sandbox_egress_failure_stage": "none",
+            "sandbox_egress_http_status": 200,
+        },
+    )
+    report = network_quality.build_report(
+        42, True, network_quality.DEFAULT_CANARY_URL
+    )
+    assert report["sandbox_egress_state"] == "daemon_mount_io_busy"
+    assert report["sandbox_egress_failure_stage"] == "daemon_event_loop"
+    assert report["sandbox_probe_daemon_mount_io_blocked"] is True
 
 
 def test_deep_canary_fails_closed_on_ambiguous_or_unstable_roles(monkeypatch):
@@ -496,13 +622,13 @@ def test_deep_canary_fails_closed_on_ambiguous_or_unstable_roles(monkeypatch):
 
 def test_canary_identity_is_normalized_and_query_bound_without_disclosure():
     _, valid_a, identity_a, fingerprint_a = network_quality.canary_target(
-        "HTTPS://API.GITHUB.COM:443/zen?token=first#ignored"
+        "HTTPS://PYPI.ORG:443/simple/pip/?token=first#ignored"
     )
     _, valid_b, identity_b, fingerprint_b = network_quality.canary_target(
-        "https://api.github.com/zen?token=second"
+        "https://pypi.org/simple/pip/?token=second"
     )
     assert valid_a and valid_b
-    assert identity_a == identity_b == "https://api.github.com/zen"
+    assert identity_a == identity_b == "https://pypi.org/simple/pip/"
     assert fingerprint_a != fingerprint_b
     assert "first" not in fingerprint_a
     assert "second" not in fingerprint_b

@@ -97,17 +97,107 @@ wait_claude_network_contract() {
   return 1
 }
 
+network_cache_probe_token() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        report = json.load(stream)
+    values = (
+        report["claude_pid"],
+        report["claude_start_ticks"],
+        report["sandbox_forwarder_fingerprint"],
+    )
+    if any(value is None or str(value).strip() == "" for value in values):
+        raise ValueError("missing probe identity")
+    print(":".join(str(value) for value in values))
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
 record_deep_network_quality() {
-  local pid verdict
-  pid="$(claude_primary_pid)" || return 1
-  verdict="$("$PYTHON_BIN" "$NETWORK_QUALITY_HELPER" \
-    --pid "$pid" --deep --cache-file "$NETWORK_CACHE_FILE" --write-cache --contract-only \
-    2>/dev/null || printf 'unknown\n')"
-  if [ "$verdict" = "ready" ]; then
-    echo "Claude Science sandbox egress canary passed (anonymous, non-billable HTTPS API request to GitHub Zen)."
-    return 0
+  local pid verdict="unknown" attempt success_streak=0 delay
+  local pending_cache="${NETWORK_CACHE_FILE}.pending.$$"
+  local degraded_cache="${NETWORK_CACHE_FILE}.degraded.$$" probe_token="" success_token=""
+  DEEP_NETWORK_VERDICT="unknown"
+  # Never expose one transient success as the startup verdict.  Each attempt
+  # writes an isolated pending report; only the second adjacent success for the
+  # same PID/starttime/forwarder fingerprint is promoted atomically.
+  rm -f -- "$pending_cache" "$degraded_cache" "$NETWORK_CACHE_FILE"
+  for attempt in 1 2 3 4; do
+    pid="$(claude_primary_pid)" || {
+      rm -f -- "$pending_cache" "$degraded_cache"
+      return 1
+    }
+    rm -f -- "$pending_cache"
+    verdict="$("$PYTHON_BIN" "$NETWORK_QUALITY_HELPER" \
+      --pid "$pid" --deep --cache-file "$pending_cache" --write-cache --contract-only \
+      2>/dev/null || printf 'unknown\n')"
+    if [ "$verdict" = "ready" ]; then
+      probe_token="$(network_cache_probe_token "$pending_cache" 2>/dev/null || true)"
+      if [ -z "$probe_token" ]; then
+        verdict="cache_identity_invalid"
+        success_streak=0
+        success_token=""
+      elif [ "$probe_token" = "$success_token" ]; then
+        success_streak=$((success_streak + 1))
+      else
+        success_streak=1
+        success_token="$probe_token"
+      fi
+      if [ "$success_streak" -ge 2 ]; then
+        rm -f -- "$degraded_cache"
+        mv -f -- "$pending_cache" "$NETWORK_CACHE_FILE" || return 1
+        DEEP_NETWORK_VERDICT="ready"
+        echo "Claude Science sandbox egress canary passed twice consecutively (anonymous, non-billable HTTPS HEAD requests to PyPI)."
+        return 0
+      fi
+    fi
+    if [ "$verdict" != "ready" ]; then
+      success_streak=0
+      success_token=""
+      if [ "$verdict" != "cache_identity_invalid" ] && [ -f "$pending_cache" ]; then
+        mv -f -- "$pending_cache" "$degraded_cache" || true
+      fi
+    fi
+    [ "$attempt" -lt 4 ] || break
+    case "$verdict" in
+      egress_daemon_mount_io_busy|egress_daemon_busy)
+        delay=$((attempt * 2))
+        echo "Claude Science daemon is temporarily busy; retrying the sandbox protocol check in ${delay}s (${attempt}/4)." >&2
+        ;;
+      *)
+        delay=2
+        ;;
+    esac
+    sleep "$delay"
+  done
+  rm -f -- "$pending_cache"
+  if [ -f "$degraded_cache" ]; then
+    mv -f -- "$degraded_cache" "$NETWORK_CACHE_FILE" || true
   fi
-  echo "Warning: Claude Science local services started, but sandbox egress quality is $verdict. The degraded result was cached for diagnostics; no model request was made." >&2
+  if [ "$verdict" = "ready" ]; then
+    verdict="insufficient_consecutive_successes"
+  fi
+  DEEP_NETWORK_VERDICT="$verdict"
+  case "$verdict" in
+    egress_daemon_mount_io_busy)
+      echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop is blocked on WSL-mounted filesystem I/O. The daemon was kept running; wait for MCP warmup or move high-I/O workspaces to WSL ext4, then refresh status. No model request was made." >&2
+      ;;
+    egress_daemon_busy)
+      echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop remained busy during protocol handshakes. The daemon was kept running for a later retry; no model request was made." >&2
+      ;;
+    *)
+      if [ -f "$NETWORK_CACHE_FILE" ]; then
+        echo "Warning: Claude Science local services started, but sandbox egress quality is $verdict after bounded retries. The last safe degraded result was cached for diagnostics; no model request was made." >&2
+      else
+        echo "Warning: Claude Science local services started, but sandbox egress quality is $verdict after bounded retries. No green cache was published; no model request was made." >&2
+      fi
+      ;;
+  esac
   return 1
 }
 
@@ -196,15 +286,60 @@ claude_listener_pids() {
 }
 
 managed_claude_pid() {
-  local pid="$1" executable cmd
+  local pid="$1" executable raw_executable
+  local -a argv=()
   [ -r "/proc/$pid/cmdline" ] || return 1
-  executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  raw_executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  executable="${raw_executable% (deleted)}"
   case "$executable" in
     "$CSA_CLAUDE_ROOT"/patched/*/claude-science|"$LEGACY_STATE_DIR"/patched/claude-science) ;;
     *) return 1;;
   esac
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-  [[ "$cmd" == *"$executable serve"* ]]
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
+  [ "${argv[0]:-}" = "$executable" ] && [ "${argv[1]:-}" = "serve" ]
+}
+
+process_start_ticks_shell() {
+  local pid="$1" payload suffix
+  payload="$(<"/proc/$pid/stat")" 2>/dev/null || return 1
+  suffix="${payload##*) }"
+  set -- $suffix
+  case "${20:-}" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "${20}"
+}
+
+managed_claude_token() {
+  local pid="$1" before after
+  before="$(process_start_ticks_shell "$pid")" || return 1
+  managed_claude_pid "$pid" || return 1
+  after="$(process_start_ticks_shell "$pid")" || return 1
+  [ "$before" = "$after" ] || return 1
+  printf '%s:%s\n' "$pid" "$before"
+}
+
+process_threads_signalable() {
+  local pid="$1" task_dir payload suffix state count=0
+  for task_dir in "/proc/$pid"/task/[0-9]*; do
+    [ -d "$task_dir" ] || continue
+    payload="$(<"$task_dir/stat")" 2>/dev/null || return 1
+    suffix="${payload##*) }"
+    state="${suffix%% *}"
+    case "$state" in
+      R|S|I) ;;
+      *) return 1;;
+    esac
+    count=$((count + 1))
+  done
+  [ "$count" -gt 0 ]
+}
+
+managed_claude_signal_token() {
+  local pid="$1" before after
+  before="$(managed_claude_token "$pid")" || return 1
+  process_threads_signalable "$pid" || return 1
+  after="$(managed_claude_token "$pid")" || return 1
+  [ "$before" = "$after" ] || return 1
+  printf '%s\n' "$before"
 }
 
 exact_executable_serve_tokens() {
@@ -236,6 +371,17 @@ candidate_token_is_baseline() {
     | grep -Fx -- "$token" >/dev/null 2>&1
 }
 
+exact_executable_signal_token() {
+  local expected_bin="$1" expected_token="$2" pid
+  pid="${expected_token%%:*}"
+  exact_executable_serve_tokens "$expected_bin" \
+    | grep -Fx -- "$expected_token" >/dev/null 2>&1 || return 1
+  process_threads_signalable "$pid" || return 1
+  exact_executable_serve_tokens "$expected_bin" \
+    | grep -Fx -- "$expected_token" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$expected_token"
+}
+
 cleanup_failed_candidate_processes() {
   [ "${CLAUDE_CANDIDATE_LAUNCHED:-0}" = "1" ] || return 0
   [ -n "${PATCHED_BIN:-}" ] || return 0
@@ -246,7 +392,7 @@ cleanup_failed_candidate_processes() {
     pid="${token%%:*}"
     # Recheck the PID+start-time token immediately before signalling so PID
     # reuse cannot redirect cleanup to an unrelated process.
-    if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+    if exact_executable_signal_token "$PATCHED_BIN" "$token" >/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
   done
@@ -258,7 +404,7 @@ cleanup_failed_candidate_processes() {
       candidate_token_is_baseline "$token" && continue
       candidate_process_found=1
       pid="${token%%:*}"
-      if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+      if exact_executable_signal_token "$PATCHED_BIN" "$token" >/dev/null; then
         kill "$pid" 2>/dev/null || true
       fi
     done
@@ -269,7 +415,7 @@ cleanup_failed_candidate_processes() {
   for token in $current_tokens; do
     candidate_token_is_baseline "$token" && continue
     pid="${token%%:*}"
-    if exact_executable_serve_tokens "$PATCHED_BIN" | grep -Fx -- "$token" >/dev/null 2>&1; then
+    if exact_executable_signal_token "$PATCHED_BIN" "$token" >/dev/null; then
       kill -9 "$pid" 2>/dev/null || true
     fi
   done
@@ -328,6 +474,81 @@ wait_claude_health() {
     sleep 0.35
   done
   return 1
+}
+
+launch_claude_daemon() {
+  local executable="$1" base_url="$2" runtime_working_dir
+  runtime_working_dir="$(dirname "$executable")"
+  [ -x "$executable" ] || return 1
+  [ -d "$runtime_working_dir" ] || return 1
+  # The portable package normally lives on /mnt/c or /mnt/e (DrvFS/9P).
+  # Claude Science inherits its launch cwd and performs substantial workspace
+  # discovery during MCP warmup.  Starting from the managed ext4 runtime keeps
+  # that control-plane I/O off the Windows mount without moving user projects.
+  (
+    cd -P "$runtime_working_dir"
+    ANTHROPIC_BASE_URL="$base_url" "$executable" serve \
+      --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update
+  )
+}
+
+stop_existing_claude_for_activation() {
+  local claude_pids claude_tokens="" pid token cmd deadline
+  PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary || true)"
+  claude_pids="$(claude_listener_pids || true)"
+  for pid in $claude_pids; do
+    case "$pid" in ''|*[!0-9]*) continue;; esac
+    token="$(managed_claude_signal_token "$pid" || true)"
+    if [ -z "$token" ]; then
+      echo "Claude Science port owner PID $pid is unverified or in an unsafe scheduler state; CSA will not stop it or mutate Bridge." >&2
+      return 1
+    fi
+    claude_tokens="${claude_tokens}${token}"$'\n'
+  done
+  [ -n "$claude_pids" ] || return 0
+
+  # Close the TOCTOU window immediately before TERM.  If the daemon entered
+  # D/T/Z/unknown state after preflight, abort before Bridge or runtime pointers
+  # are touched.
+  for token in $claude_tokens; do
+    pid="${token%%:*}"
+    if [ "$(managed_claude_signal_token "$pid" || true)" != "$token" ]; then
+      echo "Claude Science identity/state changed before TERM; CSA left Bridge and runtime pointers unchanged." >&2
+      return 1
+    fi
+  done
+  CLAUDE_STOPPED_FOR_ACTIVATION=1
+  for token in $claude_tokens; do
+    pid="${token%%:*}"
+    if [ "$(managed_claude_signal_token "$pid" || true)" != "$token" ]; then
+      echo "Claude Science identity/state changed at TERM; CSA left Bridge and runtime pointers unchanged." >&2
+      return 1
+    fi
+    cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+    if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  deadline=$((SECONDS + 5))
+  while [ "$SECONDS" -lt "$deadline" ] && [ -n "$(claude_listener_pids || true)" ]; do
+    sleep 0.25
+  done
+  if [ -n "$(claude_listener_pids || true)" ]; then
+    for token in $claude_tokens; do
+      pid="${token%%:*}"
+      if [ "$(managed_claude_signal_token "$pid" || true)" = "$token" ]; then
+        cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+        if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
+          kill -9 "$pid" 2>/dev/null || true
+        fi
+      fi
+    done
+  fi
+  if [ -n "$(claude_listener_pids || true)" ]; then
+    echo "Existing Claude Science listeners did not stop safely within 5 seconds; CSA left Bridge unchanged." >&2
+    return 1
+  fi
 }
 
 verified_bridge_listener() {
@@ -645,19 +866,6 @@ restore_runtime_after_failure() {
         "$CSA_CLAUDE_ROOT" "$CLAUDE_PREVIOUS_RUNTIME" "$CLAUDE_CANDIDATE_RUNTIME" \
         "Claude Science" || true
     fi
-    if [ "$CLAUDE_STOPPED_FOR_ACTIVATION" = "1" ] \
-      && [ -n "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
-      && [ -x "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
-      && [ -z "$(claude_listener_pids || true)" ]; then
-      rollback_proxy_url="http://127.0.0.1:$PROXY_PORT"
-      if ANTHROPIC_BASE_URL="$rollback_proxy_url" "$PREVIOUS_RUNNING_CLAUDE_BIN" serve \
-        --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update >/dev/null 2>&1 \
-        && wait_claude_health "$PREVIOUS_RUNNING_CLAUDE_BIN" 12; then
-        echo "Restarted the previous Claude Science daemon after failed activation." >&2
-      else
-        echo "Failed to restart the previous Claude Science daemon after activation failure." >&2
-      fi
-    fi
     if [ "$BRIDGE_VALIDATED" != "1" ] \
       && [ "$BRIDGE_POINTER_CHANGED" = "1" ]; then
       if rollback_runtime_pointer \
@@ -672,10 +880,69 @@ restore_runtime_after_failure() {
         fi
       fi
     fi
+    # Restore the Bridge transaction before relaunching the previous Claude
+    # daemon.  Otherwise a failed Bridge candidate can make rollback startup
+    # fail even though the previous runtime is intact.
+    if [ "$CLAUDE_STOPPED_FOR_ACTIVATION" = "1" ] \
+      && [ -n "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
+      && [ -x "$PREVIOUS_RUNNING_CLAUDE_BIN" ] \
+      && [ -z "$(claude_listener_pids || true)" ]; then
+      rollback_proxy_url="http://127.0.0.1:$PROXY_PORT"
+      if launch_claude_daemon "$PREVIOUS_RUNNING_CLAUDE_BIN" "$rollback_proxy_url" \
+        >/dev/null 2>&1 \
+        && wait_claude_health "$PREVIOUS_RUNNING_CLAUDE_BIN" 12; then
+        echo "Restarted the previous Claude Science daemon after failed activation." >&2
+      else
+        echo "Failed to restart the previous Claude Science daemon after activation failure." >&2
+      fi
+    fi
   fi
   exit "$exit_code"
 }
 trap restore_runtime_after_failure EXIT
+
+# Refuse a partial ForceRestart before Bridge is touched.  A Claude process in
+# D/T/Z/unknown state cannot be stopped predictably; all thread states plus the
+# PID start token are re-read from /proc around the ownership check.
+preflight_claude_pids="$(claude_listener_pids || true)"
+preflight_unsafe_pid=""
+for pid in $preflight_claude_pids; do
+  case "$pid" in ''|*[!0-9]*) continue;; esac
+  if ! managed_claude_token "$pid" >/dev/null; then
+    echo "Claude Science port is owned by an unverified process (PID $pid); CSA will not mutate Bridge or signal it." >&2
+    exit 1
+  fi
+  if ! managed_claude_signal_token "$pid" >/dev/null; then
+    preflight_unsafe_pid="$pid"
+  fi
+done
+if [ -n "$preflight_unsafe_pid" ]; then
+  if [ "${CSA_FORCE_RESTART:-0}" = "1" ] \
+    || ! csa_load_bridge_runtime_identity >/dev/null 2>&1 \
+    || ! check_bridge_health \
+    || ! check_claude_network_contract; then
+    echo "Claude Science PID $preflight_unsafe_pid is currently in an unsafe scheduler state for repair (for example D/p9 mount I/O). CSA left Claude Science, Bridge, WSL, runtime pointers, and unrelated ports unchanged; refresh and retry after I/O returns." >&2
+    exit 1
+  fi
+  echo "Claude Science PID $preflight_unsafe_pid is temporarily unsafe to signal. Existing healthy local services were preserved without staging or mutating Bridge/runtime pointers."
+  if record_deep_network_quality; then
+    echo "Claude Science recovered and passed the network probe, but package migration was intentionally deferred; refresh once more to apply it safely."
+  else
+    echo "Claude Science remains locally available but external API readiness is degraded ($DEEP_NETWORK_VERDICT). Refresh after I/O returns; CSA did not restart WSL or touch unrelated port 2222."
+  fi
+  csa_print_bridge_identity
+  START_COMPLETED=1
+  exit 0
+fi
+
+# A full activation stops the verified Claude daemon before staging or
+# restarting Bridge.  This makes the state transition one-way: if the daemon
+# becomes uninterruptible, the operation fails while Bridge and both runtime
+# pointers are still untouched.  Explicit Bridge-only operations retain their
+# documented behavior and never attempt to stop Claude.
+if [ "${CSA_BRIDGE_ONLY:-0}" != "1" ]; then
+  stop_existing_claude_for_activation || exit 1
+fi
 
 csa_stage_bridge_runtime "$PROJECT_DIR" "$CSA_PACKAGE_VERSION"
 BRIDGE_POINTER_CHANGED="$CSA_POINTER_CHANGED"
@@ -716,10 +983,11 @@ CLAUDE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
 CLAUDE_CANDIDATE_RUNTIME="$CSA_CLAUDE_RUNTIME_DIR"
 SOURCE_BIN="$CSA_CLAUDE_RUNTIME_DIR/claude-science"
 SOURCE_SHA="$CSA_CLAUDE_SOURCE_SHA256"
+PATCH_PROFILE="byok-no-eager-mcp-warmup-v1"
 if [ -n "$PATCH_DIR_OVERRIDE" ]; then
   PATCH_DIR="$PATCH_DIR_OVERRIDE"
 else
-  PATCH_DIR="$CSA_CLAUDE_ROOT/patched/${SOURCE_SHA}-${PROXY_PORT}"
+  PATCH_DIR="$CSA_CLAUDE_ROOT/patched/${SOURCE_SHA}-${PROXY_PORT}-${PATCH_PROFILE}"
 fi
 PATCHED_BIN="$PATCH_DIR/claude-science"
 
@@ -737,7 +1005,7 @@ if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
   if record_deep_network_quality && [ -x "$PATCHED_BIN" ]; then
     echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
   else
-    echo "Claude Science local services are ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT; see network diagnostics for egress status."
+    echo "Claude Science local listeners remain available on 127.0.0.1:$CLAUDE_SCIENCE_PORT, but external API readiness is degraded ($DEEP_NETWORK_VERDICT). The launcher will not report the service ready until a later deep check passes twice consecutively."
   fi
   csa_print_bridge_identity
   START_COMPLETED=1
@@ -767,7 +1035,7 @@ if [ "$ACTUAL_SOURCE_SHA" != "$SOURCE_SHA" ]; then
   exit 1
 fi
 PATCH_MARKER="$PATCH_DIR/.claude-science.source.sha256"
-PATCH_CACHE_KEY="$SOURCE_SHA:$PROXY_PORT"
+PATCH_CACHE_KEY="$SOURCE_SHA:$PROXY_PORT:$PATCH_PROFILE"
 
 if [ -x "$PATCHED_BIN" ] \
   && [ -f "$PATCH_MARKER" ] \
@@ -812,6 +1080,17 @@ pairs = [
         ],
         f"http://127.000.000.01:{port}/api/oauth/token".encode(),
     ),
+    # Claude Science 0.1.25 unconditionally calls QT9(V) during boot to
+    # prewarm every bundled MCP connector.  On WSL workspaces under /mnt/c or
+    # /mnt/e that can block Bun's main event loop in p9_client_rpc for 80-100s,
+    # leaving all six proxy ports listening but unable to accept.  The locked
+    # build contains an existing no-op ZT9 and this full 22-byte call context
+    # occurs exactly once.  Patch only the managed copy; lazy connector startup
+    # remains available when a connector is actually used.
+    (
+        [b"QT9(V),oe_(V,WG).catch"],
+        b"ZT9(V),oe_(V,WG).catch",
+    ),
 ]
 
 for olds, new in pairs:
@@ -821,14 +1100,20 @@ for olds, new in pairs:
 
 data = target.read_bytes()
 counts = [(olds, new, sum(data.count(old) for old in olds), data.count(new)) for olds, new in pairs]
+warmup_old = b"QT9(V),oe_(V,WG).catch"
+warmup_new = b"ZT9(V),oe_(V,WG).catch"
+if data.count(b"function QT9(z)") != 1 or data.count(b"function ZT9(z){}") != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; eager/no-op warmup function identity changed")
+if data.count(warmup_old) + data.count(warmup_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; eager MCP warmup call identity is not unique")
 missing = [
-    " or ".join(old.decode() for old in olds)
+    " or ".join(old.decode(errors="replace") for old in olds)
     for olds, new, old_count, new_count in counts
     if old_count == 0 and new_count == 0
 ]
 if missing:
     raise SystemExit(
-        "Unsupported Claude Science daemon build; expected OAuth/API URL(s) not found:\n"
+        "Unsupported Claude Science daemon build; expected version-locked patch pattern(s) not found:\n"
         + "\n".join(f"  - {item}" for item in missing)
     )
 
@@ -857,8 +1142,10 @@ for olds, new, _, _ in counts:
             raise SystemExit(f"patch verification failed; original URL still present: {old.decode()}")
     if after.count(new) == 0:
         raise SystemExit(f"patch verification failed; replacement URL missing: {new.decode()}")
+if after.count(warmup_old) != 0 or after.count(warmup_new) != 1:
+    raise SystemExit("patch verification failed; eager MCP warmup call was not replaced exactly once")
 
-print(f"Patched OAuth/API URL occurrence(s): {patched}")
+print(f"Patched managed runtime byte occurrence(s): {patched}")
 PY
 
   if ! "$PATCHED_BIN" --help >/dev/null 2>&1; then
@@ -868,51 +1155,10 @@ PY
   printf '%s\n' "$PATCH_CACHE_KEY" > "$PATCH_MARKER"
 fi
 
-PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary || true)"
-claude_pids="$(claude_listener_pids || true)"
-for pid in $claude_pids; do
-  case "$pid" in ''|*[!0-9]*) continue;; esac
-  if ! managed_claude_pid "$pid"; then
-    echo "Claude Science port is owned by an unverified process (PID $pid); CSA will not stop it." >&2
-    exit 1
-  fi
-done
-if [ -n "$claude_pids" ]; then
-  CLAUDE_STOPPED_FOR_ACTIVATION=1
-fi
-for pid in $claude_pids; do
-  case "$pid" in ''|*[!0-9]*) continue;; esac
-  if managed_claude_pid "$pid"; then
-    cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
-    if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
-      kill "$pid" 2>/dev/null || true
-    fi
-  fi
-done
-deadline=$((SECONDS + 5))
-while [ "$SECONDS" -lt "$deadline" ] && [ -n "$(claude_listener_pids || true)" ]; do
-  sleep 0.25
-done
-if [ -n "$(claude_listener_pids || true)" ]; then
-  for pid in $(claude_listener_pids || true); do
-    case "$pid" in ''|*[!0-9]*) continue;; esac
-    if managed_claude_pid "$pid"; then
-      cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
-      if [[ "$cmd" == *"claude-science"*"serve"* ]]; then
-        kill -9 "$pid" 2>/dev/null || true
-      fi
-    fi
-  done
-fi
-if [ -n "$(claude_listener_pids || true)" ]; then
-  echo "Existing Claude Science listeners did not stop within 5 seconds." >&2
-  exit 1
-fi
-
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 CLAUDE_CANDIDATE_BASELINE_TOKENS="$(exact_executable_serve_tokens "$PATCHED_BIN" || true)"
 CLAUDE_CANDIDATE_LAUNCHED=1
-ANTHROPIC_BASE_URL="$PROXY_URL" "$PATCHED_BIN" serve --port "$CLAUDE_SCIENCE_PORT" --no-browser --detached --no-auto-update
+launch_claude_daemon "$PATCHED_BIN" "$PROXY_URL"
 if ! wait_claude_health "$PATCHED_BIN" 15; then
   echo "Claude Science candidate did not become healthy on 127.0.0.1:$CLAUDE_SCIENCE_PORT." >&2
   exit 1
@@ -921,13 +1167,18 @@ if ! wait_claude_network_contract 5; then
   echo "Claude Science candidate started locally but failed its outbound proxy contract." >&2
   exit 1
 fi
-record_deep_network_quality || true
 csa_atomic_symlink "$PATCH_DIR" "$CSA_CLAUDE_ROOT/patched-current"
-CLAUDE_VALIDATED=1
-
-echo "Started Claude Science patched copy:"
-echo "  daemon: $PATCHED_BIN"
-echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
-echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
+if record_deep_network_quality; then
+  CLAUDE_VALIDATED=1
+  echo "Started Claude Science validated patched copy:"
+  echo "  daemon: $PATCHED_BIN"
+  echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
+  echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
+else
+  echo "Started Claude Science patched copy with degraded network quality:"
+  echo "  daemon: $PATCHED_BIN"
+  echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
+  echo "Claude Science local listeners remain available on 127.0.0.1:$CLAUDE_SCIENCE_PORT, but external API readiness is degraded ($DEEP_NETWORK_VERDICT). The process was kept running without restarting WSL or touching unrelated port 2222."
+fi
 csa_print_bridge_identity
 START_COMPLETED=1

@@ -68,7 +68,58 @@ if [ "$(printf '%s\n' "$claude_primary_pid_list" | sed '/^$/d' | wc -l)" = "1" ]
 elif [ -n "$claude_listener_pid_list" ]; then
   claude_unverified_pid="$(printf '%s\n' "$claude_listener_pid_list" | sed '/^$/d' | head -1)"
 fi
-network_json='{"schema_version":2,"claude_pid":null,"claude_start_ticks":null,"proxy_state":"not_running","proxy_reachable":null,"proxy_endpoints":[],"proxy_variable_names":[],"proxy_conflict":false,"deep_checked":false,"deep_checked_at_unix":null,"sandbox_contract_stable_during_probe":false,"sandbox_forwarder_count":0,"sandbox_forwarder_group_count":0,"sandbox_http_forwarder_count":0,"sandbox_socks_forwarder_count":0,"sandbox_forwarder_expected_count":3,"sandbox_forwarder_topology_state":"incomplete","sandbox_forwarder_incomplete_extra_count":0,"sandbox_forwarder_fingerprint":null,"sandbox_probe_identity":"analysis-socks5h-github-zen-v1","sandbox_probe_role":"analysis","sandbox_probe_transport":"socks5h","sandbox_egress_state":"not_checked","sandbox_egress_target":"api.github.com","sandbox_egress_canary_identity":"https://api.github.com/zen","sandbox_egress_canary_fingerprint":null,"sandbox_egress_http_status":null,"sandbox_egress_http_statuses":[],"sandbox_forwarder_probe_count":0,"sandbox_forwarder_passed_count":0,"sandbox_forwarder_failed_count":0,"secrets_included":false}'
+network_fallback_json() {
+  local fallback_pid="${1:-null}"
+  local fallback_proxy_state="${2:-unknown}"
+  local fallback_egress_state="${3:-not_checked}"
+  printf '%s' \
+    '{"schema_version":3,' \
+    "\"claude_pid\":$fallback_pid," \
+    '"claude_start_ticks":null,' \
+    '"claude_process_state":"unknown",' \
+    '"claude_wait_channel":"unknown",' \
+    '"claude_io_blocked":false,' \
+    '"claude_mount_io_blocked":false,' \
+    "\"proxy_state\":\"$fallback_proxy_state\"," \
+    '"proxy_reachable":null,' \
+    '"proxy_endpoints":[],' \
+    '"proxy_variable_names":[],' \
+    '"proxy_conflict":false,' \
+    '"deep_checked":false,' \
+    '"deep_checked_at_unix":null,' \
+    '"sandbox_contract_stable_during_probe":false,' \
+    '"sandbox_forwarder_count":0,' \
+    '"sandbox_forwarder_group_count":0,' \
+    '"sandbox_http_forwarder_count":0,' \
+    '"sandbox_socks_forwarder_count":0,' \
+    '"sandbox_forwarder_expected_count":3,' \
+    '"sandbox_forwarder_topology_state":"incomplete",' \
+    '"sandbox_forwarder_incomplete_extra_count":0,' \
+    '"sandbox_forwarder_fingerprint":null,' \
+    '"sandbox_probe_identity":"analysis-socks5h-pypi-head-v2",' \
+    '"sandbox_probe_role":"analysis",' \
+    '"sandbox_probe_transport":"socks5h",' \
+    '"sandbox_unix_socket_state":"not_checked",' \
+    '"sandbox_socks_handshake_state":"not_checked",' \
+    '"sandbox_socks_handshake_error":null,' \
+    "\"sandbox_egress_state\":\"$fallback_egress_state\"," \
+    '"sandbox_egress_failure_stage":"not_checked",' \
+    '"sandbox_egress_target":"pypi.org",' \
+    '"sandbox_egress_canary_identity":"https://pypi.org/simple/pip/",' \
+    '"sandbox_egress_canary_fingerprint":null,' \
+    '"sandbox_egress_http_status":null,' \
+    '"sandbox_egress_http_statuses":[],' \
+    '"sandbox_forwarder_probe_count":0,' \
+    '"sandbox_forwarder_passed_count":0,' \
+    '"sandbox_forwarder_failed_count":0,' \
+    '"sandbox_egress_curl_exit_code":null,' \
+    '"sandbox_probe_daemon_state":"unknown",' \
+    '"sandbox_probe_daemon_wait_channel":"unknown",' \
+    '"sandbox_probe_daemon_io_blocked":false,' \
+    '"sandbox_probe_daemon_mount_io_blocked":false,' \
+    '"secrets_included":false}'
+}
+network_json="$(network_fallback_json null not_running not_checked)"
 network_python=""
 if [ -x "$venv_python" ]; then
   network_python="$venv_python"
@@ -88,10 +139,10 @@ if [ -n "$claude_pid" ]; then
     if [[ "$network_result" == \{*\} ]]; then
       network_json="$network_result"
     else
-      network_json="{\"schema_version\":2,\"claude_pid\":$claude_pid,\"claude_start_ticks\":null,\"proxy_state\":\"unknown\",\"proxy_reachable\":null,\"proxy_endpoints\":[],\"proxy_variable_names\":[],\"proxy_conflict\":false,\"deep_checked\":false,\"deep_checked_at_unix\":null,\"sandbox_contract_stable_during_probe\":false,\"sandbox_forwarder_count\":0,\"sandbox_forwarder_group_count\":0,\"sandbox_http_forwarder_count\":0,\"sandbox_socks_forwarder_count\":0,\"sandbox_forwarder_expected_count\":3,\"sandbox_forwarder_topology_state\":\"incomplete\",\"sandbox_forwarder_incomplete_extra_count\":0,\"sandbox_forwarder_fingerprint\":null,\"sandbox_probe_identity\":\"analysis-socks5h-github-zen-v1\",\"sandbox_probe_role\":\"analysis\",\"sandbox_probe_transport\":\"socks5h\",\"sandbox_egress_state\":\"unavailable\",\"sandbox_egress_target\":\"api.github.com\",\"sandbox_egress_canary_identity\":\"https://api.github.com/zen\",\"sandbox_egress_canary_fingerprint\":null,\"sandbox_egress_http_status\":null,\"sandbox_egress_http_statuses\":[],\"sandbox_forwarder_probe_count\":0,\"sandbox_forwarder_passed_count\":0,\"sandbox_forwarder_failed_count\":0,\"secrets_included\":false}"
+      network_json="$(network_fallback_json "$claude_pid" unknown unavailable)"
     fi
   else
-    network_json="{\"schema_version\":2,\"claude_pid\":$claude_pid,\"claude_start_ticks\":null,\"proxy_state\":\"unknown\",\"proxy_reachable\":null,\"proxy_endpoints\":[],\"proxy_variable_names\":[],\"proxy_conflict\":false,\"deep_checked\":false,\"deep_checked_at_unix\":null,\"sandbox_contract_stable_during_probe\":false,\"sandbox_forwarder_count\":0,\"sandbox_forwarder_group_count\":0,\"sandbox_http_forwarder_count\":0,\"sandbox_socks_forwarder_count\":0,\"sandbox_forwarder_expected_count\":3,\"sandbox_forwarder_topology_state\":\"incomplete\",\"sandbox_forwarder_incomplete_extra_count\":0,\"sandbox_forwarder_fingerprint\":null,\"sandbox_probe_identity\":\"analysis-socks5h-github-zen-v1\",\"sandbox_probe_role\":\"analysis\",\"sandbox_probe_transport\":\"socks5h\",\"sandbox_egress_state\":\"unavailable\",\"sandbox_egress_target\":\"api.github.com\",\"sandbox_egress_canary_identity\":\"https://api.github.com/zen\",\"sandbox_egress_canary_fingerprint\":null,\"sandbox_egress_http_status\":null,\"sandbox_egress_http_statuses\":[],\"sandbox_forwarder_probe_count\":0,\"sandbox_forwarder_passed_count\":0,\"sandbox_forwarder_failed_count\":0,\"secrets_included\":false}"
+    network_json="$(network_fallback_json "$claude_pid" unknown unavailable)"
   fi
 fi
 bridge_healthy=false

@@ -75,19 +75,44 @@ remain open after the daemon's inherited upstream proxy has stopped. Run:
 .\scripts\status-probe.ps1 -DeepNetworkProbe
 ```
 
-The report separates four facts: managed process ownership, inherited proxy endpoint reachability,
-all three built-in HTTP/SOCKS sandbox pairs, and an anonymous, non-billable HTTPS API request to
-GitHub Zen through the canonical `analysis` SOCKS5H route. The Operon and BYOC pairs have different
-allowlists, so topology is verified for all roles while the egress canary intentionally probes only
-`analysis`. The fixed canary cannot be replaced by an environment variable, and a short-lived
-loopback adapter sends the probe through the real `analysis/socks.sock` Unix socket rather than
-bypassing it through the backing TCP port. Proxy URLs are reduced to scheme/host/port and credentials
-are never included.
+The report separates each failure boundary instead of treating an open port as proof of egress:
+
+1. the listener belongs to the expected managed process and the three built-in HTTP/SOCKS pairs are complete;
+2. the canonical `analysis/socks.sock` Unix socket accepts a connection;
+3. that socket completes a SOCKS5 greeting;
+4. a short-lived loopback adapter carries `HEAD https://pypi.org/simple/pip/` through the same SOCKS5H route; and
+5. the Claude Science daemon remains schedulable and the sandbox contract identity remains stable during the probe.
+
+The fixed, anonymous, non-billable canary identity is `analysis-socks5h-pypi-head-v2`; it cannot be
+replaced by an environment variable. The Operon and BYOC pairs have different allowlists, so topology
+is verified for all roles while the egress request intentionally probes only `analysis`. Socket path,
+device, inode, child start identity, and report schema are bound to the cached result, so old
+GitHub/arXiv or prior-schema results cannot supply a green status. During startup, the first success is
+kept in a PID-specific pending cache; a green cache is published only after a second adjacent success
+with the same PID, start time, and forwarder fingerprint. Proxy URLs are reduced to
+scheme/host/port and credentials are never included.
+
+If `claude_process_state` is `D`, inspect `claude_wait_channel`. A value such as `p9_client_rpc`, with
+`claude_mount_io_blocked=true` or `sandbox_probe_daemon_mount_io_blocked=true`, means the daemon is
+waiting on WSL DrvFS/9P mount I/O. That is a local Claude Science/WSL filesystem stall, not evidence
+that PyPI, OpenAlex, arXiv, or the internet is down. The launcher therefore refuses a cached green
+result and temporarily blocks restart rather than leaving Bridge and Claude Science half-switched.
+Refresh after the I/O returns.
+
+The managed launcher starts Claude Science with an ext4 managed-runtime directory as its working
+directory. Its content-addressed managed binary copy also skips the eager startup warmup of 24 MCPs;
+connectors remain available for on-demand use, and the original Claude Science binary is not
+modified. These two measures reduce avoidable DrvFS/9P traffic during startup.
 
 If `proxy_state` is `unreachable` or `conflict`, use the launcher's **修复并重启** action after the
 current experiment finishes. A Bridge-only restart cannot refresh proxy variables already inherited
 by Claude Science. The controlled restart does not modify the Windows/WSL system proxy, VPN, DNS,
 hosts, certificates, or port 443.
+
+CSA self-check and repair never run global `wsl --shutdown` or `wsl --terminate`. Those commands can
+interrupt unrelated services in the same WSL environment (for example SSH on another port), so a
+daemon stuck in uninterruptible mount I/O is reported and preserved until it becomes safely
+signalable.
 
 ## Tool Call Markers Appear As Text
 

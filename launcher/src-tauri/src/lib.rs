@@ -32,8 +32,8 @@ const BUNDLED_CLAUDE_SCIENCE_VERSION: &str = "0.1.25";
 const BUNDLED_CLAUDE_SCIENCE_SHA8: &str = "b7190511";
 const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
 const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
-const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-github-zen-v1";
-const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://api.github.com/zen";
+const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-pypi-head-v2";
+const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://pypi.org/simple/pip/";
 
 fn deep_network_result_is_fresh(
     deep_checked: bool,
@@ -214,6 +214,13 @@ struct NetworkQualityStatus {
     sandbox_socks_forwarder_count: u32,
     sandbox_probe_role: String,
     sandbox_probe_transport: String,
+    daemon_process_state: String,
+    daemon_wait_channel: String,
+    daemon_io_blocked: bool,
+    daemon_mount_io_blocked: bool,
+    sandbox_unix_socket_state: String,
+    sandbox_socks_handshake_state: String,
+    sandbox_egress_failure_stage: String,
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
     sandbox_egress_state: String,
@@ -237,6 +244,13 @@ impl Default for NetworkQualityStatus {
             sandbox_socks_forwarder_count: 0,
             sandbox_probe_role: "analysis".into(),
             sandbox_probe_transport: "socks5h".into(),
+            daemon_process_state: "unknown".into(),
+            daemon_wait_channel: "unknown".into(),
+            daemon_io_blocked: false,
+            daemon_mount_io_blocked: false,
+            sandbox_unix_socket_state: "not_checked".into(),
+            sandbox_socks_handshake_state: "not_checked".into(),
+            sandbox_egress_failure_stage: "not_checked".into(),
             deep_checked: false,
             deep_checked_at_unix: None,
             sandbox_egress_state: "not_checked".into(),
@@ -386,6 +400,28 @@ struct WslProbeNetwork {
     #[serde(default)]
     sandbox_probe_transport: String,
     #[serde(default)]
+    claude_process_state: String,
+    #[serde(default)]
+    claude_wait_channel: String,
+    #[serde(default)]
+    claude_io_blocked: bool,
+    #[serde(default)]
+    claude_mount_io_blocked: bool,
+    #[serde(default)]
+    sandbox_unix_socket_state: String,
+    #[serde(default)]
+    sandbox_socks_handshake_state: String,
+    #[serde(default)]
+    sandbox_egress_failure_stage: String,
+    #[serde(default)]
+    sandbox_probe_daemon_state: String,
+    #[serde(default)]
+    sandbox_probe_daemon_wait_channel: String,
+    #[serde(default)]
+    sandbox_probe_daemon_io_blocked: bool,
+    #[serde(default)]
+    sandbox_probe_daemon_mount_io_blocked: bool,
+    #[serde(default)]
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
     #[serde(default)]
@@ -415,14 +451,17 @@ fn sandbox_forwarder_topology_is_ready(network: &WslProbeNetwork) -> bool {
         && network.sandbox_probe_identity == SANDBOX_NETWORK_PROBE_IDENTITY
         && network.sandbox_probe_role == "analysis"
         && network.sandbox_probe_transport == "socks5h"
-        && network.sandbox_egress_target.as_deref() == Some("api.github.com")
+        && network.sandbox_egress_target.as_deref() == Some("pypi.org")
         && network.sandbox_egress_canary_identity.as_deref()
             == Some(SANDBOX_NETWORK_CANARY_IDENTITY)
 }
 
 fn sandbox_deep_egress_is_ready(network: &WslProbeNetwork) -> bool {
     network.sandbox_contract_stable_during_probe
+        && network.sandbox_unix_socket_state == "connected"
+        && network.sandbox_socks_handshake_state == "ok"
         && network.sandbox_egress_state == "ok"
+        && network.sandbox_egress_failure_stage == "none"
         && network.sandbox_forwarder_probe_count == 1
         && network.sandbox_forwarder_passed_count == 1
         && network.sandbox_forwarder_failed_count == 0
@@ -1083,8 +1122,36 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         probe.network.deep_checked_at_unix,
         now_unix,
     );
-    let network_ready =
-        local_network_ready && deep_result_fresh && sandbox_deep_egress_is_ready(&probe.network);
+    let network_ready = local_network_ready
+        && !probe.network.claude_io_blocked
+        && deep_result_fresh
+        && sandbox_deep_egress_is_ready(&probe.network);
+    let daemon_process_state = if probe.network.claude_process_state.trim().is_empty() {
+        if deep_result_fresh && !probe.network.sandbox_probe_daemon_state.trim().is_empty() {
+            probe.network.sandbox_probe_daemon_state.clone()
+        } else {
+            "unknown".into()
+        }
+    } else {
+        probe.network.claude_process_state.clone()
+    };
+    let daemon_wait_channel = if probe.network.claude_wait_channel.trim().is_empty() {
+        if deep_result_fresh
+            && !probe
+                .network
+                .sandbox_probe_daemon_wait_channel
+                .trim()
+                .is_empty()
+        {
+            probe.network.sandbox_probe_daemon_wait_channel.clone()
+        } else {
+            "unknown".into()
+        }
+    } else {
+        probe.network.claude_wait_channel.clone()
+    };
+    let daemon_io_blocked = probe.network.claude_io_blocked;
+    let daemon_mount_io_blocked = probe.network.claude_mount_io_blocked;
     let network = NetworkQualityStatus {
         proxy_state: proxy_state.clone(),
         local_ready: local_network_ready,
@@ -1099,6 +1166,35 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         sandbox_socks_forwarder_count: probe.network.sandbox_socks_forwarder_count,
         sandbox_probe_role: probe.network.sandbox_probe_role.clone(),
         sandbox_probe_transport: probe.network.sandbox_probe_transport.clone(),
+        daemon_process_state,
+        daemon_wait_channel,
+        daemon_io_blocked,
+        daemon_mount_io_blocked,
+        sandbox_unix_socket_state: if probe.network.sandbox_unix_socket_state.trim().is_empty() {
+            "not_checked".into()
+        } else {
+            probe.network.sandbox_unix_socket_state.clone()
+        },
+        sandbox_socks_handshake_state: if probe
+            .network
+            .sandbox_socks_handshake_state
+            .trim()
+            .is_empty()
+        {
+            "not_checked".into()
+        } else {
+            probe.network.sandbox_socks_handshake_state.clone()
+        },
+        sandbox_egress_failure_stage: if probe
+            .network
+            .sandbox_egress_failure_stage
+            .trim()
+            .is_empty()
+        {
+            "not_checked".into()
+        } else {
+            probe.network.sandbox_egress_failure_stage.clone()
+        },
         deep_checked: deep_result_fresh,
         deep_checked_at_unix: probe.network.deep_checked_at_unix,
         sandbox_egress_state: if probe.network.sandbox_egress_state.trim().is_empty() {
@@ -1140,7 +1236,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             .unwrap_or(false)
         || root_free_ratio.map(|ratio| ratio < 0.10).unwrap_or(false)
         || inode_free_ratio.map(|ratio| ratio < 0.05).unwrap_or(false);
-    let restart_blocked = storage_blocked;
+    let restart_blocked = storage_blocked || (claude_running && probe.network.claude_io_blocked);
     let windows_bridge_pid = legacy_windows_bridge_pid();
 
     if bridge_running && !probe.runtime.bridge_health_responding {
@@ -1207,7 +1303,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         ));
     }
     if local_network_ready && !deep_result_fresh {
-        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable HTTPS API deep check (GitHub Zen) before treating external APIs as ready.".into());
+        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable HTTPS HEAD deep check (PyPI) before treating external APIs as ready.".into());
     }
     if deep_result_fresh
         && !matches!(
@@ -1215,20 +1311,54 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             "ok" | "not_checked"
         )
     {
-        let target = probe
-            .network
-            .sandbox_egress_target
-            .as_deref()
-            .unwrap_or("research API canary");
-        let status = probe
-            .network
-            .sandbox_egress_http_status
-            .map(|value| format!(", HTTP {value}"))
-            .unwrap_or_default();
-        warnings.push(format!(
-            "Sandbox deep egress check to {target} failed ({}{}). This can be a local proxy, policy, DNS/TLS, or remote-service issue; the probe does not make a billable model request.",
-            probe.network.sandbox_egress_state, status
-        ));
+        if probe.network.sandbox_probe_daemon_mount_io_blocked
+            || probe.network.sandbox_egress_state == "daemon_mount_io_busy"
+        {
+            let wait_channel = if probe
+                .network
+                .sandbox_probe_daemon_wait_channel
+                .trim()
+                .is_empty()
+            {
+                "mount I/O"
+            } else {
+                probe.network.sandbox_probe_daemon_wait_channel.as_str()
+            };
+            warnings.push(format!(
+                "Claude Science owns all expected ports, but its event loop was blocked in {wait_channel} while accessing a WSL-mounted Windows workspace during the end-to-end probe. The readiness result was withheld, so this is not evidence of an external API or proxy outage. Wait for I/O to return, or move high-I/O workspaces to WSL ext4."
+            ));
+        } else if probe.network.sandbox_probe_daemon_io_blocked
+            || probe.network.sandbox_egress_state == "daemon_busy"
+        {
+            warnings.push(format!(
+                "Claude Science owns all expected ports, but its event loop entered scheduler state {} at {} during the protocol probe. External API readiness is not established; the daemon was kept running and no billable model request was made.",
+                probe.network.sandbox_probe_daemon_state,
+                probe.network.sandbox_probe_daemon_wait_channel
+            ));
+        } else {
+            let target = probe
+                .network
+                .sandbox_egress_target
+                .as_deref()
+                .unwrap_or("research API canary");
+            let status = probe
+                .network
+                .sandbox_egress_http_status
+                .map(|value| format!(", HTTP {value}"))
+                .unwrap_or_default();
+            warnings.push(format!(
+                "Sandbox deep egress check to {target} failed at stage {} ({}{}). This can be a local proxy, policy, DNS/TLS, or remote-service issue; the probe does not make a billable model request.",
+                probe.network.sandbox_egress_failure_stage,
+                probe.network.sandbox_egress_state,
+                status
+            ));
+        }
+    }
+
+    if claude_running && probe.network.claude_mount_io_blocked {
+        warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. Repair/restart is temporarily blocked so CSA does not leave Bridge and daemon in a partial state; refresh after the current I/O returns.".into());
+    } else if claude_running && probe.network.claude_io_blocked {
+        warnings.push("Claude Science is currently in uninterruptible I/O. Repair/restart is temporarily blocked; CSA will not signal the daemon or mutate Bridge until the process becomes safely stoppable.".into());
     }
 
     if bridge_pid.is_some() && claude_pid.is_none() {
@@ -2943,7 +3073,10 @@ fn apply_bridge_config_patch_value(
 ) -> Result<AppliedBridgeConfig, String> {
     let status = current_status();
     if status.restart_blocked {
-        return Err("当前诊断不允许写入 API Key/模型配置；请先处理磁盘、WSL 或安装包问题".into());
+        return Err(
+            "当前诊断不允许写入 API Key/模型配置；请先处理磁盘、WSL、守护进程 I/O 阻塞或安装包问题"
+                .into(),
+        );
     }
     let Some(distro) = status.distro.as_deref() else {
         return Err("未检测到可用 WSL 发行版，暂不能应用 Provider 配置".into());
@@ -4229,6 +4362,12 @@ async fn get_runtime_update_status() -> Result<RuntimeUpdateStatus, String> {
     run_blocking(get_runtime_update_status_impl).await
 }
 
+// The inner startup can legitimately spend up to ~100 seconds in the
+// lifecycle lock, Bridge fallback, Claude health checks and four bounded deep
+// probes.  The outer Windows timeout must not cut the WSL transaction in half.
+const START_SERVICES_TIMEOUT: Duration = Duration::from_secs(180);
+const STOP_SERVICES_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn start_services_raw(
     distro: &str,
     user: &str,
@@ -4257,7 +4396,7 @@ fn start_services_raw(
         command.arg("-ForceRestart");
     }
     let output =
-        command_output_with_timeout(command, Duration::from_secs(45), "Claude Science 启动")?;
+        command_output_with_timeout(command, START_SERVICES_TIMEOUT, "Claude Science 启动")?;
     if output.status.success() {
         parse_runtime_identity(&output_text(&output))
     } else {
@@ -4276,7 +4415,7 @@ fn start_services_impl() -> Result<SystemStatus, String> {
     }
     if before.restart_blocked {
         return Err(format!(
-            "当前诊断不允许自动启动（{}）。请先检查磁盘空间、WSL 状态和安装包完整性；CSA 不会冒险修改环境。",
+            "当前诊断不允许自动启动（{}）。请先检查磁盘空间、WSL 状态、守护进程 I/O 阻塞和安装包完整性；CSA 不会停止 Bridge、关闭 WSL 或影响无关端口。",
             before
                 .wsl_storage_path
                 .as_deref()
@@ -4329,15 +4468,49 @@ listener_pids() {
 }
 
 managed_claude_pid() {
-  local pid="$1" executable cmd
+  local pid="$1" executable raw_executable
+  local -a argv=()
   [ -r "/proc/$pid/cmdline" ] || return 1
-  executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+  raw_executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  executable="${raw_executable% (deleted)}"
   case "$executable" in
     "$state_root"/runtime/claude-science/patched/*/claude-science|"$legacy_root"/patched/claude-science) ;;
     *) return 1;;
   esac
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-  [[ "$cmd" == *"$executable serve"* ]]
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
+  [ "${argv[0]:-}" = "$executable" ] && [ "${argv[1]:-}" = "serve" ]
+}
+
+process_start_ticks() {
+  local pid="$1" payload suffix
+  payload="$(<"/proc/$pid/stat")" 2>/dev/null || return 1
+  suffix="${payload##*) }"
+  set -- $suffix
+  case "${20:-}" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "${20}"
+}
+
+process_threads_signalable() {
+  local pid="$1" task_dir payload suffix state count=0
+  for task_dir in "/proc/$pid"/task/[0-9]*; do
+    [ -d "$task_dir" ] || continue
+    payload="$(<"$task_dir/stat")" 2>/dev/null || return 1
+    suffix="${payload##*) }"
+    state="${suffix%% *}"
+    case "$state" in R|S|I) ;; *) return 1;; esac
+    count=$((count + 1))
+  done
+  [ "$count" -gt 0 ]
+}
+
+managed_claude_signal_token() {
+  local pid="$1" before after
+  before="$(process_start_ticks "$pid")" || return 1
+  managed_claude_pid "$pid" || return 1
+  process_threads_signalable "$pid" || return 1
+  after="$(process_start_ticks "$pid")" || return 1
+  [ "$before" = "$after" ] || return 1
+  printf '%s:%s\n' "$pid" "$before"
 }
 
 verified_bridge_pid() {
@@ -4432,11 +4605,14 @@ bridge_unit_matches_verified_listener() {
 
 claude_pids="$(for port in 8765 8766; do listener_pids "$port"; done | sort -u)"
 bridge_pids="$(listener_pids 9876)"
+claude_tokens=""
 for pid in $claude_pids; do
-  managed_claude_pid "$pid" || {
-    echo "Refusing to stop unverified owner PID $pid on Claude Science port." >&2
+  token="$(managed_claude_signal_token "$pid" || true)"
+  [ -n "$token" ] || {
+    echo "Refusing to stop Claude Science PID $pid: owner/starttime is unverified or a thread is in D/T/Z/unknown state. Bridge and WSL were left unchanged." >&2
     exit 1
   }
+  claude_tokens="${claude_tokens}${token}"$'\n'
 done
 for pid in $bridge_pids; do
   verified_bridge_pid "$pid" || {
@@ -4459,14 +4635,15 @@ case "$bridge_unit_active_state" in
     ;;
 esac
 
-if [ "$bridge_unit_owned" = "1" ]; then
-  systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
-fi
-for pid in $claude_pids; do
-  managed_claude_pid "$pid" && kill "$pid" 2>/dev/null || true
-done
-for pid in $bridge_pids; do
-  verified_bridge_pid "$pid" && kill "$pid" 2>/dev/null || true
+# Stop Claude Science completely before mutating Bridge, so a process that
+# becomes uninterruptible after TERM cannot leave the runtime half-stopped.
+for token in $claude_tokens; do
+  pid="${token%%:*}"
+  [ "$(managed_claude_signal_token "$pid" || true)" = "$token" ] || {
+    echo "Claude Science identity/state changed before TERM; Bridge was left unchanged." >&2
+    exit 1
+  }
+  kill "$pid" 2>/dev/null || true
 done
 grace_deadline=$((SECONDS + 4))
 while [ "$SECONDS" -lt "$grace_deadline" ]; do
@@ -4480,8 +4657,31 @@ while [ "$SECONDS" -lt "$grace_deadline" ]; do
   [ "$remaining" = "0" ] && break
   sleep 0.25
 done
-for pid in $claude_pids; do
-  managed_claude_pid "$pid" && kill -9 "$pid" 2>/dev/null || true
+for token in $claude_tokens; do
+  pid="${token%%:*}"
+  if kill -0 "$pid" 2>/dev/null; then
+    [ "$(managed_claude_signal_token "$pid" || true)" = "$token" ] || {
+      echo "Claude Science became unsafe to signal after TERM; Bridge was left unchanged." >&2
+      exit 1
+    }
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+done
+claude_deadline=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$claude_deadline" ]; do
+  ss -ltn 2>/dev/null | grep -qE ':(8765|8766) ' || break
+  sleep 0.25
+done
+if ss -ltn 2>/dev/null | grep -qE ':(8765|8766) '; then
+  echo "Claude Science did not stop safely; Bridge and WSL were left unchanged." >&2
+  exit 1
+fi
+
+if [ "$bridge_unit_owned" = "1" ]; then
+  systemctl --user stop claude-science-bridge.service >/dev/null 2>&1 || true
+fi
+for pid in $bridge_pids; do
+  verified_bridge_pid "$pid" && kill "$pid" 2>/dev/null || true
 done
 deadline=$((SECONDS + 5))
 while [ "$SECONDS" -lt "$deadline" ]; do
@@ -4499,7 +4699,7 @@ fn stop_services_raw(distro: &str) -> Result<(), String> {
     let output = run_wsl_with_timeout(
         distro,
         &[STOP_SERVICES_SHELL, "-lc", STOP_SERVICES_SCRIPT],
-        Duration::from_secs(22),
+        STOP_SERVICES_TIMEOUT,
     )?;
     if !output.status.success() {
         return Err(format!("停止服务失败：{}", command_error_text(&output)));
@@ -4526,7 +4726,7 @@ fn restart_services_impl() -> Result<SystemStatus, String> {
     let _service_operation = service_operation_lock("restart-services")?;
     let before = current_status();
     if before.restart_blocked {
-        return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应或安装包不完整。现有服务不会被停止。".into());
+        return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应、Claude Science 正处于不可中断 I/O，或安装包不完整。现有服务、WSL 和无关端口不会被停止。".into());
     }
     let distro = before
         .distro
@@ -5609,23 +5809,36 @@ mod tests {
     #[test]
     fn bridge_only_restart_exits_before_claude_runtime_work() {
         let script = include_str!("../../../scripts/start-claude-science-wsl.sh");
+        let unsafe_preflight = script
+            .find("if [ -n \"$preflight_unsafe_pid\" ]; then")
+            .expect("unsafe Claude preflight should be present");
+        let bridge_stage = script
+            .find("csa_stage_bridge_runtime \"$PROJECT_DIR\"")
+            .expect("Bridge staging should be present");
+        let full_activation_stop = script
+            .find(
+                "if [ \"${CSA_BRIDGE_ONLY:-0}\" != \"1\" ]; then\n  stop_existing_claude_for_activation || exit 1",
+            )
+            .expect("full activation should stop Claude before Bridge staging");
         let bridge_only = script
             .find("if [ \"${CSA_BRIDGE_ONLY:-0}\" = \"1\" ]")
             .expect("bridge-only mode should be present");
         let token_refresh = script
             .find("TOKEN_FILE=")
             .expect("token refresh block should be present");
-        let claude_stop = script
-            .find("PREVIOUS_RUNNING_CLAUDE_BIN=\"$(running_claude_binary")
-            .expect("Claude Science stop block should be present");
         let claude_start = script
-            .find("\"$PATCHED_BIN\" serve")
+            .find("launch_claude_daemon \"$PATCHED_BIN\"")
             .expect("Claude Science start command should be present");
 
+        assert!(unsafe_preflight < bridge_stage);
+        assert!(full_activation_stop < bridge_stage);
+        assert!(script[unsafe_preflight..bridge_stage]
+            .contains("runtime pointers, and unrelated ports unchanged"));
         assert!(bridge_only < token_refresh);
-        assert!(bridge_only < claude_stop);
         assert!(bridge_only < claude_start);
         assert!(script[bridge_only..token_refresh].contains("exit 0"));
+        assert!(!script.contains("record_deep_network_quality || true"));
+        assert!(script.contains("if record_deep_network_quality; then\n  CLAUDE_VALIDATED=1"));
     }
 
     #[test]
@@ -5748,7 +5961,7 @@ mod tests {
             sandbox_probe_identity: SANDBOX_NETWORK_PROBE_IDENTITY.into(),
             sandbox_probe_role: "analysis".into(),
             sandbox_probe_transport: "socks5h".into(),
-            sandbox_egress_target: Some("api.github.com".into()),
+            sandbox_egress_target: Some("pypi.org".into()),
             sandbox_egress_canary_identity: Some(SANDBOX_NETWORK_CANARY_IDENTITY.into()),
             ..Default::default()
         };
@@ -5779,7 +5992,10 @@ mod tests {
     fn sandbox_deep_readiness_binds_the_stable_single_probe_result() {
         let mut network = WslProbeNetwork {
             sandbox_contract_stable_during_probe: true,
+            sandbox_unix_socket_state: "connected".into(),
+            sandbox_socks_handshake_state: "ok".into(),
             sandbox_egress_state: "ok".into(),
+            sandbox_egress_failure_stage: "none".into(),
             sandbox_egress_http_status: Some(200),
             sandbox_forwarder_probe_count: 1,
             sandbox_forwarder_passed_count: 1,
@@ -6056,6 +6272,8 @@ mod tests {
     #[test]
     fn stop_services_uses_bash_and_requires_verified_listener_owners() {
         assert_eq!(STOP_SERVICES_SHELL, "bash");
+        assert!(START_SERVICES_TIMEOUT >= Duration::from_secs(120));
+        assert!(STOP_SERVICES_TIMEOUT >= Duration::from_secs(45));
         assert!(STOP_SERVICES_SCRIPT.contains("grep -oE 'pid=[0-9]+'"));
         assert!(STOP_SERVICES_SCRIPT.contains("runtime/lifecycle.lock"));
         assert!(STOP_SERVICES_SCRIPT.contains("flock -w"));
@@ -6071,5 +6289,15 @@ mod tests {
             .contains("if [ \"$bridge_unit_owned\" = \"1\" ]; then\n  systemctl --user stop"));
         assert!(STOP_SERVICES_SCRIPT.contains("manifest.get(\"product\")"));
         assert!(!STOP_SERVICES_SCRIPT.contains("ps -eo pid=,args="));
+        assert!(STOP_SERVICES_SCRIPT.contains("process_threads_signalable \"$pid\""));
+        let claude_term = STOP_SERVICES_SCRIPT
+            .find("kill \"$pid\" 2>/dev/null || true")
+            .expect("Claude TERM should be present");
+        let bridge_stop = STOP_SERVICES_SCRIPT
+            .find("systemctl --user stop claude-science-bridge.service")
+            .expect("owned Bridge stop should be present");
+        assert!(claude_term < bridge_stop);
+        assert!(!STOP_SERVICES_SCRIPT.contains("wsl --shutdown"));
+        assert!(!STOP_SERVICES_SCRIPT.contains("wsl --terminate"));
     }
 }

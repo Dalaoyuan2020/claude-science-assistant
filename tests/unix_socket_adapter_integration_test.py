@@ -48,24 +48,27 @@ def main() -> int:
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 server.bind(str(unix_path))
-                server.listen(1)
+                server.listen(2)
                 ready.set()
-                connection, _address = server.accept()
-                with connection:
-                    greeting = receive_exact(connection, 3)
-                    if greeting != b"\x05\x01\x00":
-                        raise RuntimeError(f"unexpected SOCKS greeting: {greeting!r}")
-                    connection.sendall(b"\x05\x00")
-                    header = receive_exact(connection, 5)
-                    if header[:4] != b"\x05\x01\x00\x03":
-                        raise RuntimeError(f"unexpected SOCKS request: {header!r}")
-                    host = receive_exact(connection, header[4]).decode("ascii")
-                    port = int.from_bytes(receive_exact(connection, 2), "big")
-                    observed.update(host=host, port=port)
-                    connection.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
-                    if receive_exact(connection, 4) != b"PING":
-                        raise RuntimeError("relay request payload was corrupted")
-                    connection.sendall(b"PONG")
+                for connection_index in range(2):
+                    connection, _address = server.accept()
+                    with connection:
+                        greeting = receive_exact(connection, 3)
+                        if greeting != b"\x05\x01\x00":
+                            raise RuntimeError(f"unexpected SOCKS greeting: {greeting!r}")
+                        connection.sendall(b"\x05\x00")
+                        if connection_index == 0:
+                            continue
+                        header = receive_exact(connection, 5)
+                        if header[:4] != b"\x05\x01\x00\x03":
+                            raise RuntimeError(f"unexpected SOCKS request: {header!r}")
+                        host = receive_exact(connection, header[4]).decode("ascii")
+                        port = int.from_bytes(receive_exact(connection, 2), "big")
+                        observed.update(host=host, port=port)
+                        connection.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                        if receive_exact(connection, 4) != b"PING":
+                            raise RuntimeError("relay request payload was corrupted")
+                        connection.sendall(b"PONG")
             except BaseException as error:  # surfaced in the main thread below
                 errors.append(error)
                 ready.set()
@@ -79,12 +82,20 @@ def main() -> int:
         if errors:
             raise errors[0]
 
+        unix_state, handshake_state, handshake_error = network_quality.probe_socks_handshake(
+            str(unix_path)
+        )
+        if (unix_state, handshake_state, handshake_error) != ("connected", "ok", None):
+            raise RuntimeError(
+                f"direct Unix SOCKS handshake failed: {unix_state}/{handshake_state}/{handshake_error}"
+            )
+
         with network_quality.UnixSocketTcpAdapter(str(unix_path)) as adapter:
             with socket.create_connection(("127.0.0.1", adapter.port), timeout=3) as client:
                 client.sendall(b"\x05\x01\x00")
                 if receive_exact(client, 2) != b"\x05\x00":
                     raise RuntimeError("adapter did not relay the SOCKS greeting")
-                host = b"api.github.com"
+                host = b"pypi.org"
                 client.sendall(
                     b"\x05\x01\x00\x03"
                     + bytes((len(host),))
@@ -101,7 +112,7 @@ def main() -> int:
             raise RuntimeError("Unix SOCKS fixture did not stop")
         if errors:
             raise errors[0]
-        if observed != {"host": "api.github.com", "port": 443}:
+        if observed != {"host": "pypi.org", "port": 443}:
             raise RuntimeError(f"SOCKS hostname/port changed in transit: {observed!r}")
 
     print("Unix socket adapter integration test passed")

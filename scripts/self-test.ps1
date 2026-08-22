@@ -113,9 +113,19 @@ if (-not $StartScriptText.Contains('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')) {
   throw "Provider switching must support a Bridge-only restart mode."
 }
 $BridgeOnlyPosition = $StartScriptText.IndexOf('if [ "${CSA_BRIDGE_ONLY:-0}" = "1" ]')
-$ClaudeStopPosition = $StartScriptText.IndexOf('PREVIOUS_RUNNING_CLAUDE_BIN="$(running_claude_binary')
-if ($ClaudeStopPosition -lt 0 -or $BridgeOnlyPosition -gt $ClaudeStopPosition) {
-  throw "Bridge-only restart must exit before Claude Science processes are stopped."
+$FullActivationGuardPosition = $StartScriptText.IndexOf('if [ "${CSA_BRIDGE_ONLY:-0}" != "1" ]; then')
+$ClaudeStopPosition = $StartScriptText.IndexOf('stop_existing_claude_for_activation || exit 1')
+$BridgeStagePosition = $StartScriptText.IndexOf('csa_stage_bridge_runtime "$PROJECT_DIR"')
+if (
+  $FullActivationGuardPosition -lt 0 -or
+  $ClaudeStopPosition -lt $FullActivationGuardPosition -or
+  $BridgeStagePosition -lt $ClaudeStopPosition
+) {
+  throw "Full activation must stop Claude Science before Bridge staging, while Bridge-only mode skips that stop."
+}
+$BridgeOnlyTail = $StartScriptText.Substring($BridgeOnlyPosition, [Math]::Min(400, $StartScriptText.Length - $BridgeOnlyPosition))
+if (-not $BridgeOnlyTail.Contains('START_COMPLETED=1') -or -not $BridgeOnlyTail.Contains('exit 0')) {
+  throw "Bridge-only restart must exit before Claude Science runtime staging."
 }
 Write-Host "Claude Science 0.1.25 runtime lock checks passed"
 

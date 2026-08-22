@@ -37,11 +37,12 @@ PROXY_VARIABLES = (
     "ALL_PROXY",
     "all_proxy",
 )
+NETWORK_REPORT_SCHEMA_VERSION = 3
 HEALTHY_PROXY_STATES = {"direct", "reachable"}
-DEFAULT_CANARY_URL = "https://api.github.com/zen"
+DEFAULT_CANARY_URL = "https://pypi.org/simple/pip/"
 DEFAULT_CACHE_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_EXPECTED_SANDBOX_FORWARDERS = 3
-SANDBOX_PROBE_IDENTITY = "analysis-socks5h-github-zen-v1"
+SANDBOX_PROBE_IDENTITY = "analysis-socks5h-pypi-head-v2"
 # The three built-in role forwarders are spawned together during daemon start.
 # A later replacement can make PID ordering assign the wrong allowlist to a
 # role, so fail closed when their start times are no longer one startup burst.
@@ -114,6 +115,50 @@ class SandboxForwarder:
             and bool(self.http_socket_inode)
             and bool(self.socks_socket_inode)
         )
+
+
+@dataclass(frozen=True)
+class ProcessRuntimeSnapshot:
+    state: str
+    wait_channel: str
+    io_blocked: bool
+    mount_io_blocked: bool
+
+
+def process_runtime_snapshot(pid: int) -> ProcessRuntimeSnapshot:
+    """Read a redacted Linux scheduler snapshot for the daemon main thread."""
+    state = "unknown"
+    wait_channel = "unknown"
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        suffix = payload[payload.rfind(")") + 2 :].split()
+        if suffix and re.fullmatch(r"[A-Z]", suffix[0]):
+            state = suffix[0]
+    except OSError:
+        pass
+    try:
+        candidate = Path(f"/proc/{pid}/wchan").read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", candidate):
+            wait_channel = candidate
+    except OSError:
+        pass
+
+    io_blocked = state == "D"
+    normalized_wait = wait_channel.casefold()
+    mount_io_blocked = io_blocked and any(
+        marker in normalized_wait
+        for marker in ("p9_", "v9fs", "fuse", "virtiofs", "virtio_fs")
+    )
+    return ProcessRuntimeSnapshot(
+        state=state,
+        wait_channel=wait_channel,
+        io_blocked=io_blocked,
+        mount_io_blocked=mount_io_blocked,
+    )
 
 
 def parse_proxy_endpoint(value: str) -> Optional[ProxyEndpoint]:
@@ -555,6 +600,49 @@ class UnixSocketTcpAdapter:
             self.thread.join(timeout=1)
 
 
+def probe_socks_handshake(
+    unix_socket_path: str, timeout: float = 2.0
+) -> tuple[str, str, Optional[str]]:
+    """Verify that the owned Unix socket reaches a live SOCKS5 server."""
+    if not hasattr(socket, "AF_UNIX"):
+        return "unavailable", "not_checked", "AfUnixUnavailable"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    connected = False
+    try:
+        client.connect(unix_socket_path)
+        connected = True
+        client.sendall(b"\x05\x01\x00")
+        response = b""
+        while len(response) < 2:
+            chunk = client.recv(2 - len(response))
+            if not chunk:
+                break
+            response += chunk
+        if response == b"\x05\x00":
+            return "connected", "ok", None
+        if len(response) == 2 and response[:1] == b"\x05":
+            return "connected", "rejected", None
+        return "connected", "invalid_reply", None
+    except socket.timeout:
+        return (
+            "connected" if connected else "timeout",
+            "timeout" if connected else "not_checked",
+            "TimeoutError",
+        )
+    except OSError as error:
+        return (
+            "connected" if connected else "error",
+            "error" if connected else "not_checked",
+            type(error).__name__,
+        )
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
 def canary_target(
     url: str,
 ) -> tuple[Optional[str], bool, Optional[str], Optional[str]]:
@@ -635,7 +723,11 @@ def probe_sandbox_egress(
         "sandbox_probe_identity": SANDBOX_PROBE_IDENTITY,
         "sandbox_probe_role": "analysis",
         "sandbox_probe_transport": "socks5h",
+        "sandbox_unix_socket_state": "not_checked",
+        "sandbox_socks_handshake_state": "not_checked",
+        "sandbox_socks_handshake_error": None,
         "sandbox_egress_state": "not_checked",
+        "sandbox_egress_failure_stage": "not_checked",
         "sandbox_egress_target": target,
         "sandbox_egress_canary_identity": canary_identity,
         "sandbox_egress_canary_fingerprint": canary_fingerprint,
@@ -644,21 +736,48 @@ def probe_sandbox_egress(
         "sandbox_forwarder_probe_count": 0,
         "sandbox_forwarder_passed_count": 0,
         "sandbox_forwarder_failed_count": 0,
+        "sandbox_egress_curl_exit_code": None,
     }
     if not deep:
         return result
     if not valid_target or url != DEFAULT_CANARY_URL:
         result["sandbox_egress_state"] = "invalid_target"
+        result["sandbox_egress_failure_stage"] = "target"
         return result
     analysis = next((item for item in forwarders if item.role == "analysis"), None)
     if analysis is None or not analysis.complete or analysis.socks_port is None:
         result["sandbox_egress_state"] = (
             "topology_incomplete" if topology_state == "incomplete" else "unavailable"
         )
+        result["sandbox_egress_failure_stage"] = "topology"
+        return result
+    unix_socket_state, handshake_state, handshake_error = probe_socks_handshake(
+        analysis.socks_socket_path
+    )
+    result["sandbox_unix_socket_state"] = unix_socket_state
+    result["sandbox_socks_handshake_state"] = handshake_state
+    result["sandbox_socks_handshake_error"] = handshake_error
+    handshake_identity_valid = socket_identity_matches(
+        analysis.socks_socket_path,
+        analysis.socks_socket_device,
+        analysis.socks_socket_inode,
+    )
+    if unix_socket_state != "connected" or not handshake_identity_valid:
+        result["sandbox_egress_state"] = "unix_socket_failed"
+        result["sandbox_egress_failure_stage"] = "unix_socket"
+        result["sandbox_forwarder_probe_count"] = 1
+        result["sandbox_forwarder_failed_count"] = 1
+        return result
+    if handshake_state != "ok":
+        result["sandbox_egress_state"] = "socks_handshake_failed"
+        result["sandbox_egress_failure_stage"] = "socks_handshake"
+        result["sandbox_forwarder_probe_count"] = 1
+        result["sandbox_forwarder_failed_count"] = 1
         return result
     curl = shutil.which("curl")
     if not curl:
         result["sandbox_egress_state"] = "unavailable"
+        result["sandbox_egress_failure_stage"] = "https_request"
         return result
 
     clean_environment = dict(os.environ)
@@ -690,6 +809,7 @@ def probe_sandbox_egress(
                 "0",
                 "--user-agent",
                 "CSA-Network-Quality/1",
+                "--head",
                 url,
             ]
             completed = subprocess.run(
@@ -706,6 +826,7 @@ def probe_sandbox_egress(
                 status = int(completed.stdout.strip() or "0")
             except ValueError:
                 status = 0
+            result["sandbox_egress_curl_exit_code"] = completed.returncode
             process_passed = completed.returncode == 0 and 200 <= status < 300
         adapter_error = adapter.error
     except (OSError, subprocess.TimeoutExpired):
@@ -732,16 +853,22 @@ def probe_sandbox_egress(
 
     if topology_state not in {"expected", "extended"}:
         result["sandbox_egress_state"] = f"topology_{topology_state}"
+        result["sandbox_egress_failure_stage"] = "topology"
     elif passed:
         result["sandbox_egress_state"] = "ok"
+        result["sandbox_egress_failure_stage"] = "none"
     elif unique_statuses == [502]:
         result["sandbox_egress_state"] = "http_502"
+        result["sandbox_egress_failure_stage"] = "https_request"
     elif unique_statuses == [403]:
         result["sandbox_egress_state"] = "http_403"
+        result["sandbox_egress_failure_stage"] = "https_request"
     elif len(unique_statuses) > 1:
         result["sandbox_egress_state"] = "mixed_http_failure"
+        result["sandbox_egress_failure_stage"] = "https_request"
     else:
         result["sandbox_egress_state"] = "failed"
+        result["sandbox_egress_failure_stage"] = "https_request"
     if len(unique_statuses) == 1:
         result["sandbox_egress_http_status"] = unique_statuses[0]
     return result
@@ -753,11 +880,13 @@ def build_report(
     canary_url: str,
     expected_forwarders: int = DEFAULT_EXPECTED_SANDBOX_FORWARDERS,
 ) -> dict:
+    runtime_before = ProcessRuntimeSnapshot("unknown", "unknown", False, False)
     if pid is None:
         proxy_report = inspect_proxy_environment(os.environ)
         forwarders = []
         start_ticks = None
     else:
+        runtime_before = process_runtime_snapshot(pid)
         environment, process_state = process_environment(pid)
         if environment is None:
             proxy_report = {
@@ -779,6 +908,55 @@ def build_report(
     egress_report = probe_sandbox_egress(
         forwarders, canary_url, deep, expected_forwarders
     )
+    runtime_after = (
+        process_runtime_snapshot(pid)
+        if pid is not None
+        else ProcessRuntimeSnapshot("unknown", "unknown", False, False)
+    )
+    blocked_snapshot = next(
+        (
+            snapshot
+            for snapshot in (runtime_before, runtime_after)
+            if snapshot.mount_io_blocked
+        ),
+        next(
+            (
+                snapshot
+                for snapshot in (runtime_before, runtime_after)
+                if snapshot.io_blocked
+            ),
+            runtime_after,
+        ),
+    )
+    egress_report.update(
+        {
+            "sandbox_probe_daemon_state": blocked_snapshot.state,
+            "sandbox_probe_daemon_wait_channel": blocked_snapshot.wait_channel,
+            "sandbox_probe_daemon_io_blocked": (
+                runtime_before.io_blocked or runtime_after.io_blocked
+            ),
+            "sandbox_probe_daemon_mount_io_blocked": (
+                runtime_before.mount_io_blocked or runtime_after.mount_io_blocked
+            ),
+        }
+    )
+    # A successful HTTP response does not make the daemon ready when either
+    # runtime snapshot caught its event loop in uninterruptible I/O.  This is
+    # especially important for the startup streak: two nominal HTTP results
+    # must also be two stable daemon observations, otherwise a green cache can
+    # hide an intermittent DrvFS/9P stall.
+    if (
+        deep
+        and egress_report.get("sandbox_egress_failure_stage")
+        in {"none", "unix_socket", "socks_handshake", "https_request"}
+        and egress_report["sandbox_probe_daemon_io_blocked"]
+    ):
+        egress_report["sandbox_egress_state"] = (
+            "daemon_mount_io_busy"
+            if egress_report["sandbox_probe_daemon_mount_io_blocked"]
+            else "daemon_busy"
+        )
+        egress_report["sandbox_egress_failure_stage"] = "daemon_event_loop"
     contract_stable_during_probe = None
     if deep:
         contract_stable_during_probe = False
@@ -792,14 +970,19 @@ def build_report(
             )
         if not contract_stable_during_probe:
             egress_report["sandbox_egress_state"] = "contract_changed"
+            egress_report["sandbox_egress_failure_stage"] = "contract"
     egress_report["sandbox_contract_stable_during_probe"] = (
         contract_stable_during_probe
     )
 
     return {
-        "schema_version": 2,
+        "schema_version": NETWORK_REPORT_SCHEMA_VERSION,
         "claude_pid": pid,
         "claude_start_ticks": start_ticks,
+        "claude_process_state": runtime_after.state,
+        "claude_wait_channel": runtime_after.wait_channel,
+        "claude_io_blocked": runtime_after.io_blocked,
+        "claude_mount_io_blocked": runtime_after.mount_io_blocked,
         **proxy_report,
         **egress_report,
         "deep_checked_at_unix": int(time.time()) if deep else None,
@@ -808,6 +991,15 @@ def build_report(
 
 
 def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> dict:
+    report = dict(report)
+    if report.get("claude_pid") is not None and (
+        report.get("claude_io_blocked") is True
+        or report.get("claude_process_state") in {None, "", "unknown", "D", "T", "t", "Z"}
+    ):
+        # A cached green result must never mask a daemon which cannot currently
+        # service its own proxy listeners or whose live scheduler state cannot
+        # be established.
+        return report
     try:
         cached = json.loads(cache_file.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
@@ -849,6 +1041,7 @@ def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> d
         "deep_checked",
         "deep_checked_at_unix",
         "sandbox_egress_state",
+        "sandbox_egress_failure_stage",
         "sandbox_egress_target",
         "sandbox_egress_canary_identity",
         "sandbox_egress_canary_fingerprint",
@@ -858,6 +1051,14 @@ def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> d
         "sandbox_forwarder_probe_count",
         "sandbox_forwarder_passed_count",
         "sandbox_forwarder_failed_count",
+        "sandbox_unix_socket_state",
+        "sandbox_socks_handshake_state",
+        "sandbox_socks_handshake_error",
+        "sandbox_egress_curl_exit_code",
+        "sandbox_probe_daemon_state",
+        "sandbox_probe_daemon_wait_channel",
+        "sandbox_probe_daemon_io_blocked",
+        "sandbox_probe_daemon_mount_io_blocked",
     ):
         report[name] = cached.get(name)
     return report

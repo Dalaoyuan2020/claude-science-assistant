@@ -28,6 +28,13 @@ interface NetworkQualityStatus {
   sandboxSocksForwarderCount: number;
   sandboxProbeRole: string;
   sandboxProbeTransport: string;
+  daemonProcessState: string;
+  daemonWaitChannel: string;
+  daemonIoBlocked: boolean;
+  daemonMountIoBlocked: boolean;
+  sandboxUnixSocketState: string;
+  sandboxSocksHandshakeState: string;
+  sandboxEgressFailureStage: string;
   deepChecked: boolean;
   deepCheckedAtUnix?: number;
   sandboxEgressState: string;
@@ -225,6 +232,13 @@ const initialStatus: SystemStatus = {
     sandboxSocksForwarderCount: 0,
     sandboxProbeRole: "analysis",
     sandboxProbeTransport: "socks5h",
+    daemonProcessState: "unknown",
+    daemonWaitChannel: "unknown",
+    daemonIoBlocked: false,
+    daemonMountIoBlocked: false,
+    sandboxUnixSocketState: "not_checked",
+    sandboxSocksHandshakeState: "not_checked",
+    sandboxEgressFailureStage: "not_checked",
     deepChecked: false,
     sandboxEgressState: "not_checked",
   },
@@ -265,6 +279,13 @@ const browserPreviewStatus: SystemStatus = {
     sandboxSocksForwarderCount: 0,
     sandboxProbeRole: "analysis",
     sandboxProbeTransport: "socks5h",
+    daemonProcessState: "unknown",
+    daemonWaitChannel: "unknown",
+    daemonIoBlocked: false,
+    daemonMountIoBlocked: false,
+    sandboxUnixSocketState: "not_checked",
+    sandboxSocksHandshakeState: "not_checked",
+    sandboxEgressFailureStage: "not_checked",
     deepChecked: false,
     sandboxEgressState: "not_checked",
   },
@@ -633,8 +654,11 @@ function App() {
           network: {
             ...browserPreviewStatus.network,
             deepChecked: true,
+            sandboxUnixSocketState: "connected",
+            sandboxSocksHandshakeState: "ok",
             sandboxEgressState: "ok",
-            sandboxEgressTarget: "api.github.com",
+            sandboxEgressFailureStage: "none",
+            sandboxEgressTarget: "pypi.org",
             sandboxEgressHttpStatus: 200,
           },
         });
@@ -1065,6 +1089,14 @@ function App() {
       return;
     }
     if (status.restartBlocked) {
+      if (status.network.daemonMountIoBlocked) {
+        setError(`Claude Science 当前阻塞在 WSL 挂载盘 I/O（${status.network.daemonWaitChannel || "mount I/O"}）。端口虽在监听，但进程暂时无法安全停止；请等待 MCP 预热/I/O 返回后刷新。启动器不会关闭整个 WSL，也不会影响 2222 等无关服务。`);
+        return;
+      }
+      if (status.network.daemonIoBlocked) {
+        setError(`Claude Science 当前处于不可中断 I/O（${status.network.daemonProcessState || "D"} / ${status.network.daemonWaitChannel || "unknown"}）。启动器将保留 Claude Science、Bridge、WSL 和无关端口，待进程恢复后再允许修复。`);
+        return;
+      }
       const location = status.wslStoragePath || "当前 WSL 虚拟磁盘";
       setError(`当前不适合自动启动或重启（${location}）。请先根据诊断信息检查磁盘空间、WSL 状态或重新解压完整安装包；启动器不会冒险修改环境。`);
       return;
@@ -1170,8 +1202,10 @@ function App() {
   };
   const deepEgressLabel = status.network.deepChecked
     ? status.network.sandboxEgressState === "ok"
-      ? ` · 实链路通过${status.network.sandboxEgressHttpStatus ? ` HTTP ${status.network.sandboxEgressHttpStatus}` : ""}`
-      : ` · 实链路失败（${status.network.sandboxEgressState}）`
+      ? ` · SOCKS 握手与实链路通过${status.network.sandboxEgressHttpStatus ? ` HTTP ${status.network.sandboxEgressHttpStatus}` : ""}`
+      : status.network.daemonIoBlocked || ["daemon_mount_io_busy", "daemon_busy"].includes(status.network.sandboxEgressState)
+        ? ` · 守护进程忙（${status.network.daemonWaitChannel || "I/O 等待"}）`
+        : ` · ${status.network.sandboxEgressFailureStage} 阶段失败（${status.network.sandboxEgressState}）`
     : " · 可深度检测";
   const networkDetail = status.claudeRunning
     ? `${proxyStateLabel[status.network.proxyState] || status.network.proxyState} · ${status.network.sandboxForwarderCount}/${status.network.sandboxForwarderExpectedCount} 组 HTTP/SOCKS 沙盒出口（${status.network.sandboxForwarderTopologyState}） · ${status.network.sandboxProbeRole}/${status.network.sandboxProbeTransport.toUpperCase()} 探针${deepEgressLabel}`

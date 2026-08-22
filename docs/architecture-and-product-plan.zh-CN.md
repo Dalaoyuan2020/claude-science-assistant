@@ -376,13 +376,16 @@ https://10521052.xyz/v1，自定义中转由用户自行填写。中转入口不
 
 ## 10. v0.1.5 网络质检维护修订
 
-v0.1.5 的维护修订不再把“端口正在监听”直接等同于“系统可用”。启动器只有在以下条件同时满足时才显示运行正常：
+v0.1.5 的维护修订不再把“端口正在监听”直接等同于“系统可用”。网络质检按失败位置逐级收窄，顺序固定为：**端口与受管进程身份 → `analysis/socks.sock` Unix socket → SOCKS5 握手 → 经 SOCKS5H 发往 PyPI 的 HTTPS HEAD**。启动器只有在以下条件同时满足时才显示运行正常：
 
 1. `9876` 的监听进程、Bridge `/health` 身份和当前受管运行时一致。
 2. `8765`、`8766` 由同一个 CSA 受管 Claude Science 可执行文件监听。
 3. Claude Science 实际继承的代理环境为直连或代理端点可达，且不存在大小写代理变量冲突。
-4. 三个内置角色的沙盒 HTTP/SOCKS 转发器均成对完整，并且最近 15 分钟内经 `analysis` 角色真实 `socks.sock` Unix socket 与 SOCKS5H 路由执行的固定、匿名、非计费 HTTPS API 出口探针（GitHub Zen）成功；Operon 与 BYOC 使用不同白名单，不以同一 URL 误测。socket 路径、inode、设备号及子进程启动身份均绑定缓存，旧 HTTP/arXiv 结果不会复用。
+4. 三个内置角色的沙盒 HTTP/SOCKS 转发器均成对完整，并且经 `analysis` 角色真实 `socks.sock` Unix socket 与 SOCKS5H 路由执行固定、匿名、非计费的 `HEAD https://pypi.org/simple/pip/` 出口探针连续两次成功；探针身份固定为 `analysis-socks5h-pypi-head-v2`。第一次成功只写 PID 专属 pending cache，只有 PID、启动时间和转发器指纹均相同的第二次相邻成功才原子发布绿色缓存。Operon 与 BYOC 使用不同白名单，不以同一 URL 误测。socket 路径、inode、设备号、子进程启动身份和报告 schema 均绑定缓存，旧 GitHub/arXiv 或旧 schema 结果不会复用。
+5. Claude Science 在探针前后均没有进入不可中断 I/O（Linux 进程状态 `D`）。报告分别保留 daemon state、wait channel、普通 I/O blocked 和挂载 I/O blocked，以及 Unix、SOCKS、HTTPS、contract 各阶段状态，避免把事件循环卡住误报成公网 API 故障或缓存绿灯。
 
-启动或修复发现失联、冲突或无效代理变量时，只从新建 Claude Science 子进程的环境中移除这些变量；不修改 Windows/WSL 系统代理、VPN、DNS、hosts、证书或网络工具。服务切换由 WSL 生命周期锁串行化，运行时使用内容寻址目录、原子指针和失败回滚；停止逻辑只向已经通过端口、可执行路径和运行时身份联合验证的 PID 发送信号。
+Linux `D` 状态且 wait channel 为 `p9_client_rpc`（或同类挂载等待）表示 Claude Science 正在等待 WSL 的 DrvFS/9P 挂载 I/O；它是 daemon/WSL 文件系统路径问题，不等于 PyPI、OpenAlex 或 arXiv 的公网出口不可达。为减少这类等待，启动器从 ext4 上的受管运行时目录启动 Claude Science，并只在内容寻址的托管二进制副本中跳过启动阶段对 24 个 MCP 的 eager warmup；按需使用 connector/MCP 的能力仍保留，官方源二进制不被覆盖。
+
+启动或修复发现失联、冲突或无效代理变量时，只从新建 Claude Science 子进程的环境中移除这些变量；不修改 Windows/WSL 系统代理、VPN、DNS、hosts、证书或网络工具。服务切换由 WSL 生命周期锁串行化，运行时使用内容寻址目录、原子指针和失败回滚；停止逻辑只向已经通过端口、可执行路径、启动时间和运行时身份联合验证，且处于可安全发信号状态的 PID 发送信号。自检和修复绝不自动执行全局 `wsl --shutdown` 或 `wsl --terminate`，以免中断同一 WSL 环境中的 SSH 等无关服务；检测到 `D` 状态时保留现场并提示稍后刷新。
 
 该维护修订继续使用 `0.1.5` 产品版本，通过包限定名区分发行物。由于健康身份同时依赖 EXE、`proxy.py`、脚本、Skill 和测试，升级必须替换完整便携包，不能只复制启动器 EXE。

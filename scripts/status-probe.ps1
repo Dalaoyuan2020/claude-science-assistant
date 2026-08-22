@@ -299,6 +299,16 @@ $sandboxTopologyState = [string](Get-OptionalProperty $networkProbe "sandbox_for
 $sandboxProbeIdentity = [string](Get-OptionalProperty $networkProbe "sandbox_probe_identity" "")
 $sandboxProbeRole = [string](Get-OptionalProperty $networkProbe "sandbox_probe_role" "")
 $sandboxProbeTransport = [string](Get-OptionalProperty $networkProbe "sandbox_probe_transport" "")
+$claudeProcessState = [string](Get-OptionalProperty $networkProbe "claude_process_state" "unknown")
+$claudeWaitChannel = [string](Get-OptionalProperty $networkProbe "claude_wait_channel" "unknown")
+$claudeIoBlocked = [bool](Get-OptionalProperty $networkProbe "claude_io_blocked" $false)
+$claudeMountIoBlocked = [bool](Get-OptionalProperty $networkProbe "claude_mount_io_blocked" $false)
+$sandboxUnixSocketState = [string](Get-OptionalProperty $networkProbe "sandbox_unix_socket_state" "not_checked")
+$sandboxSocksHandshakeState = [string](Get-OptionalProperty $networkProbe "sandbox_socks_handshake_state" "not_checked")
+$sandboxEgressFailureStage = [string](Get-OptionalProperty $networkProbe "sandbox_egress_failure_stage" "not_checked")
+$sandboxProbeDaemonWaitChannel = [string](Get-OptionalProperty $networkProbe "sandbox_probe_daemon_wait_channel" "unknown")
+$sandboxProbeDaemonIoBlocked = [bool](Get-OptionalProperty $networkProbe "sandbox_probe_daemon_io_blocked" $false)
+$sandboxProbeDaemonMountIoBlocked = [bool](Get-OptionalProperty $networkProbe "sandbox_probe_daemon_mount_io_blocked" $false)
 $sandboxEgressTarget = [string](Get-OptionalProperty $networkProbe "sandbox_egress_target" "")
 $sandboxCanaryIdentity = [string](Get-OptionalProperty $networkProbe "sandbox_egress_canary_identity" "")
 $sandboxDeepChecked = [bool](Get-OptionalProperty $networkProbe "deep_checked" $false)
@@ -309,11 +319,11 @@ $sandboxProbePassedCount = [int](Get-OptionalProperty $networkProbe "sandbox_for
 $sandboxProbeFailedCount = [int](Get-OptionalProperty $networkProbe "sandbox_forwarder_failed_count" 0)
 $sandboxEgressHttpStatus = [int](Get-OptionalProperty $networkProbe "sandbox_egress_http_status" 0)
 $sandboxProbeContractReady = [bool](
-  $sandboxProbeIdentity -eq "analysis-socks5h-github-zen-v1" -and
+  $sandboxProbeIdentity -eq "analysis-socks5h-pypi-head-v2" -and
   $sandboxProbeRole -eq "analysis" -and
   $sandboxProbeTransport -eq "socks5h" -and
-  $sandboxEgressTarget -eq "api.github.com" -and
-  $sandboxCanaryIdentity -eq "https://api.github.com/zen"
+  $sandboxEgressTarget -eq "pypi.org" -and
+  $sandboxCanaryIdentity -eq "https://pypi.org/simple/pip/"
 )
 $sandboxForwardersReady = [bool](
   $wslProbe -and
@@ -328,14 +338,23 @@ $deepEgressReady = [bool](
   $wslProbe -and
   $sandboxDeepChecked -and
   $sandboxContractStable -and
+  $sandboxUnixSocketState -eq "connected" -and
+  $sandboxSocksHandshakeState -eq "ok" -and
   $sandboxEgressState -eq "ok" -and
+  $sandboxEgressFailureStage -eq "none" -and
   $sandboxProbeCount -eq 1 -and
   $sandboxProbePassedCount -eq 1 -and
   $sandboxProbeFailedCount -eq 0 -and
   $sandboxEgressHttpStatus -ge 200 -and
   $sandboxEgressHttpStatus -lt 300
 )
-$networkReady = [bool]($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and $deepEgressReady)
+$networkReady = [bool](
+  $claudeDetected -and
+  -not $claudeIoBlocked -and
+  $proxyContractReady -and
+  $sandboxForwardersReady -and
+  $deepEgressReady
+)
 
 if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid", "unknown")) {
   $endpoints = @($wslProbe.network.proxy_endpoints) -join ", "
@@ -349,7 +368,19 @@ if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -
   $warnings.Add("Sandbox egress has not passed a fresh end-to-end canary. Re-run with -DeepNetworkProbe.")
 }
 if ($wslProbe -and $sandboxDeepChecked -and -not $deepEgressReady) {
-  $warnings.Add("Sandbox egress canary failed: $sandboxEgressState. No billable model request was made.")
+  if ($sandboxProbeDaemonMountIoBlocked -or $sandboxEgressState -eq "daemon_mount_io_busy") {
+    $waitChannel = if ($sandboxProbeDaemonWaitChannel -and $sandboxProbeDaemonWaitChannel -ne "unknown") { $sandboxProbeDaemonWaitChannel } else { "WSL mount I/O" }
+    $warnings.Add("Claude Science owns its ports, but the daemon event loop was blocked in $waitChannel during the end-to-end probe. The result was withheld and this is not evidence of an external API outage; wait for I/O to return or move high-I/O workspaces to WSL ext4.")
+  } elseif ($sandboxProbeDaemonIoBlocked -or $sandboxEgressState -eq "daemon_busy") {
+    $warnings.Add("Claude Science entered uninterruptible I/O during the protocol probe ($sandboxProbeDaemonWaitChannel). External API readiness is not established; the daemon was kept running and no billable model request was made.")
+  } else {
+    $warnings.Add("Sandbox egress canary failed at $sandboxEgressFailureStage`: $sandboxEgressState. No billable model request was made.")
+  }
+}
+if ($claudeDetected -and $claudeMountIoBlocked) {
+  $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel; do not force a partial restart until the WSL mount I/O returns.")
+} elseif ($claudeDetected -and $claudeIoBlocked) {
+  $warnings.Add("Claude Science is currently in uninterruptible I/O ($claudeProcessState at $claudeWaitChannel); CSA will not report network ready or attempt a partial restart until it becomes safely stoppable.")
 }
 
 $overall = "not_ready"
