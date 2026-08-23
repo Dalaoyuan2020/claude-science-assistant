@@ -425,7 +425,7 @@ struct WslProbeNetwork {
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
     #[serde(default)]
-    sandbox_contract_stable_during_probe: bool,
+    sandbox_contract_stable_during_probe: Option<bool>,
     #[serde(default)]
     sandbox_egress_state: String,
     sandbox_egress_target: Option<String>,
@@ -457,7 +457,7 @@ fn sandbox_forwarder_topology_is_ready(network: &WslProbeNetwork) -> bool {
 }
 
 fn sandbox_deep_egress_is_ready(network: &WslProbeNetwork) -> bool {
-    network.sandbox_contract_stable_during_probe
+    network.sandbox_contract_stable_during_probe == Some(true)
         && network.sandbox_unix_socket_state == "connected"
         && network.sandbox_socks_handshake_state == "ok"
         && network.sandbox_egress_state == "ok"
@@ -5991,7 +5991,7 @@ mod tests {
     #[test]
     fn sandbox_deep_readiness_binds_the_stable_single_probe_result() {
         let mut network = WslProbeNetwork {
-            sandbox_contract_stable_during_probe: true,
+            sandbox_contract_stable_during_probe: Some(true),
             sandbox_unix_socket_state: "connected".into(),
             sandbox_socks_handshake_state: "ok".into(),
             sandbox_egress_state: "ok".into(),
@@ -6004,14 +6004,32 @@ mod tests {
         };
         assert!(sandbox_deep_egress_is_ready(&network));
 
-        network.sandbox_contract_stable_during_probe = false;
+        network.sandbox_contract_stable_during_probe = Some(false);
         assert!(!sandbox_deep_egress_is_ready(&network));
-        network.sandbox_contract_stable_during_probe = true;
+        network.sandbox_contract_stable_during_probe = Some(true);
         network.sandbox_forwarder_failed_count = 1;
         assert!(!sandbox_deep_egress_is_ready(&network));
         network.sandbox_forwarder_failed_count = 0;
         network.sandbox_egress_http_status = Some(302);
         assert!(!sandbox_deep_egress_is_ready(&network));
+    }
+
+    #[test]
+    fn shallow_wsl_probe_accepts_null_contract_stability() {
+        let report: WslProbeReport = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "network": {
+                "deep_checked": false,
+                "sandbox_contract_stable_during_probe": null
+            }
+        }))
+        .expect("a shallow probe may report unknown contract stability as null");
+
+        assert!(report
+            .network
+            .sandbox_contract_stable_during_probe
+            .is_none());
+        assert!(!sandbox_deep_egress_is_ready(&report.network));
     }
 
     #[test]

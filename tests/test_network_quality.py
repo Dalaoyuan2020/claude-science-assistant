@@ -141,6 +141,8 @@ def test_process_contract_requires_a_sandbox_forwarder(monkeypatch):
     assert report["sandbox_forwarder_count"] == 0
     assert report["sandbox_forwarder_expected_count"] == 3
     assert report["sandbox_forwarder_topology_state"] == "incomplete"
+    assert report["deep_checked"] is False
+    assert report["sandbox_contract_stable_during_probe"] is None
 
 
 def test_process_start_ticks_are_available_for_the_current_process():
