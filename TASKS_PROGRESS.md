@@ -202,3 +202,25 @@ FAIL egress 0ms work.bridge_egress.not_implemented
 PASS grade 4008ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5491 exit=0
 ```
+
+## S4 完成
+
+做了什么：新增唯一权威入口 `run_bridge_egress_probe(confirm_billable)`，由 Tauri `run_bridge_egress_check` 与 smoke 的 `egress` 项共同调用。探针在 Bridge 所在 WSL 网络命名空间内按 `/health → outbound proxy TCP → /v1/models → 单次 max_tokens=1 /v1/messages → 不经 proxy 的直连对照` 分层执行；64 秒 host watchdog 与 62 秒 guest timeout 双重回收。当前 10808 在第二层 TCP refused 后立即短路，后三层 skipped，绝不为了复现既知 502 继续计费。required path secret、Bridge current path/hash/listener PID/cmdline、model allowlist、URL origin-only 与输出 control-char 合同均在 WSL 内校验；不调用 `/api/config`，不把 Key、token、请求头、响应正文或 URL path/query/fragment送回 DTO。guest timeout 124/137 映射为语义 timeout。
+
+前端在既有“沙盒 / API 出口”状态项内增加第二个“能力体检”动作，没有新增首页模块。第一次点击只打开说明；只有第二次点击“同意并开始体检（1 次真实请求）”才以 `confirmBillable: true` 调 command。它使用独立 WORK busy/ref/circuit 与 75 秒 deadline，不写 ALLOW、PID、全局启动 busy 或主按钮。结构化红色报告仍保留五层证据、是否计费与 `buildBridgeEgressRepairPrompt()`；Prompt 只建议等待用户批准后清空 `outbound_proxy_url` 或改为 WSL 内真实监听地址，禁止自动改系统代理/VPN/DNS/hosts/证书/443、关闭 WSL或触碰 2222。
+
+证据在哪：`launcher/src-tauri/src/bridge_egress.rs`、`launcher/src-tauri/src/lib.rs`、`launcher/src-tauri/src/smoke.rs`、`launcher/src/bridgeEgress.ts`、`launcher/src/App.tsx`、`launcher/tests/bridge-egress.test.ts`。Rust 95 passed、0 failed、4 ignored，integration 9 passed；Node 9 passed；`npm run build` 通过（36 modules）；pwsh 总 self-test 为 54 translation tests、package policy、35 passed/3 skipped。独立后端与前端最终审查均无 blocker。浏览器实际点击证据：首次点击只出现计费确认，取消后 dialog=0；二次确认后五层结果完整，主按钮在弹窗前/确认中/结果后均 enabled；Escape 可关闭并把焦点还给“能力体检”；800px 视口为两列 `334.5px 334.5px`、最后一层通栏且无水平溢出。
+
+现场证据：最终 smoke 精确查出 `http://127.0.0.1:10808` 对应的 `work.bridge_egress.proxy_dead`，`billable=false` 且 `gating=false`；required checks 仍全绿、exit=0。smoke 前后 Claude PID 443、Bridge PID 18733 未变，8765/8766/9876 与无关 2222 均保持监听。完整输出如下。
+
+下一步：进入 S5，落长期合同与 PR 防膨胀五问，并逐项点击现有 UI/command，记录每项入口、响应和日志证据；任一无法现场安全点击的破坏性/计费能力明确标为待人工，不用源码存在冒充已验收。
+
+```text
+PASS allow 426ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 426ms budget=3000ms
+PASS open 724ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 380ms health=200 models=200 identity=current modelCount=5
+FAIL egress 381ms work.bridge_egress.proxy_dead health=passed proxy=failed models=skipped request=skipped direct=skipped billable=false gating=false
+PASS grade 3311ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5224 exit=0
+```

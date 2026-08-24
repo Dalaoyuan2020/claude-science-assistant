@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri_plugin_opener::OpenerExt;
 
+mod bridge_egress;
 mod runtime_lifecycle;
 mod smoke;
 
 pub use smoke::smoke_exit_code_if_requested;
+
+use bridge_egress::{run_bridge_egress_probe, BridgeEgressReport};
 
 use runtime_lifecycle::{
     parse_runtime_identity, runtime_identity_from_health, RuntimeIdentity, ServiceOperationLock,
@@ -5958,6 +5961,11 @@ async fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
         .map_err(|error| ensure_error_prefix("runtime.legacy_bridge_stop_failed", error))
 }
 
+#[tauri::command]
+async fn run_bridge_egress_check(confirm_billable: bool) -> Result<BridgeEgressReport, String> {
+    run_blocking(move || run_bridge_egress_probe(confirm_billable)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5975,6 +5983,7 @@ pub fn run() {
             open_claude_science,
             get_dashboard_url,
             stop_legacy_windows_bridge,
+            run_bridge_egress_check,
             get_provider_catalog,
             get_launcher_settings,
             save_provider_selection,

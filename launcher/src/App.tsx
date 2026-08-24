@@ -3,6 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { buildStorageMigrationPrompt, storageRecommendation } from "./storageMigration";
 import {
+  browserPreviewBridgeEgressReport,
+  buildBridgeEgressRepairPrompt,
+  type BridgeEgressLayer,
+  type BridgeEgressReport,
+} from "./bridgeEgress";
+import {
   browserPreviewRuntimeStatus,
   buildRuntimeRollbackPrompt,
   buildRuntimeUpgradePrompt,
@@ -26,6 +32,7 @@ const APP_VERSION = "V0.1.6";
 const GRADE_STATUS_TIMEOUT_MS = 15_000;
 const NETWORK_QUALITY_TIMEOUT_MS = 25_000;
 const RUNTIME_UPDATE_TIMEOUT_MS = 45_000;
+const BRIDGE_EGRESS_TIMEOUT_MS = 75_000;
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
 
@@ -78,10 +85,11 @@ interface WorkReport {
 
 type WorkLaneValue =
   | { probe: "network_quality"; value?: WorkReport; errorCode?: string }
-  | { probe: "runtime_update"; value?: RuntimeUpdateStatus; errorCode?: string };
+  | { probe: "runtime_update"; value?: RuntimeUpdateStatus; errorCode?: string }
+  | { probe: "bridge_egress"; value?: BridgeEgressReport; errorCode?: string };
 
 interface NonGatingProbeNotice {
-  source: "grade.status" | "work.network_quality" | "work.runtime_update";
+  source: "grade.status" | "work.network_quality" | "work.runtime_update" | "work.bridge_egress";
   code: string;
   message: string;
   muted: boolean;
@@ -645,6 +653,11 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimePromptMode, setRuntimePromptMode] = useState<"upgrade" | "rollback">();
   const [runtimeCopyState, setRuntimeCopyState] = useState("");
+  const [showBridgeEgressAssistant, setShowBridgeEgressAssistant] = useState(false);
+  const [bridgeEgressReport, setBridgeEgressReport] = useState<BridgeEgressReport>();
+  const [bridgeEgressChecking, setBridgeEgressChecking] = useState(false);
+  const [bridgeEgressError, setBridgeEgressError] = useState("");
+  const [bridgeEgressCopyState, setBridgeEgressCopyState] = useState("");
   const allowRefreshEpoch = useRef(0);
   const gradeRefreshInFlight = useRef(false);
   const busyRef = useRef(false);
@@ -653,12 +666,15 @@ function App() {
   const statusCommitEpoch = useRef(0);
   const runtimeInitializationAttempted = useRef(false);
   const runtimeCheckingRef = useRef(false);
+  const bridgeEgressCheckingRef = useRef(false);
+  const bridgeEgressDialogRef = useRef<HTMLElement>(null);
   const laneStateRef = useRef<LaneState<AllowStatus, SystemStatus, WorkLaneValue | undefined>>(
     createLaneState(initialAllowStatus, initialStatus, undefined),
   );
   const gradeStatusCircuitRef = useRef(createProbeCircuit());
   const networkQualityCircuitRef = useRef(createProbeCircuit());
   const runtimeUpdateCircuitRef = useRef(createProbeCircuit());
+  const bridgeEgressCircuitRef = useRef(createProbeCircuit());
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
@@ -705,6 +721,10 @@ function App() {
       ? buildRuntimeUpgradePrompt(runtimeUpdate)
       : buildRuntimeRollbackPrompt(runtimeUpdate);
   }, [runtimePromptMode, runtimeUpdate]);
+  const bridgeEgressPrompt = useMemo(
+    () => bridgeEgressReport ? buildBridgeEgressRepairPrompt(bridgeEgressReport) : "",
+    [bridgeEgressReport],
+  );
 
   const commitAllowStatus = useCallback((next: AllowStatus) => {
     const reduced = laneReducer(laneStateRef.current, { lane: "allow", value: next });
@@ -839,6 +859,26 @@ function App() {
       if (gradeTimer !== undefined) window.clearInterval(gradeTimer);
     };
   }, [initializeRuntimeInBackground, isTauri, refreshAllow, refreshGrade]);
+
+  useEffect(() => {
+    if (!showBridgeEgressAssistant) return;
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : undefined;
+    const focusFrame = window.requestAnimationFrame(() => bridgeEgressDialogRef.current?.focus());
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !bridgeEgressCheckingRef.current) {
+        event.preventDefault();
+        setShowBridgeEgressAssistant(false);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", closeOnEscape);
+      previouslyFocused?.focus();
+    };
+  }, [showBridgeEgressAssistant]);
 
   function updateBusy(value: boolean) {
     if (value) {
@@ -1573,6 +1613,74 @@ function App() {
     }
   }
 
+  function openBridgeEgressAssistant() {
+    setBridgeEgressReport(undefined);
+    setBridgeEgressError("");
+    setBridgeEgressCopyState("");
+    setShowBridgeEgressAssistant(true);
+  }
+
+  async function confirmBridgeEgressCheck() {
+    if (bridgeEgressCheckingRef.current) return;
+    bridgeEgressCheckingRef.current = true;
+    setBridgeEgressChecking(true);
+    setBridgeEgressError("");
+    setBridgeEgressCopyState("");
+    try {
+      const result = await runNonGatingProbe<BridgeEgressReport>({
+        lane: "work",
+        key: "bridge_egress",
+        timeoutMs: BRIDGE_EGRESS_TIMEOUT_MS,
+        circuit: bridgeEgressCircuitRef.current,
+        task: () => isTauri
+          ? invoke<BridgeEgressReport>("run_bridge_egress_check", { confirmBillable: true })
+          : Promise.resolve(browserPreviewBridgeEgressReport),
+      });
+      if (!result.ok) {
+        laneStateRef.current = laneReducer(laneStateRef.current, {
+          lane: "work",
+          value: { probe: "bridge_egress", errorCode: result.code },
+        });
+        const muted = nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped);
+        setBridgeEgressError(nonGatingFailurePresentation(`${result.code}: ${result.message}`, allowStatus));
+        setProbeNotice({
+          source: "work.bridge_egress",
+          code: result.code,
+          message: result.message,
+          muted,
+        });
+        return;
+      }
+      laneStateRef.current = laneReducer(laneStateRef.current, {
+        lane: "work",
+        value: { probe: "bridge_egress", value: result.value },
+      });
+      setBridgeEgressReport(result.value);
+      if (result.value.ok) {
+        setProbeNotice((current) => current?.source === "work.bridge_egress" ? undefined : current);
+      } else {
+        setProbeNotice({
+          source: "work.bridge_egress",
+          code: result.value.code,
+          message: result.value.conclusion,
+          muted: nonGatingFailureIsMuted(result.value.code),
+        });
+      }
+    } finally {
+      bridgeEgressCheckingRef.current = false;
+      setBridgeEgressChecking(false);
+    }
+  }
+
+  async function copyBridgeEgressPrompt() {
+    try {
+      await navigator.clipboard.writeText(bridgeEgressPrompt);
+      setBridgeEgressCopyState("修复 Prompt 已复制，可以交给本地 Codex。");
+    } catch {
+      setBridgeEgressCopyState("自动复制失败，请在文本框中按 Ctrl+A、Ctrl+C 手动复制。");
+    }
+  }
+
   const bridgeDetail = status.bridgeHealthy
     ? (status.bridgePid ? `PID ${status.bridgePid}` : "健康")
     : status.bridgeRunning
@@ -1672,6 +1780,9 @@ function App() {
               actionLabel={networkChecking ? "检测中…" : "深度检测"}
               onAction={runNetworkQualityCheck}
               actionDisabled={busy || networkChecking || !allowStatus.claudeRunning}
+              secondaryActionLabel={bridgeEgressChecking ? "体检中…" : "能力体检"}
+              onSecondaryAction={openBridgeEgressAssistant}
+              secondaryActionDisabled={bridgeEgressChecking}
             />
             <HealthItem
               label="WSL 存储"
@@ -1781,6 +1892,94 @@ function App() {
               {runtimeCopyState && <span aria-live="polite">{runtimeCopyState}</span>}
               <button className="primary-inline-button" onClick={copyRuntimePrompt}>复制 Prompt</button>
             </div>
+          </section>
+        </div>
+      )}
+
+      {showBridgeEgressAssistant && (
+        <div className="migration-backdrop" role="presentation" onMouseDown={(event) => {
+          if (!bridgeEgressChecking && event.currentTarget === event.target) setShowBridgeEgressAssistant(false);
+        }}>
+          <section
+            className="migration-dialog bridge-egress-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bridge-egress-title"
+            ref={bridgeEgressDialogRef}
+            tabIndex={-1}
+          >
+            <div className="migration-dialog-head">
+              <div>
+                <span className="eyebrow">Bridge → 上游模型 API</span>
+                <h2 id="bridge-egress-title">{bridgeEgressReport ? "能力体检结果" : "能力体检确认"}</h2>
+                <p>{bridgeEgressReport
+                  ? "五层结果均来自 Bridge 实际使用的出口；它属于 WORK 车道，不影响本地打开。"
+                  : "这与不计费的沙盒深度检测是两条不同链路。只有你明确同意后，才会开始真实出口体检。"}</p>
+              </div>
+              <button
+                className="quiet-button"
+                onClick={() => setShowBridgeEgressAssistant(false)}
+                disabled={bridgeEgressChecking}
+              >关闭</button>
+            </div>
+
+            {!bridgeEgressReport ? (
+              <>
+                <div className="bridge-egress-consent">
+                  <strong>本次可能产生极少量模型费用</strong>
+                  <p>同意后，体检会先检查 Bridge /health、outbound proxy TCP 和 /v1/models；前三层通过时，会向当前模型发送一次真实请求，<code>max_tokens=1</code>。</p>
+                  <p>若提前查到 10808 等死代理，探针会在真实请求前停止，并明确显示“本次未发送真实请求”。</p>
+                </div>
+                <div className="migration-boundary">
+                  探针全程只读：不改 outbound_proxy_url，不改系统代理、VPN、DNS、hosts、证书或 443，也不会关闭 WSL、启动器或无关服务。
+                </div>
+                {bridgeEgressError && <div className="bridge-egress-error" role="alert">{bridgeEgressError}</div>}
+                <div className="migration-actions">
+                  <button className="secondary-button" onClick={() => setShowBridgeEgressAssistant(false)} disabled={bridgeEgressChecking}>取消</button>
+                  <button className="primary-inline-button" onClick={confirmBridgeEgressCheck} disabled={bridgeEgressChecking}>
+                    {bridgeEgressChecking ? "正在执行五层体检…" : "同意并开始体检（1 次真实请求）"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={`bridge-egress-summary ${bridgeEgressReport.ok ? "ok" : "fail"}`}>
+                  <strong>{bridgeEgressReport.code}</strong>
+                  <p>{bridgeEgressReport.conclusion}</p>
+                  <small>真实请求：{bridgeEgressReport.billableRequestSent ? "已发送 1 次（max_tokens=1）" : "未发送"} · 无论结果如何，仍可打开 Claude Science</small>
+                </div>
+                <div className="bridge-egress-layers" aria-label="Bridge 出口五层结果">
+                  {([
+                    ["1 · /health", bridgeEgressReport.health],
+                    ["2 · proxy TCP", bridgeEgressReport.proxy],
+                    ["3 · /v1/models", bridgeEgressReport.models],
+                    ["4 · /v1/messages", bridgeEgressReport.request],
+                    ["5 · direct control", bridgeEgressReport.direct],
+                  ] as Array<[string, BridgeEgressLayer]>).map(([label, layer]) => (
+                    <div className={`bridge-egress-layer ${layer.state}`} key={label}>
+                      <span>{label}</span>
+                      <strong>{layer.state}</strong>
+                      <code>{layer.code}</code>
+                      <small>{typeof layer.httpStatus === "number" ? `HTTP ${layer.httpStatus} · ` : ""}{Math.max(0, Math.round(layer.durationMs))} ms</small>
+                    </div>
+                  ))}
+                </div>
+                <div className="migration-boundary">
+                  启动器只生成修复 Prompt，不会自动修改代理配置。请把 Prompt 交给 Codex 做只读复核，再由你决定是否批准最小修改。
+                </div>
+                <label className="migration-prompt-label" htmlFor="bridge-egress-prompt">复制下面内容给 Codex</label>
+                <textarea id="bridge-egress-prompt" value={bridgeEgressPrompt} readOnly spellCheck={false} />
+                <div className="migration-actions">
+                  {bridgeEgressCopyState && <span aria-live="polite">{bridgeEgressCopyState}</span>}
+                  <button className="secondary-button" onClick={() => {
+                    setBridgeEgressReport(undefined);
+                    setBridgeEgressError("");
+                    setBridgeEgressCopyState("");
+                  }}>重新检测（重新确认）</button>
+                  <button className="primary-inline-button" onClick={copyBridgeEgressPrompt}>复制修复 Prompt</button>
+                </div>
+              </>
+            )}
           </section>
         </div>
       )}
@@ -2281,19 +2480,37 @@ function App() {
   );
 }
 
-function HealthItem({ label, ok, detail, actionLabel, onAction, actionDisabled }: {
+function HealthItem({
+  label,
+  ok,
+  detail,
+  actionLabel,
+  onAction,
+  actionDisabled,
+  secondaryActionLabel,
+  onSecondaryAction,
+  secondaryActionDisabled,
+}: {
   label: string;
   ok: boolean;
   detail: string;
   actionLabel?: string;
   onAction?: () => void;
   actionDisabled?: boolean;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: () => void;
+  secondaryActionDisabled?: boolean;
 }) {
   return (
     <div className="health-item">
       <span className={`health-check ${ok ? "ok" : ""}`}>{ok ? "✓" : "—"}</span>
       <div className="health-item-copy"><strong>{label}</strong><small>{detail}</small></div>
-      {actionLabel && onAction && <button className="health-item-action" onClick={onAction} disabled={actionDisabled}>{actionLabel}</button>}
+      <div className="health-item-actions">
+        {actionLabel && onAction && <button className="health-item-action" onClick={onAction} disabled={actionDisabled}>{actionLabel}</button>}
+        {secondaryActionLabel && onSecondaryAction && (
+          <button className="health-item-action" onClick={onSecondaryAction} disabled={secondaryActionDisabled}>{secondaryActionLabel}</button>
+        )}
+      </div>
     </div>
   );
 }

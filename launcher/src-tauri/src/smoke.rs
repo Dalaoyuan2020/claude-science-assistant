@@ -1,3 +1,6 @@
+use super::bridge_egress::{run_bridge_egress_probe, BridgeEgressReport};
+#[cfg(test)]
+use super::bridge_egress::{BridgeEgressLayer, BridgeEgressLayerState};
 use super::{
     allow_status_impl, background_command, command_output_with_stdin_timeout,
     command_output_with_timeout, derive_can_open, get_claude_url_impl, grade_status_impl,
@@ -385,7 +388,7 @@ trait SmokeBackend {
     fn allow_status(&self) -> Result<AllowStatus, String>;
     fn resolve_login_url(&self) -> Result<String, String>;
     fn probe_bridge(&self) -> Result<BridgeProbe, String>;
-    fn probe_egress(&self) -> Result<(), String>;
+    fn probe_egress(&self) -> Result<BridgeEgressReport, String>;
     fn grade_status(&self) -> GradeProbe;
 }
 
@@ -404,8 +407,8 @@ impl SmokeBackend for LiveSmokeBackend {
         bridge_probe_impl()
     }
 
-    fn probe_egress(&self) -> Result<(), String> {
-        Err("work.bridge_egress.not_implemented".into())
+    fn probe_egress(&self) -> Result<BridgeEgressReport, String> {
+        run_bridge_egress_probe(true)
     }
 
     fn grade_status(&self) -> GradeProbe {
@@ -1030,13 +1033,29 @@ fn run_smoke_with_backend<B: SmokeBackend>(
             SmokeCheck::Egress => {
                 let started = Instant::now();
                 match backend.probe_egress() {
-                    Ok(()) => lines.push(format!(
-                        "PASS egress {}ms work.bridge_egress.ok",
-                        elapsed_ms(started)
-                    )),
+                    Ok(report) => {
+                        let level = if report.ok { "PASS" } else { "FAIL" };
+                        if !report.ok {
+                            non_gating_fail += 1;
+                        }
+                        lines.push(format!(
+                            "{level} egress {}ms {} health={} proxy={} models={} request={} direct={} billable={} gating=false",
+                            elapsed_ms(started),
+                            report.code,
+                            report.health.state.as_str(),
+                            report.proxy.state.as_str(),
+                            report.models.state.as_str(),
+                            report.request.state.as_str(),
+                            report.direct.state.as_str(),
+                            report.billable_request_sent,
+                        ));
+                    }
                     Err(code) => {
                         non_gating_fail += 1;
-                        lines.push(format!("FAIL egress {}ms {code}", elapsed_ms(started)));
+                        lines.push(format!(
+                            "FAIL egress {}ms {code} health=unknown proxy=unknown models=unknown request=unknown direct=unknown billable=false gating=false",
+                            elapsed_ms(started)
+                        ));
                     }
                 }
             }
@@ -1134,8 +1153,8 @@ mod tests {
             })
         }
 
-        fn probe_egress(&self) -> Result<(), String> {
-            Err("work.bridge_egress.proxy_dead".into())
+        fn probe_egress(&self) -> Result<BridgeEgressReport, String> {
+            Ok(fake_proxy_dead_report())
         }
 
         fn grade_status(&self) -> GradeProbe {
@@ -1148,6 +1167,37 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn fake_egress_layer(state: BridgeEgressLayerState, name: &str) -> BridgeEgressLayer {
+        BridgeEgressLayer {
+            state,
+            code: format!("work.bridge_egress.{name}"),
+            http_status: None,
+            duration_ms: 0,
+            detail: None,
+        }
+    }
+
+    fn fake_proxy_dead_report() -> BridgeEgressReport {
+        BridgeEgressReport {
+            operation: "bridge_egress".into(),
+            ok: false,
+            code: "work.bridge_egress.proxy_dead".into(),
+            conclusion: "proxy unavailable".into(),
+            billable_request_sent: false,
+            model: None,
+            outbound_proxy_configured: true,
+            outbound_proxy_url: Some("http://127.0.0.1:10808".into()),
+            upstream_base_url: None,
+            health: fake_egress_layer(BridgeEgressLayerState::Passed, "health_ok"),
+            proxy: fake_egress_layer(BridgeEgressLayerState::Failed, "proxy_dead"),
+            models: fake_egress_layer(BridgeEgressLayerState::Skipped, "models_skipped"),
+            request: fake_egress_layer(BridgeEgressLayerState::Skipped, "request_skipped"),
+            direct: fake_egress_layer(BridgeEgressLayerState::Skipped, "direct_skipped"),
+            suggested_action: "replace or clear the Bridge proxy".into(),
+            warnings: Vec::new(),
+        }
     }
 
     #[test]
@@ -1182,6 +1232,9 @@ mod tests {
         assert_eq!(backend.allow_calls.get(), 1);
         let output = lines.join("\n");
         assert!(output.contains("FAIL egress"));
+        assert!(output.contains(
+            "health=passed proxy=failed models=skipped request=skipped direct=skipped billable=false gating=false"
+        ));
         assert!(output.contains("WARN grade"));
         assert!(output.contains("exit=0"));
         assert!(!output.contains("must-never-appear"));

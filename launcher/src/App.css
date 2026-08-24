@@ -50,6 +50,7 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 .health-item strong, .health-item small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .health-item strong { font-size: 12px; }
 .health-item small { max-width: 170px; color: #7a857e; font-size: 11px; margin-top: 2px; }
+.health-item-actions { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
 .health-item-action { flex: 0 0 auto; border: 1px solid #b9c9be; border-radius: 8px; padding: 5px 7px; color: #28523a; background: #fff; cursor: pointer; font-size: 9px; font-weight: 800; }
 
 .notice { border: 1px solid #efd8b1; border-radius: 14px; padding: 13px 16px; margin: -12px 0 24px; color: #744f19; background: #fff8e9; font-size: 12px; }
@@ -78,6 +79,33 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 .migration-dialog textarea:focus { border-color: #3c7954; box-shadow: 0 0 0 3px #3c79541a; }
 .migration-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 12px; }
 .migration-actions span { margin-right: auto; color: #557060; font-size: 11px; }
+
+.bridge-egress-consent { margin-top: 18px; border: 1px solid #e5c57f; border-radius: 14px; padding: 14px 16px; color: #684817; background: #fff8e7; }
+.bridge-egress-consent strong { display: block; font-size: 13px; }
+.bridge-egress-consent p { margin: 6px 0 0; font-size: 11px; line-height: 1.55; }
+.bridge-egress-consent code { border-radius: 5px; padding: 1px 4px; background: #f1e2bd; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.bridge-egress-error { margin-top: 12px; border: 1px solid #e2aaa0; border-radius: 11px; padding: 10px 12px; color: #7a3027; background: #fff0ed; font-size: 11px; line-height: 1.5; }
+.bridge-egress-summary { margin-top: 18px; border: 1px solid #b9dfc4; border-radius: 14px; padding: 13px 15px; color: #17582f; background: #edf8f0; }
+.bridge-egress-summary.fail { border-color: #efc8bc; color: #7a2d1d; background: #fff1ed; }
+.bridge-egress-summary strong, .bridge-egress-summary small { display: block; }
+.bridge-egress-summary strong { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.bridge-egress-summary p { margin: 5px 0; font-size: 12px; line-height: 1.5; }
+.bridge-egress-summary small { opacity: .8; font-size: 10px; }
+.bridge-egress-layers { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; margin-top: 12px; }
+.bridge-egress-layer { min-width: 0; border: 1px solid #d7dfd8; border-radius: 11px; padding: 9px; background: #f4f6f4; }
+.bridge-egress-layer.passed { border-color: #b9dfc4; background: #f0f8f2; }
+.bridge-egress-layer.failed { border-color: #efc8bc; background: #fff2ee; }
+.bridge-egress-layer span, .bridge-egress-layer strong, .bridge-egress-layer code, .bridge-egress-layer small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bridge-egress-layer span { color: #758078; font-size: 9px; }
+.bridge-egress-layer strong { margin-top: 4px; font-size: 11px; }
+.bridge-egress-layer code { margin-top: 4px; color: #536158; font-size: 8px; }
+.bridge-egress-layer small { margin-top: 4px; color: #7c877f; font-size: 8px; }
+.bridge-egress-dialog:focus { outline: 3px solid #7dad8b66; outline-offset: 3px; }
+
+@media (max-width: 900px) {
+  .bridge-egress-layers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bridge-egress-layer:last-child { grid-column: 1 / -1; }
+}
 
 .runtime-update-panel { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(260px, 1.2fr) auto; align-items: center; gap: 18px; margin: 0 0 16px; border: 1px solid #d6ded7; border-radius: 16px; padding: 15px 17px; background: #f9fbf9d9; }
 .runtime-update-copy h2 { margin: 4px 0 2px; font-size: 17px; }
