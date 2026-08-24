@@ -490,6 +490,7 @@ function App() {
   const [runtimeCopyState, setRuntimeCopyState] = useState("");
   const refreshInFlight = useRef(false);
   const busyRef = useRef(false);
+  const statusCommitEpoch = useRef(0);
   const runtimeInitializationAttempted = useRef(false);
 
   const isTauri = "__TAURI_INTERNALS__" in window;
@@ -522,6 +523,7 @@ function App() {
   const refresh = useCallback(async () => {
     if (refreshInFlight.current || busyRef.current) return;
     refreshInFlight.current = true;
+    const requestEpoch = statusCommitEpoch.current;
     let initializingRuntime = false;
     try {
       if (!isTauri) {
@@ -547,9 +549,11 @@ function App() {
       if (next.claudeRunning && next.network.localReady && !next.network.deepChecked) {
         next = await invoke<SystemStatus>("run_network_quality_check");
       }
+      if (requestEpoch !== statusCommitEpoch.current) return;
       setStatus(next);
       setError(initializationError);
     } catch (reason) {
+      if (requestEpoch !== statusCommitEpoch.current) return;
       setStatus((current) => ({ ...current, state: "error" }));
       setError(String(reason));
     } finally {
@@ -592,6 +596,11 @@ function App() {
   }, [status.state, status.restartBlocked, status.windowsBridgePid]);
 
   function updateBusy(value: boolean) {
+    if (value) {
+      // Invalidate any slower periodic refresh that started before this user
+      // action, so it cannot overwrite the action's newer status or error.
+      statusCommitEpoch.current += 1;
+    }
     busyRef.current = value;
     setBusy(value);
   }
@@ -1113,7 +1122,14 @@ function App() {
       try {
         await invoke<void>("open_claude_science");
       } catch (reason) {
-        setError(String(reason));
+        const openError = String(reason);
+        try {
+          setStatus(await invoke<SystemStatus>("get_system_status"));
+        } catch {
+          // Preserve the original, more relevant open failure if the status
+          // refresh also fails during the same WSL transition.
+        }
+        setError(openError);
       } finally {
         updateBusy(false);
       }

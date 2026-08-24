@@ -139,6 +139,13 @@ directly from the Rust backend to the system browser rather than returned to the
 copy login URLs into diagnostics. If the launcher reports that the lifecycle remains busy after its
 bounded wait, let the current start/restart finish and refresh; do not restart all of WSL.
 
+The Claude Science CLI can also use exit code `2` during a short daemon/control transition. A launcher
+must not infer “runtime missing” from that raw code: only the launcher-owned `CSA_URL_RUNTIME_MISSING`
+sentinel proves the executable lookup failed. V0.1.6 retries transient `1/2/4` results twice and refreshes
+the displayed process state after a final open failure so a stale PID is not shown beside the diagnostic.
+An epoch guard discards any older periodic health refresh that finishes after that user action, and the
+outer watchdog leaves enough time for the lifecycle-lock wait plus all bounded login retries.
+
 ## Tool Call Markers Appear As Text
 
 Some OpenAI-compatible providers emit native tool-call markers in normal text.

@@ -36,7 +36,10 @@ const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
 const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-pypi-head-v2";
 const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://pypi.org/simple/pip/";
 const CLAUDE_URL_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const CLAUDE_URL_COMMAND_TIMEOUT: Duration = Duration::from_secs(50);
+// The WSL transaction can legitimately spend 25 seconds waiting for the
+// lifecycle lock, followed by two bounded retry backoffs and three vendor
+// control requests. Keep the Windows watchdog outside that valid budget.
+const CLAUDE_URL_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
 
 fn deep_network_result_is_fresh(
     deep_checked: bool,
@@ -4980,28 +4983,33 @@ fi
 
 attempt=1
 last_rc=4
-while [ "$attempt" -le 2 ]; do
+while [ "$attempt" -le 3 ]; do
   "$bin" url
   last_rc=$?
   if [ "$last_rc" -eq 0 ]; then
     exit 0
   fi
   case "$last_rc" in
-    1|4) ;;
+    # Claude Science 0.1.25 can briefly return 2 while its daemon generation,
+    # lock file, and control socket converge. This is not the launcher's own
+    # runtime-missing condition, which always carries an explicit sentinel.
+    1|2|4) ;;
     *)
       echo "CSA_URL_COMMAND_FAILED=$last_rc" >&2
       exit "$last_rc"
       ;;
   esac
-  if [ "$attempt" -lt 2 ]; then
+  if [ "$attempt" -lt 3 ]; then
     echo "CSA_URL_TRANSIENT_RETRY=$last_rc" >&2
-    sleep 1
+    sleep "$attempt"
   fi
   attempt=$((attempt + 1))
 done
 
 if [ "$last_rc" -eq 1 ]; then
   echo "CSA_URL_CONTROL_UNAVAILABLE" >&2
+elif [ "$last_rc" -eq 2 ]; then
+  echo "CSA_URL_DAEMON_TRANSITION" >&2
 else
   echo "CSA_URL_DAEMON_NOT_READY" >&2
 fi
@@ -5099,18 +5107,22 @@ fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Resu
     }
 
     let cleaned_stderr = clean_diagnostic_text(stderr);
-    let base = if cleaned_stderr.contains("CSA_URL_RUNTIME_MISSING") || exit_code == Some(2) {
+    // Only classify launcher-owned failures by their explicit sentinel. The
+    // vendor CLI also uses small exit codes (including 2), so raw-code mapping
+    // creates false "runtime missing" diagnostics while the binary is present.
+    let base = if cleaned_stderr.contains("CSA_URL_RUNTIME_MISSING") {
         "Claude Science 受管运行时入口缺失；请从完整 V0.1.6 便携包执行修复。"
-    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_BUSY") || exit_code == Some(75) {
+    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_BUSY") {
         "Claude Science 仍在启动或重启；等待生命周期切换 25 秒后仍未完成，请稍后重试。"
-    } else if cleaned_stderr.contains("CSA_URL_FLOCK_MISSING") || exit_code == Some(70) {
+    } else if cleaned_stderr.contains("CSA_URL_FLOCK_MISSING") {
         "WSL 缺少 CSA 生命周期锁工具 flock，无法安全等待服务切换。"
-    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_LOCK_UNREADABLE") || exit_code == Some(74)
-    {
+    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_LOCK_UNREADABLE") {
         "CSA 生命周期锁不可读写，无法安全生成 Claude Science 登录地址。"
-    } else if cleaned_stderr.contains("CSA_URL_CONTROL_UNAVAILABLE") || exit_code == Some(1) {
-        "Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成一次退避重试。"
-    } else if cleaned_stderr.contains("CSA_URL_DAEMON_NOT_READY") || exit_code == Some(4) {
+    } else if cleaned_stderr.contains("CSA_URL_CONTROL_UNAVAILABLE") {
+        "Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成两次退避重试。"
+    } else if cleaned_stderr.contains("CSA_URL_DAEMON_TRANSITION") {
+        "Claude Science 运行时入口存在，但登录命令在两次退避后仍处于 daemon 切换状态；这不是运行时缺失。"
+    } else if cleaned_stderr.contains("CSA_URL_DAEMON_NOT_READY") {
         "Claude Science 当前没有稳定的锁文件或控制 socket，服务可能仍在切换。"
     } else {
         "Claude Science 登录地址生成失败。"
@@ -5390,6 +5402,31 @@ mod tests {
         assert!(missing.contains("运行时入口缺失"));
         assert!(!missing.contains(&nonce));
 
+        let vendor_two =
+            claude_url_result(Some(2), &secret_stdout, "CSA_URL_COMMAND_FAILED=2\n").unwrap_err();
+        assert!(vendor_two.contains("登录地址生成失败"));
+        assert!(!vendor_two.contains("运行时入口缺失"));
+        assert!(!vendor_two.contains(&nonce));
+
+        let transition =
+            claude_url_result(Some(2), &secret_stdout, "CSA_URL_DAEMON_TRANSITION\n").unwrap_err();
+        assert!(transition.contains("运行时入口存在"));
+        assert!(transition.contains("不是运行时缺失"));
+        assert!(!transition.contains(&nonce));
+
+        for vendor_code in [70, 74, 75] {
+            let vendor_failure = claude_url_result(
+                Some(vendor_code),
+                &secret_stdout,
+                &format!("CSA_URL_COMMAND_FAILED={vendor_code}\n"),
+            )
+            .unwrap_err();
+            assert!(vendor_failure.contains("登录地址生成失败"));
+            assert!(!vendor_failure.contains("生命周期"));
+            assert!(!vendor_failure.contains("flock"));
+            assert!(!vendor_failure.contains(&nonce));
+        }
+
         let busy =
             claude_url_result(Some(75), &secret_stdout, "CSA_URL_LIFECYCLE_BUSY\n").unwrap_err();
         assert!(busy.contains("启动或重启"));
@@ -5409,10 +5446,12 @@ mod tests {
 
     #[test]
     fn claude_login_url_waits_for_lifecycle_and_retries_only_transient_codes() {
+        assert!(CLAUDE_URL_COMMAND_TIMEOUT >= Duration::from_secs(75));
         assert!(CLAUDE_URL_SHELL.contains("flock -w 25 9"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_LEGACY_NO_LIFECYCLE_LOCK"));
-        assert!(CLAUDE_URL_SHELL.contains("while [ \"$attempt\" -le 2 ]"));
-        assert!(CLAUDE_URL_SHELL.contains("1|4) ;;"));
+        assert!(CLAUDE_URL_SHELL.contains("while [ \"$attempt\" -le 3 ]"));
+        assert!(CLAUDE_URL_SHELL.contains("1|2|4) ;;"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_TRANSITION"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_TRANSIENT_RETRY"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_COMMAND_FAILED"));
         assert!(!CLAUDE_URL_SHELL.contains("echo \"$bin\""));
@@ -6294,6 +6333,11 @@ mod tests {
         assert!(action.contains("updateBusy(true);"));
         assert!(action.contains("setError(\"\");"));
         assert!(action.contains("await invoke<void>(\"open_claude_science\");"));
+        assert!(action.contains("setStatus(await invoke<SystemStatus>(\"get_system_status\"));"));
+        assert!(source.contains("const statusCommitEpoch = useRef(0);"));
+        assert!(source.contains("const requestEpoch = statusCommitEpoch.current;"));
+        assert!(source.contains("requestEpoch !== statusCommitEpoch.current"));
+        assert!(source.contains("statusCommitEpoch.current += 1;"));
         assert!(action.contains("finally"));
         assert!(action.contains("updateBusy(false);"));
         assert!(!source.contains("get_claude_url"));
