@@ -152,7 +152,9 @@ topology still contribute to the overall health grade, but do not own the main O
 state. Deep egress checking runs independently and only merges a completed network result; a WSL/DrvFS
 inspection failure cannot replace verified core PID/port state with a degraded placeholder. The Open action uses a lightweight WSL preflight instead of
 repeating the full storage and network inspection: it verifies that 8765 and 8766 have one managed owner,
-checks its executable, argv, start ticks and scheduler state, then invokes that exact executable. A login
+checks its executable, argv, start ticks and scheduler state, then invokes that exact executable. The shell
+is streamed over stdin rather than embedded in `wsl.exe ... bash -lc`, preventing an outer command layer
+from expanding helper calls before Bash defines them. A login
 error is shown immediately rather than hidden behind a second full refresh.
 
 ## Tool Call Markers Appear As Text

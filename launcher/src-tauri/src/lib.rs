@@ -119,22 +119,64 @@ fn background_command(program: &str) -> Command {
 }
 
 fn command_output_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     label: &str,
 ) -> Result<Output, String> {
+    command_output_with_optional_stdin_timeout(command, None, timeout, label)
+}
+
+fn command_output_with_stdin_timeout(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    command_output_with_optional_stdin_timeout(command, Some(input), timeout, label)
+}
+
+fn command_output_with_optional_stdin_timeout(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("{label}启动失败：{error}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("{label}无法读取标准输出"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("{label}无法读取错误输出"))?;
+    let started = Instant::now();
+    let stdin = if input.is_some() {
+        match child.stdin.take() {
+            Some(stdin) => Some(stdin),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{label}无法打开标准输入"));
+            }
+        }
+    } else {
+        None
+    };
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label}无法读取标准输出"));
+        }
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{label}无法读取错误输出"));
+        }
+    };
     let stdout_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = stdout.read_to_end(&mut bytes);
@@ -145,15 +187,25 @@ fn command_output_with_timeout(
         let _ = stderr.read_to_end(&mut bytes);
         bytes
     });
-    let started = Instant::now();
-    let status = loop {
+    // Never write stdin synchronously on the timeout-owning thread. A child
+    // that does not read can fill the pipe and otherwise bypass the watchdog.
+    let stdin_writer = input.zip(stdin).map(|(input, mut stdin)| {
+        let input = input.to_vec();
+        let label = label.to_string();
+        thread::spawn(move || {
+            stdin
+                .write_all(&input)
+                .map_err(|error| format!("{label}无法写入标准输入：{error}"))
+        })
+    });
+    let status_result = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
+                break Err(format!(
                     "{label}在 {} 秒内没有响应，已停止本次操作。请检查宿主磁盘空间、WSL VHDX 与发行版状态。",
                     timeout.as_secs()
                 ));
@@ -161,12 +213,21 @@ fn command_output_with_timeout(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{label}状态读取失败：{error}"));
+                break Err(format!("{label}状态读取失败：{error}"));
             }
         }
     };
+    let write_result = stdin_writer
+        .map(|writer| {
+            writer
+                .join()
+                .unwrap_or_else(|_| Err(format!("{label}标准输入写入线程异常退出")))
+        })
+        .unwrap_or(Ok(()));
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    let status = status_result?;
+    write_result?;
     Ok(Output {
         status,
         stdout,
@@ -942,13 +1003,17 @@ fn run_wsl_with_timeout(distro: &str, args: &[&str], timeout: Duration) -> Resul
     command_output_with_timeout(command, timeout, &format!("WSL {distro}"))
 }
 
-fn run_wsl_as_user_with_timeout(
+fn run_wsl_as_user_script_with_timeout(
     distro: &str,
     user: &str,
-    args: &[&str],
+    script: &str,
     timeout: Duration,
     label: &str,
 ) -> Result<Output, String> {
+    // wsl.exe reconstructs its remaining arguments as a Linux command line.
+    // Passing a script containing $() via `bash -lc <script>` lets that outer
+    // layer expand command substitutions before Bash has defined its helper
+    // functions. Feed the script over stdin so only the intended Bash parses it.
     let mut command = background_command("wsl.exe");
     command
         .arg("--distribution")
@@ -956,8 +1021,9 @@ fn run_wsl_as_user_with_timeout(
         .arg("--user")
         .arg(user)
         .arg("--")
-        .args(args);
-    command_output_with_timeout(command, timeout, label)
+        .arg("bash")
+        .arg("-s");
+    command_output_with_stdin_timeout(command, script.as_bytes(), timeout, label)
 }
 
 fn parse_first_pid(text: &str) -> Option<u32> {
@@ -5381,10 +5447,10 @@ fn get_claude_url_impl() -> Result<String, String> {
     let distro =
         selected_distro_quick().map_err(|_| "WSL 不可用，无法打开 Claude Science。".to_string())?;
     let user = selected_linux_user_quick(&distro)?;
-    let output = run_wsl_as_user_with_timeout(
+    let output = run_wsl_as_user_script_with_timeout(
         &distro,
         &user,
-        &["bash", "-lc", CLAUDE_URL_SHELL],
+        CLAUDE_URL_SHELL,
         CLAUDE_URL_COMMAND_TIMEOUT,
         "Claude Science 登录地址生成",
     )
@@ -5546,6 +5612,30 @@ mod tests {
         assert_eq!(decode_console_output(&encoded), "Ubuntu-24.04\r\n");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn blocked_stdin_writer_cannot_bypass_the_process_timeout() {
+        let mut command = background_command("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 20",
+        ]);
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let error = command_output_with_stdin_timeout(
+            command,
+            &input,
+            Duration::from_millis(250),
+            "stdin timeout regression",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("没有响应"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[test]
     fn mixed_wsl_warning_does_not_hide_linux_error() {
         let mut encoded: Vec<u8> = "wsl: localhost proxy WSL NAT warning\r\n"
@@ -5688,6 +5778,34 @@ mod tests {
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_TRANSIENT_RETRY"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_COMMAND_FAILED"));
         assert!(!CLAUDE_URL_SHELL.contains("echo \"$bin\""));
+    }
+
+    #[test]
+    fn claude_login_script_is_streamed_to_bash_without_outer_wsl_expansion() {
+        let source = include_str!("lib.rs");
+        let helper_start = source
+            .find("fn run_wsl_as_user_script_with_timeout(")
+            .expect("WSL stdin script helper should exist");
+        let helper_end = source[helper_start..]
+            .find("fn parse_first_pid(")
+            .map(|offset| helper_start + offset)
+            .expect("PID parser should follow the WSL script helper");
+        let helper = &source[helper_start..helper_end];
+
+        assert!(helper.contains(".arg(\"bash\")"));
+        assert!(helper.contains(".arg(\"-s\")"));
+        assert!(helper.contains("command_output_with_stdin_timeout"));
+        assert!(helper.contains("script.as_bytes()"));
+        assert!(!helper.contains("\"-lc\""));
+    }
+
+    #[test]
+    #[ignore = "requires the current user's live managed WSL daemon and mints one unused login URL"]
+    fn live_claude_url_stdin_transport_diagnostic() {
+        let url = get_claude_url_impl()
+            .unwrap_or_else(|error| panic!("live stdin URL transport failed: {error}"));
+        assert!(url.starts_with("http://"));
+        assert!(url.contains(":8765/?nonce="));
     }
 
     #[test]
@@ -6686,6 +6804,9 @@ mod tests {
         assert!(source.contains("if (busyRef.current || networkCheckingRef.current) return false;"));
         assert!(backend.contains("selected_distro_quick()"));
         assert!(backend.contains("selected_linux_user_quick(&distro)"));
+        assert!(backend.contains("run_wsl_as_user_script_with_timeout"));
+        assert!(backend.contains("CLAUDE_URL_SHELL"));
+        assert!(!backend.contains("\"-lc\""));
         assert!(!backend.contains("current_status()"));
         assert!(source.contains("const statusCommitEpoch = useRef(0);"));
         assert!(source.contains("const requestEpoch = statusCommitEpoch.current;"));
