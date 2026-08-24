@@ -96,9 +96,21 @@ if ($exitCode -ne 0) {
 }
 
 if ($Open) {
+  $homeWslOutput = @((Invoke-WslQuiet @(
+    "-d", $Distro, "-u", $User, "--", "printenv", "HOME"
+  )) -replace [char]0, "")
+  $homeWsl = @(
+    $homeWslOutput |
+      ForEach-Object { "$_".Trim() } |
+      Where-Object { $_ -match '^/' } |
+      Select-Object -First 1
+  )
+  if (-not $homeWsl) {
+    throw "Failed to resolve the WSL home directory for user '$User'."
+  }
+  $managedClaude = ([string]$homeWsl[0]).TrimEnd('/') + "/.local/share/csa/runtime/claude-science/patched-current/claude-science"
   $urlOutput = @((Invoke-WslQuiet @(
-    "-d", $Distro, "-u", $User, "--", "bash", "-lc",
-    '"$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science" url'
+    "-d", $Distro, "-u", $User, "--", $managedClaude, "url"
   )) -replace [char]0, "")
   $match = $urlOutput | Select-String -Pattern "http://(?:localhost|127\.0\.0\.1):\d+/\?nonce=[a-f0-9]+" | Select-Object -First 1
   if ($match) {

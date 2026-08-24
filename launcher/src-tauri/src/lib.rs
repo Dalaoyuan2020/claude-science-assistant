@@ -1278,6 +1278,30 @@ fn run_wsl_with_timeout(distro: &str, args: &[&str], timeout: Duration) -> Resul
     command_output_with_timeout(command, timeout, &format!("WSL {distro}"))
 }
 
+fn wsl_bash_stdin_command(distro: &str) -> Command {
+    let mut command = background_command("wsl.exe");
+    command
+        .arg("--distribution")
+        .arg(distro)
+        .arg("--")
+        .args(["bash", "-s"]);
+    command
+}
+
+fn run_wsl_bash_stdin_with_timeout(
+    distro: &str,
+    script: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    command_output_with_stdin_timeout(
+        wsl_bash_stdin_command(distro),
+        script.as_bytes(),
+        timeout,
+        label,
+    )
+}
+
 fn run_wsl_default_user_script_with_guest_timeout(
     distro: &str,
     script: &str,
@@ -3601,7 +3625,7 @@ fn restart_bridge_after_config(
         &[
             "curl",
             "--noproxy",
-            "*",
+            "127.0.0.1",
             "-fsS",
             "--connect-timeout",
             "0.4",
@@ -3662,6 +3686,52 @@ fn dashboard_url_from_config(data: &serde_json::Value) -> String {
         format!("http://{host}:{port}/dashboard")
     }
 }
+
+fn dashboard_health_command() -> Command {
+    let mut command = background_command("curl.exe");
+    command.args([
+        "--noproxy",
+        "127.0.0.1",
+        "-fsS",
+        "--connect-timeout",
+        "0.4",
+        "--max-time",
+        "2",
+        "http://127.0.0.1:9876/health",
+    ]);
+    command
+}
+
+fn dashboard_requires_auth_config(health: &serde_json::Value) -> bool {
+    health
+        .get("proxy_auth_mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("required"))
+        && health
+            .get("proxy_auth_configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+const DASHBOARD_AUTH_CONFIG_SCRIPT: &str = r#"
+python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path.home() / ".claude-science" / "proxy" / "config.json"
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    print("dashboard config unreadable", file=sys.stderr)
+    raise SystemExit(1)
+
+allowed = ("proxy_host", "proxy_port", "proxy_auth_mode", "proxy_auth_token")
+print(json.dumps({key: data.get(key) for key in allowed}, ensure_ascii=False))
+PY
+"#;
 
 fn percent_encode_path_segment(value: &str) -> String {
     value
@@ -5165,7 +5235,6 @@ async fn start_services() -> Result<SystemStatus, String> {
         .map_err(|error| ensure_error_prefix("runtime.start_failed", error))
 }
 
-const STOP_SERVICES_SHELL: &str = "bash";
 const STOP_SERVICES_SCRIPT: &str = r#"
 set -u
 state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
@@ -5431,10 +5500,11 @@ exit 1
 "#;
 
 fn stop_services_raw(distro: &str) -> Result<(), String> {
-    let output = run_wsl_with_timeout(
+    let output = run_wsl_bash_stdin_with_timeout(
         distro,
-        &[STOP_SERVICES_SHELL, "-lc", STOP_SERVICES_SCRIPT],
+        STOP_SERVICES_SCRIPT,
         STOP_SERVICES_TIMEOUT,
+        "停止 CSA 服务",
     )
     .map_err(|error| ensure_error_prefix("transport.stop_services_failed", error))?;
     if !output.status.success() {
@@ -5886,39 +5956,42 @@ async fn open_claude_science(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn get_dashboard_url_impl() -> Result<String, String> {
-    let distro = selected_distro_quick()?;
-    let health = run_wsl(
-        &distro,
-        &[
-            "curl",
-            "--noproxy",
-            "*",
-            "-fsS",
-            "--connect-timeout",
-            "0.4",
-            "--max-time",
-            "2",
-            "http://127.0.0.1:9876/health",
-        ],
+    // The dashboard is opened by Windows, so verify the exact Windows-facing
+    // loopback route. Sending `--noproxy *` through wsl.exe is unsafe here:
+    // WSL can re-parse the argv and expand `*` in the current DrvFS directory,
+    // making curl treat workspace entries as URLs until the host watchdog fires.
+    let health_output = command_output_with_timeout(
+        dashboard_health_command(),
+        Duration::from_secs(4),
+        "Bridge 配置面板健康检查",
     )?;
-    let health = serde_json::from_str::<serde_json::Value>(&output_text(&health))
+    if !health_output.status.success() {
+        let detail = command_error_text(&health_output);
+        return Err(if detail.trim().is_empty() {
+            "Windows 无法访问当前 Bridge 配置面板，请先刷新状态".to_string()
+        } else {
+            format!("Windows 无法访问当前 Bridge 配置面板：{detail}")
+        });
+    }
+    let health = serde_json::from_str::<serde_json::Value>(&output_text(&health_output))
         .map_err(|_| "当前 Bridge 健康信息无效，请先从本目录启动/迁移 Bridge".to_string())?;
     runtime_identity_from_health(&health)
         .map_err(|_| "9876 端口不是 CSA 受管 Bridge；请先执行修复并重启".to_string())?;
-    let script = r#"
-import json
-import pathlib
 
-path = pathlib.Path.home() / ".claude-science" / "proxy" / "config.json"
-try:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    if not isinstance(data, dict):
-        data = {}
-except Exception:
-    data = {}
-print(json.dumps(data, ensure_ascii=False))
-"#;
-    let output = run_wsl(&distro, &["python3", "-c", script])?;
+    if !dashboard_requires_auth_config(&health) {
+        return Ok(dashboard_url_from_config(&health));
+    }
+
+    // Required control authentication is the exceptional path. Read only the
+    // four dashboard fields over stdin so neither shell text nor a wildcard is
+    // transported in the outer wsl.exe argv, and do not copy unrelated API keys.
+    let distro = selected_distro_quick()?;
+    let output = run_wsl_bash_stdin_with_timeout(
+        &distro,
+        DASHBOARD_AUTH_CONFIG_SCRIPT,
+        Duration::from_secs(8),
+        "Bridge 配置面板认证读取",
+    )?;
     if !output.status.success() {
         return Err("无法读取 Bridge 配置，无法打开配置面板".into());
     }
@@ -5929,10 +6002,14 @@ print(json.dumps(data, ensure_ascii=False))
 }
 
 #[tauri::command]
-async fn get_dashboard_url() -> Result<String, String> {
-    run_blocking(get_dashboard_url_impl)
+async fn open_bridge_dashboard(app: tauri::AppHandle) -> Result<(), String> {
+    let url = run_blocking(get_dashboard_url_impl)
         .await
-        .map_err(|error| ensure_error_prefix("bridge.dashboard_url_failed", error))
+        .map_err(|error| ensure_error_prefix("bridge.dashboard_url_failed", error))?;
+    app.opener().open_url(url, None::<&str>).map_err(|_| {
+        "bridge.dashboard_browser_open_failed: 已验证本机 Bridge 配置面板，但 Windows 无法打开默认浏览器；请检查默认浏览器关联后重试。"
+            .to_string()
+    })
 }
 
 fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
@@ -5981,7 +6058,7 @@ pub fn run() {
             stop_services,
             restart_services,
             open_claude_science,
-            get_dashboard_url,
+            open_bridge_dashboard,
             stop_legacy_windows_bridge,
             run_bridge_egress_check,
             get_provider_catalog,
@@ -8196,6 +8273,39 @@ mod tests {
     }
 
     #[test]
+    fn powershell_wsl_scripts_keep_shell_text_out_of_outer_argv() {
+        let windows_start = include_str!("../../../scripts/start-claude-science-wsl.ps1");
+        let open_block = windows_start
+            .split("if ($Open) {")
+            .nth(1)
+            .expect("Windows start script should retain the optional open block");
+        assert!(open_block.contains("\"--\", \"printenv\", \"HOME\""));
+        assert!(open_block.contains("\"--\", $managedClaude, \"url\""));
+        assert!(!open_block.contains("\"bash\", \"-lc\""));
+        assert!(!open_block.contains("$HOME/.local/share/csa"));
+        assert!(!open_block.contains("$("));
+        assert!(!open_block.contains('*'));
+
+        let evidence = include_str!("../../../scripts/collect-acceptance-evidence.ps1");
+        let status_block = evidence
+            .split("$wslStatusScript = @'")
+            .nth(1)
+            .expect("evidence status script should use a literal stdin here-string");
+        let argv_block = status_block
+            .split("$wslArgs = @(")
+            .nth(1)
+            .and_then(|value| value.split("  )").next())
+            .expect("evidence WSL argv block should be present");
+        assert!(argv_block.contains("\"bash\""));
+        assert!(argv_block.contains("\"-s\""));
+        assert!(!argv_block.contains("-lc"));
+        assert!(!argv_block.contains("$("));
+        assert!(!argv_block.contains('*'));
+        assert!(status_block.contains("-StandardInputText $wslStatusScript"));
+        assert!(!evidence.contains("\"-lc\""));
+    }
+
+    #[test]
     fn validates_official_release_pointer_and_manifest() {
         assert!(valid_release_sha8("b7190511"));
         assert!(!valid_release_sha8("B7190511"));
@@ -8252,6 +8362,95 @@ mod tests {
             })),
             "http://127.0.0.1:9876/secret%20token/dashboard"
         );
+    }
+
+    #[test]
+    fn dashboard_health_uses_windows_loopback_without_a_wsl_glob() {
+        let command = dashboard_health_command();
+        assert_eq!(command.get_program(), "curl.exe");
+        let argv = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            argv,
+            [
+                "--noproxy",
+                "127.0.0.1",
+                "-fsS",
+                "--connect-timeout",
+                "0.4",
+                "--max-time",
+                "2",
+                "http://127.0.0.1:9876/health",
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "wsl.exe"));
+    }
+
+    #[test]
+    fn direct_process_argv_never_carries_a_noproxy_glob() {
+        let source = include_str!("lib.rs");
+        let lines = source.lines().collect::<Vec<_>>();
+        for pair in lines.windows(2) {
+            if pair[0].trim() == "\"--noproxy\"," {
+                assert_ne!(
+                    pair[1].trim(),
+                    "\"*\",",
+                    "a literal no-proxy wildcard in direct argv can expand after wsl.exe reparses it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_reads_linux_config_only_for_required_auth() {
+        assert!(!dashboard_requires_auth_config(&serde_json::json!({
+            "proxy_auth_mode": "optional",
+            "proxy_auth_configured": true
+        })));
+        assert!(!dashboard_requires_auth_config(&serde_json::json!({
+            "proxy_auth_mode": "required",
+            "proxy_auth_configured": false
+        })));
+        assert!(dashboard_requires_auth_config(&serde_json::json!({
+            "proxy_auth_mode": "required",
+            "proxy_auth_configured": true
+        })));
+
+        assert!(DASHBOARD_AUTH_CONFIG_SCRIPT.contains("python3 - <<'PY'"));
+        assert!(DASHBOARD_AUTH_CONFIG_SCRIPT.contains("proxy_auth_token"));
+        assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("api_key"));
+        assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("--noproxy"));
+    }
+
+    #[test]
+    fn dashboard_path_secret_never_crosses_the_frontend_invoke_boundary() {
+        let frontend = include_str!("../../src/App.tsx");
+        let open_start = frontend
+            .find("async function openDashboard()")
+            .expect("dashboard action should exist");
+        let open_end = frontend[open_start..]
+            .find("function openMigrationAssistant()")
+            .map(|offset| open_start + offset)
+            .expect("migration helper should follow dashboard action");
+        let open_action = &frontend[open_start..open_end];
+        assert!(open_action.contains("await invoke<void>(\"open_bridge_dashboard\")"));
+        assert!(!open_action.contains("invoke<string>"));
+        assert!(!open_action.contains("get_dashboard_url"));
+        assert!(!open_action.contains("openUrl"));
+
+        let backend = include_str!("lib.rs");
+        let command_start = backend
+            .find("async fn open_bridge_dashboard(app: tauri::AppHandle)")
+            .expect("dashboard opener command should exist");
+        let command_end = backend[command_start..]
+            .find("fn stop_legacy_windows_bridge_impl()")
+            .map(|offset| command_start + offset)
+            .expect("legacy bridge action should follow dashboard opener");
+        let command = &backend[command_start..command_end];
+        assert!(command.contains("run_blocking(get_dashboard_url_impl)"));
+        assert!(command.contains("app.opener().open_url(url"));
     }
 
     #[test]
@@ -8429,7 +8628,7 @@ mod tests {
             "--silent",
             "--show-error",
             "--noproxy",
-            "*",
+            "127.0.0.1",
             "--connect-timeout",
             "1",
             "--max-time",
@@ -8459,7 +8658,7 @@ mod tests {
             "--silent",
             "--show-error",
             "--noproxy",
-            "*",
+            "127.0.0.1",
             "--connect-timeout",
             "2",
             "--max-time",
@@ -8659,8 +8858,44 @@ mod tests {
     }
 
     #[test]
-    fn stop_services_uses_bash_and_requires_verified_listener_owners() {
-        assert_eq!(STOP_SERVICES_SHELL, "bash");
+    fn stop_services_streams_bash_over_stdin_and_requires_verified_listener_owners() {
+        let source = include_str!("lib.rs");
+        let helper = source
+            .split("fn run_wsl_bash_stdin_with_timeout(")
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .split("fn run_wsl_default_user_script_with_guest_timeout(")
+                    .next()
+            })
+            .expect("the general WSL stdin helper should be present");
+        assert!(helper.contains("command_output_with_stdin_timeout"));
+        assert!(helper.contains("script.as_bytes()"));
+        let stop_transport = source
+            .split("fn stop_services_raw(distro: &str)")
+            .nth(1)
+            .and_then(|value| value.split("fn stop_services_impl()").next())
+            .expect("the stop transport should be present");
+        assert!(stop_transport.contains("run_wsl_bash_stdin_with_timeout"));
+        assert!(stop_transport.contains("STOP_SERVICES_SCRIPT"));
+        assert!(!stop_transport.contains("-lc"));
+
+        let command = wsl_bash_stdin_command("Ubuntu-24.04");
+        let argv = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(argv, ["--distribution", "Ubuntu-24.04", "--", "bash", "-s"]);
+        let outer_expanded = argv
+            .iter()
+            .map(|arg| {
+                arg.replace('*', "OUTER_GLOB")
+                    .replace("$(", "OUTER_SUBSHELL(")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outer_expanded, argv);
+        assert!(STOP_SERVICES_SCRIPT.contains("$("));
+        assert!(STOP_SERVICES_SCRIPT.contains("--noproxy '*'"));
         assert!(START_SERVICES_TIMEOUT >= Duration::from_secs(120));
         assert!(STOP_SERVICES_TIMEOUT >= Duration::from_secs(45));
         assert!(STOP_SERVICES_SCRIPT.contains("grep -oE 'pid=[0-9]+'"));

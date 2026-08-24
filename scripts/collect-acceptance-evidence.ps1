@@ -95,7 +95,8 @@ function Invoke-CapturedNative {
   param(
     [string]$Name,
     [string]$FilePath,
-    [string[]]$Arguments
+    [string[]]$Arguments,
+    [AllowNull()][string]$StandardInputText = $null
   )
 
   Write-Host "Collecting: $Name"
@@ -104,7 +105,12 @@ function Invoke-CapturedNative {
   $previousErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
-    $lines = @(& $FilePath @Arguments 2>&1 | ForEach-Object {
+    $nativeOutput = if ($null -eq $StandardInputText) {
+      & $FilePath @Arguments 2>&1
+    } else {
+      $StandardInputText | & $FilePath @Arguments 2>&1
+    }
+    $lines = @($nativeOutput | ForEach-Object {
       if ($_ -is [System.Management.Automation.ErrorRecord]) {
         $_.Exception.Message
       } else {
@@ -249,15 +255,23 @@ if (-not $SkipWslStatus) {
       reason = "No usable WSL distro found."
     }
   } else {
-  $wslArgs = @(
-    "-d",
-    $Distro,
-    "--",
-    "bash",
-    "-lc",
-    "if test -e ~/.claude-science/proxy/config.json; then stat -c 'config_exists=true mode=%a owner=%U group=%G path=%n' ~/.claude-science/proxy/config.json; else echo config_exists=false; fi; systemctl --user is-active claude-science-bridge.service 2>/dev/null || true"
-  )
-  $summary.commands += Invoke-CapturedNative -Name "wsl-runtime-status-no-config-content" -FilePath "wsl.exe" -Arguments $wslArgs
+    $wslStatusScript = @'
+set -u
+if test -e ~/.claude-science/proxy/config.json; then
+  stat -c 'config_exists=true mode=%a owner=%U group=%G path=%n' ~/.claude-science/proxy/config.json
+else
+  echo config_exists=false
+fi
+systemctl --user is-active claude-science-bridge.service 2>/dev/null || true
+'@
+    $wslArgs = @(
+      "-d",
+      $Distro,
+      "--",
+      "bash",
+      "-s"
+    )
+    $summary.commands += Invoke-CapturedNative -Name "wsl-runtime-status-no-config-content" -FilePath "wsl.exe" -Arguments $wslArgs -StandardInputText $wslStatusScript
   }
 }
 

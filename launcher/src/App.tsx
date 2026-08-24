@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { buildStorageMigrationPrompt, storageRecommendation } from "./storageMigration";
 import {
   browserPreviewBridgeEgressReport,
@@ -1297,6 +1296,7 @@ function App() {
     if (!isTauri) {
       const entry = apiKeys.find((item) => item.id === apiKeyId);
       if (!entry) return;
+      setError("");
       setActiveApiKeyId(apiKeyId);
       setPendingApiKeyId(apiKeyId);
       setActiveProvider(entry.providerId);
@@ -1347,6 +1347,7 @@ function App() {
       return;
     }
     if (!isTauri) {
+      setError("");
       setRoleMappingsDirty(false);
       setAggregateSchemes((current) => current.map((scheme) => scheme.id === selectedSchemeId
         ? { ...scheme, routes: roleBindings }
@@ -1429,6 +1430,7 @@ function App() {
       return;
     }
     if (!isTauri) {
+      setError("");
       setActiveAggregateSchemeId(pendingSchemeId);
       setAccessMode("aggregate");
       return;
@@ -1512,7 +1514,7 @@ function App() {
 
   async function openDashboard() {
     try {
-      await openUrl(await invoke<string>("get_dashboard_url"));
+      await invoke<void>("open_bridge_dashboard");
     } catch (reason) {
       setError(String(reason));
     }
@@ -2472,7 +2474,11 @@ function App() {
         <span>{allowStatus.linuxUser && allowStatus.distro ? `${allowStatus.linuxUser} · ${allowStatus.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
           <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
-          <button onClick={() => runAction("restart_services")} disabled={allowActionBusy || !allowStatus.wslInstalled || status.restartBlocked}>重启</button>
+          <button
+            onClick={() => runAction("restart_services")}
+            disabled={allowActionBusy || !allowStatus.wslInstalled || status.restartBlocked}
+            title="备份配置、收窄持久 DrvFS 写授权，并重启受管 Bridge 与 Claude Science"
+          >修复并重启</button>
           <button onClick={() => runAction("stop_services")} disabled={allowActionBusy || (!status.bridgeRunning && !allowStatus.claudeRunning)}>停止</button>
         </div>
       </footer>
