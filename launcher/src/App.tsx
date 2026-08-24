@@ -42,6 +42,22 @@ interface NetworkQualityStatus {
   sandboxEgressHttpStatus?: number;
 }
 
+interface DeepNetworkQualityStatus {
+  deepChecked: boolean;
+  deepCheckedAtUnix?: number;
+  sandboxUnixSocketState: string;
+  sandboxSocksHandshakeState: string;
+  sandboxEgressFailureStage: string;
+  sandboxEgressState: string;
+  sandboxEgressTarget?: string;
+  sandboxEgressHttpStatus?: number;
+}
+
+interface NetworkQualityCheckResult {
+  deep?: DeepNetworkQualityStatus;
+  warnings: string[];
+}
+
 interface SystemStatus {
   state: SystemState;
   wslInstalled: boolean;
@@ -478,6 +494,7 @@ function App() {
   const [testingKey, setTestingKey] = useState(false);
   const [autoMappingKey, setAutoMappingKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [networkChecking, setNetworkChecking] = useState(false);
   const [error, setError] = useState("");
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
   const [apiSectionCollapsed, setApiSectionCollapsed] = useState(initialApiSectionCollapsed);
@@ -490,6 +507,7 @@ function App() {
   const [runtimeCopyState, setRuntimeCopyState] = useState("");
   const refreshInFlight = useRef(false);
   const busyRef = useRef(false);
+  const networkCheckingRef = useRef(false);
   const statusCommitEpoch = useRef(0);
   const runtimeInitializationAttempted = useRef(false);
 
@@ -510,7 +528,18 @@ function App() {
   const draftProvider = providers.find((provider) => provider.id === draftProviderId) || activeKeyProvider;
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
-  const summary = stateText[status.state];
+  const deepNetworkReady = status.network.deepChecked && status.network.sandboxEgressState === "ok";
+  const canOpenClaude = Boolean(
+    status.claudeRunning
+    && !status.windowsBridgePid,
+  );
+  const mutationBusy = busy || networkChecking;
+  const summary = status.state === "running" && !deepNetworkReady
+    ? {
+      title: "Claude Science 已准备好",
+      detail: "Bridge、本地端口与 3/3 沙盒出口拓扑已验证；外部 API 深度质检不影响打开",
+    }
+    : stateText[status.state];
   const migrationRecommendation = useMemo(() => storageRecommendation(status), [status]);
   const migrationPrompt = useMemo(() => buildStorageMigrationPrompt(status), [status]);
   const runtimePrompt = useMemo(() => {
@@ -521,7 +550,7 @@ function App() {
   }, [runtimePromptMode, runtimeUpdate]);
 
   const refresh = useCallback(async () => {
-    if (refreshInFlight.current || busyRef.current) return;
+    if (refreshInFlight.current || busyRef.current || networkCheckingRef.current) return;
     refreshInFlight.current = true;
     const requestEpoch = statusCommitEpoch.current;
     let initializingRuntime = false;
@@ -545,9 +574,6 @@ function App() {
         }
       } else {
         next = await invoke<SystemStatus>("get_system_status");
-      }
-      if (next.claudeRunning && next.network.localReady && !next.network.deepChecked) {
-        next = await invoke<SystemStatus>("run_network_quality_check");
       }
       if (requestEpoch !== statusCommitEpoch.current) return;
       setStatus(next);
@@ -588,12 +614,12 @@ function App() {
 
   const primaryLabel = useMemo(() => {
     if (status.windowsBridgePid) return "先停止旧 Windows Bridge";
-    if (status.state === "running") return "打开 Claude Science";
+    if (canOpenClaude) return "打开 Claude Science";
     if (status.restartBlocked) return "先处理诊断问题";
     if (status.state === "notInstalled") return "安装运行环境";
     if (status.state === "degraded") return "修复并重启";
     return "启动 Claude Science";
-  }, [status.state, status.restartBlocked, status.windowsBridgePid]);
+  }, [canOpenClaude, status.state, status.restartBlocked, status.windowsBridgePid]);
 
   function updateBusy(value: boolean) {
     if (value) {
@@ -603,6 +629,12 @@ function App() {
     }
     busyRef.current = value;
     setBusy(value);
+  }
+
+  function tryBeginMutation() {
+    if (busyRef.current || networkCheckingRef.current) return false;
+    updateBusy(true);
+    return true;
   }
 
   function applyLauncherState(settings: LauncherSettings) {
@@ -678,15 +710,33 @@ function App() {
   }
 
   async function runNetworkQualityCheck() {
-    if (busy) return;
-    updateBusy(true);
+    if (busyRef.current || networkCheckingRef.current || refreshInFlight.current) return;
+    networkCheckingRef.current = true;
+    setNetworkChecking(true);
+    statusCommitEpoch.current += 1;
+    const checkEpoch = statusCommitEpoch.current;
+    const commitNetworkResult = (next: NetworkQualityCheckResult) => {
+      if (checkEpoch !== statusCommitEpoch.current) return;
+      setStatus((current) => ({
+        ...current,
+        network: next.deep
+          ? {
+            ...current.network,
+            ...next.deep,
+            ready: current.network.localReady
+              && !current.network.daemonIoBlocked
+              && next.deep.deepChecked
+              && next.deep.sandboxEgressState === "ok",
+          }
+          : current.network,
+        warnings: next.warnings,
+      }));
+    };
     setError("");
     try {
       if (!isTauri) {
-        setStatus({
-          ...browserPreviewStatus,
-          network: {
-            ...browserPreviewStatus.network,
+        const next: NetworkQualityCheckResult = {
+          deep: {
             deepChecked: true,
             sandboxUnixSocketState: "connected",
             sandboxSocksHandshakeState: "ok",
@@ -695,19 +745,23 @@ function App() {
             sandboxEgressTarget: "pypi.org",
             sandboxEgressHttpStatus: 200,
           },
-        });
+          warnings: browserPreviewStatus.warnings,
+        };
+        commitNetworkResult(next);
       } else {
-        setStatus(await invoke<SystemStatus>("run_network_quality_check"));
+        const next = await invoke<NetworkQualityCheckResult>("run_network_quality_check");
+        commitNetworkResult(next);
       }
     } catch (reason) {
-      setError(String(reason));
+      if (checkEpoch === statusCommitEpoch.current) setError(String(reason));
     } finally {
-      updateBusy(false);
+      networkCheckingRef.current = false;
+      setNetworkChecking(false);
     }
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     try {
       setStatus(await invoke<SystemStatus>(command));
@@ -719,6 +773,7 @@ function App() {
   }
 
   async function applyDraftKey() {
+    if (busyRef.current || networkCheckingRef.current) return;
     if (!draftProvider) return;
     if (status.restartBlocked) {
       setError("当前诊断不允许写入或切换 API Key；请先处理磁盘、WSL 或安装包问题。连接测试仍可使用。");
@@ -766,7 +821,7 @@ function App() {
       return;
     }
 
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     try {
       const saved = await invoke<LauncherSettings>("save_api_key", {
@@ -918,6 +973,7 @@ function App() {
   }
 
   async function activateKey(apiKeyId: string) {
+    if (busyRef.current || networkCheckingRef.current) return;
     if (apiKeyId === activeApiKeyId && !activeRole && !activeAggregateSchemeId) return;
     if (status.restartBlocked) {
       setError("当前诊断不允许切换 API Key；请先处理磁盘、WSL 或安装包问题。");
@@ -935,7 +991,7 @@ function App() {
       setApiKeys((current) => current.map((item) => ({ ...item, active: item.id === apiKeyId })));
       return;
     }
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     let applied = false;
     try {
@@ -970,6 +1026,7 @@ function App() {
   }
 
   async function saveRoleMappings() {
+    if (busyRef.current || networkCheckingRef.current) return;
     if (roleBindings.some((binding) => !binding.apiKeyId || !binding.providerId || !binding.model)) {
       setError("请为决策、视觉和日常三个角色都选择订阅与模型；三个角色可以使用同一订阅。");
       return;
@@ -985,7 +1042,7 @@ function App() {
       setAccessMode("aggregate");
       return;
     }
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     let applied = false;
     try {
@@ -1043,7 +1100,7 @@ function App() {
   }
 
   async function confirmPendingAggregateScheme() {
-    if (busy || status.restartBlocked || roleMappingsDirty) return;
+    if (busyRef.current || networkCheckingRef.current || status.restartBlocked || roleMappingsDirty) return;
     if (pendingSchemeId === activeAggregateSchemeId) return;
     const scheme = aggregateSchemes.find((item) => item.id === pendingSchemeId);
     if (!scheme) {
@@ -1061,7 +1118,7 @@ function App() {
       setAccessMode("aggregate");
       return;
     }
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     try {
       applyLauncherState(await invoke<LauncherSettings>("activate_aggregate_scheme", {
@@ -1094,6 +1151,7 @@ function App() {
   }
 
   async function deleteKey(apiKeyId: string) {
+    if (busyRef.current || networkCheckingRef.current) return;
     if (!isTauri) {
       setApiKeys((current) => current.filter((item) => item.id !== apiKeyId));
       setRoleBindings((current) => current.map((binding) => binding.apiKeyId === apiKeyId
@@ -1102,7 +1160,7 @@ function App() {
       setRoleMappingsDirty(true);
       return;
     }
-    updateBusy(true);
+    if (!tryBeginMutation()) return;
     setError("");
     try {
       applyLauncherState(await invoke<LauncherSettings>("delete_api_key", { apiKeyId }));
@@ -1115,21 +1173,17 @@ function App() {
 
   async function primaryAction() {
     if (busyRef.current) return;
+    if (networkCheckingRef.current && !canOpenClaude) return;
     if (status.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
-    if (status.state === "running") {
+    if (canOpenClaude) {
       updateBusy(true);
       setError("");
       try {
         await invoke<void>("open_claude_science");
       } catch (reason) {
-        const openError = String(reason);
-        try {
-          setStatus(await invoke<SystemStatus>("get_system_status"));
-        } catch {
-          // Preserve the original, more relevant open failure if the status
-          // refresh also fails during the same WSL transition.
-        }
-        setError(openError);
+        // Show the login failure immediately. A full storage/network refresh
+        // can take minutes on DrvFS and must not keep the Open button locked.
+        setError(String(reason));
       } finally {
         updateBusy(false);
       }
@@ -1276,7 +1330,7 @@ function App() {
           </div>
           <p>三模型聚合，一个安全启动入口</p>
         </div>
-        <button className="quiet-button" onClick={refresh} disabled={busy}>刷新状态</button>
+        <button className="quiet-button" onClick={refresh} disabled={mutationBusy}>刷新状态</button>
       </header>
 
       <section className={`hero state-${status.state}`}>
@@ -1286,7 +1340,11 @@ function App() {
           <h2>{summary.title}</h2>
           <p>{summary.detail}</p>
         </div>
-        <button className="primary-button" onClick={primaryAction} disabled={busy || status.state === "loading"}>
+        <button
+          className="primary-button"
+          onClick={primaryAction}
+          disabled={busy || status.state === "loading" || (networkChecking && !canOpenClaude)}
+        >
           {busy ? (accessMode === "aggregate" ? "正在验证三个模型…" : "正在处理…") : primaryLabel}
         </button>
       </section>
@@ -1320,9 +1378,9 @@ function App() {
               label="沙盒 / API 出口"
               ok={networkOk}
               detail={networkDetail}
-              actionLabel="深度检测"
+              actionLabel={networkChecking ? "检测中…" : "深度检测"}
               onAction={runNetworkQualityCheck}
-              actionDisabled={busy || !status.claudeRunning}
+              actionDisabled={busy || networkChecking || !status.claudeRunning}
             />
             <HealthItem
               label="WSL 存储"
@@ -1348,7 +1406,7 @@ function App() {
           {error && <p>{error}</p>}
           {status.warnings.map((warning) => <p key={warning}>{warning}</p>)}
           {status.windowsBridgePid && (
-            <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={busy}>
+            <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={mutationBusy}>
               停止旧 Windows Bridge（PID {status.windowsBridgePid}）
             </button>
           )}
@@ -1553,7 +1611,7 @@ function App() {
                           event.stopPropagation();
                           void deleteKey(entry.id);
                         }}
-                        disabled={busy || active}
+                        disabled={mutationBusy || active}
                       >
                         删除
                       </button>
@@ -1571,7 +1629,7 @@ function App() {
                 <button
                   className="confirm-switch-button"
                   onClick={() => void confirmPendingKey()}
-                  disabled={busy || status.restartBlocked || !pendingApiKeyId || pendingApiKeyId === activeApiKeyId}
+                  disabled={mutationBusy || status.restartBlocked || !pendingApiKeyId || pendingApiKeyId === activeApiKeyId}
                 >
                   {busy ? "切换中…" : "确认切换"}
                 </button>
@@ -1619,7 +1677,7 @@ function App() {
               <button
                 className="confirm-switch-button"
                 onClick={() => void confirmPendingAggregateScheme()}
-                disabled={busy || status.restartBlocked || roleMappingsDirty || !pendingSchemeComplete || pendingSchemeId === activeAggregateSchemeId}
+                disabled={mutationBusy || status.restartBlocked || roleMappingsDirty || !pendingSchemeComplete || pendingSchemeId === activeAggregateSchemeId}
               >
                 {busy ? "正在验证线路…" : "确认切换"}
               </button>
@@ -1681,7 +1739,7 @@ function App() {
             <button
               className="primary-inline-button"
               onClick={saveRoleMappings}
-              disabled={busy || !roleMappingsDirty || roleEligibleKeys.length === 0}
+              disabled={mutationBusy || !roleMappingsDirty || roleEligibleKeys.length === 0}
             >
               保存并应用整套方案
             </button>
@@ -1898,7 +1956,7 @@ function App() {
                 )}
 
                 <div className="form-actions">
-                  <button className="primary-inline-button" onClick={applyDraftKey} disabled={busy || testingKey || autoMappingKey || status.restartBlocked}>
+                  <button className="primary-inline-button" onClick={applyDraftKey} disabled={mutationBusy || testingKey || autoMappingKey || status.restartBlocked}>
                     {busy ? "正在保存…" : "保存到列表"}
                   </button>
                   <button onClick={() => setShowKeyPicker(false)} disabled={busy || testingKey || autoMappingKey}>取消</button>
@@ -1913,8 +1971,8 @@ function App() {
         <span>{status.linuxUser && status.distro ? `${status.linuxUser} · ${status.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
           <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
-          <button onClick={() => runAction("restart_services")} disabled={busy || !status.wslInstalled || status.restartBlocked}>重启</button>
-          <button onClick={() => runAction("stop_services")} disabled={busy || (!status.bridgeRunning && !status.claudeRunning)}>停止</button>
+          <button onClick={() => runAction("restart_services")} disabled={mutationBusy || !status.wslInstalled || status.restartBlocked}>重启</button>
+          <button onClick={() => runAction("stop_services")} disabled={mutationBusy || (!status.bridgeRunning && !status.claudeRunning)}>停止</button>
         </div>
       </footer>
     </main>

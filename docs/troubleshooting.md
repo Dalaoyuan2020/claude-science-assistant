@@ -142,9 +142,18 @@ bounded wait, let the current start/restart finish and refresh; do not restart a
 The Claude Science CLI can also use exit code `2` during a short daemon/control transition. A launcher
 must not infer “runtime missing” from that raw code: only the launcher-owned `CSA_URL_RUNTIME_MISSING`
 sentinel proves the executable lookup failed. V0.1.6 retries transient `1/2/4` results twice and refreshes
-the displayed process state after a final open failure so a stale PID is not shown beside the diagnostic.
-An epoch guard discards any older periodic health refresh that finishes after that user action, and the
-outer watchdog leaves enough time for the lifecycle-lock wait plus all bounded login retries.
+the displayed process state independently of the Open action so a slow full inspection cannot hide the
+login error. An epoch guard discards any older periodic health refresh that finishes after that user action,
+and the outer watchdog leaves enough time for the lifecycle-lock wait plus all bounded login retries.
+
+The anonymous PyPI sandbox canary is a quality-control signal, not a prerequisite for opening the local
+managed UI and not proof that every research API domain is reachable. Bridge and the 3/3 local HTTP/SOCKS
+topology still contribute to the overall health grade, but do not own the main Open button's busy or enabled
+state. Deep egress checking runs independently and only merges a completed network result; a WSL/DrvFS
+inspection failure cannot replace verified core PID/port state with a degraded placeholder. The Open action uses a lightweight WSL preflight instead of
+repeating the full storage and network inspection: it verifies that 8765 and 8766 have one managed owner,
+checks its executable, argv, start ticks and scheduler state, then invokes that exact executable. A login
+error is shown immediately rather than hidden behind a second full refresh.
 
 ## Tool Call Markers Appear As Text
 

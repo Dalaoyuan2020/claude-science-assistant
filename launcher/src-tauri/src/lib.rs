@@ -55,6 +55,10 @@ fn deep_network_result_is_fresh(
         .unwrap_or(false)
 }
 
+fn core_runtime_ready_for_ui(local_network_ready: bool, claude_io_blocked: bool) -> bool {
+    local_network_ready && !claude_io_blocked
+}
+
 // Provider changes update the WSL Bridge config and restart its listener. Keep
 // the whole write/restart/verify transaction single-flight to prevent a second
 // click from racing the first transaction's rollback.
@@ -271,6 +275,56 @@ impl Default for NetworkQualityStatus {
             sandbox_egress_target: None,
             sandbox_egress_http_status: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeepNetworkQualityStatus {
+    deep_checked: bool,
+    deep_checked_at_unix: Option<u64>,
+    sandbox_unix_socket_state: String,
+    sandbox_socks_handshake_state: String,
+    sandbox_egress_failure_stage: String,
+    sandbox_egress_state: String,
+    sandbox_egress_target: Option<String>,
+    sandbox_egress_http_status: Option<u16>,
+}
+
+impl From<&NetworkQualityStatus> for DeepNetworkQualityStatus {
+    fn from(network: &NetworkQualityStatus) -> Self {
+        Self {
+            deep_checked: network.deep_checked,
+            deep_checked_at_unix: network.deep_checked_at_unix,
+            sandbox_unix_socket_state: network.sandbox_unix_socket_state.clone(),
+            sandbox_socks_handshake_state: network.sandbox_socks_handshake_state.clone(),
+            sandbox_egress_failure_stage: network.sandbox_egress_failure_stage.clone(),
+            sandbox_egress_state: network.sandbox_egress_state.clone(),
+            sandbox_egress_target: network.sandbox_egress_target.clone(),
+            sandbox_egress_http_status: network.sandbox_egress_http_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkQualityCheckResult {
+    // Never return local readiness, daemon scheduler state, PID or topology
+    // from the long-running probe. Only deep quality fields may be merged into
+    // the last shallow status, so a probe cannot disable local login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deep: Option<DeepNetworkQualityStatus>,
+    warnings: Vec<String>,
+}
+
+fn network_quality_check_result(status: SystemStatus) -> NetworkQualityCheckResult {
+    let deep = status
+        .network
+        .deep_checked
+        .then(|| DeepNetworkQualityStatus::from(&status.network));
+    NetworkQualityCheckResult {
+        deep,
+        warnings: status.warnings,
     }
 }
 
@@ -1591,7 +1645,15 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         bridge_healthy,
         claude_running,
         unit_contract_ok,
-        network_ready,
+        // Opening the local managed UI depends on the verified Bridge,
+        // Claude dual-port topology and local proxy/forwarder contract. The
+        // anonymous PyPI canary is a separate quality signal: a stale or
+        // unavailable external site must not turn a healthy local runtime into
+        // a restart target.
+        network_ready: core_runtime_ready_for_ui(
+            local_network_ready,
+            probe.network.claude_io_blocked,
+        ),
         storage_blocked,
         wsl_runtime_writable,
         runtime_ready,
@@ -4300,8 +4362,13 @@ async fn get_system_status() -> Result<SystemStatus, String> {
 }
 
 #[tauri::command]
-async fn run_network_quality_check() -> Result<SystemStatus, String> {
-    run_blocking(|| Ok(current_status_with_options(true))).await
+async fn run_network_quality_check() -> Result<NetworkQualityCheckResult, String> {
+    run_blocking(|| {
+        Ok(network_quality_check_result(current_status_with_options(
+            true,
+        )))
+    })
+    .await
 }
 
 fn valid_release_sha8(value: &str) -> bool {
@@ -4947,6 +5014,22 @@ fn selected_distro_quick() -> Result<String, String> {
     preferred_distro(&distros).ok_or_else(|| "WSL 不可用".to_string())
 }
 
+fn selected_linux_user_quick(distro: &str) -> Result<String, String> {
+    let output = run_wsl_with_timeout(distro, &["id", "-un"], Duration::from_secs(5))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法确定 Claude Science 所属的 WSL 用户：{}",
+            command_error_text(&output)
+        ));
+    }
+    let user = output_text(&output);
+    let user = user.lines().next().unwrap_or_default().trim();
+    if user.is_empty() || user.chars().any(char::is_whitespace) {
+        return Err("无法确定 Claude Science 所属的 WSL 用户。".into());
+    }
+    Ok(user.to_string())
+}
+
 const CLAUDE_URL_SHELL: &str = r#"
 set -u
 state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
@@ -4972,21 +5055,153 @@ else
   echo "CSA_URL_LEGACY_NO_LIFECYCLE_LOCK" >&2
 fi
 
-bin="$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science"
-if [ ! -x "$bin" ]; then
-  bin="$HOME/.local/share/claude-science-api-bridge/patched/claude-science"
+legacy_root="$HOME/.local/share/claude-science-api-bridge"
+
+listener_pids() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnp "sport = :$port" 2>/dev/null \
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+
+single_listener_pid() {
+  local port="$1" pids
+  pids="$(listener_pids "$port")" || return 1
+  set -- $pids
+  [ "$#" -eq 1 ] || return 1
+  case "$1" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "$1"
+}
+
+process_start_ticks() {
+  local pid="$1" payload suffix
+  payload="$(<"/proc/$pid/stat")" 2>/dev/null || return 1
+  suffix="${payload##*) }"
+  set -- $suffix
+  case "${20:-}" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "${20}"
+}
+
+# Return 76 only for uninterruptible I/O. All other unknown/unsafe scheduler
+# states fail closed as an unverifiable identity instead of being signalled.
+process_threads_safe() {
+  local pid="$1" task_dir payload suffix state count=0
+  for task_dir in "/proc/$pid"/task/[0-9]*; do
+    [ -d "$task_dir" ] || continue
+    payload="$(<"$task_dir/stat")" 2>/dev/null || return 1
+    suffix="${payload##*) }"
+    state="${suffix%% *}"
+    case "$state" in
+      R|S|I) ;;
+      D) return 76 ;;
+      *) return 1 ;;
+    esac
+    count=$((count + 1))
+  done
+  [ "$count" -gt 0 ]
+}
+
+managed_claude_executable() {
+  local pid="$1" executable raw_executable argv0_real
+  local -a argv=()
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  raw_executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  case "$raw_executable" in ''|*' (deleted)') return 1;; esac
+  executable="$raw_executable"
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  [ "${#argv[@]}" -ge 2 ] || return 1
+  case "$executable" in
+    "$state_root"/runtime/claude-science/patched/*/claude-science) ;;
+    "$legacy_root"/patched/claude-science) ;;
+    *) return 1 ;;
+  esac
+  case "${argv[0]:-}" in
+    "$state_root"/runtime/claude-science/patched/*/claude-science|"$state_root"/runtime/claude-science/patched-current/claude-science|"$legacy_root"/patched/claude-science) ;;
+    *) return 1 ;;
+  esac
+  argv0_real="$(readlink -f -- "${argv[0]}" 2>/dev/null || true)"
+  [ "$argv0_real" = "$executable" ] || return 1
+  [ "${argv[1]:-}" = "serve" ] || return 1
+  [ -x "$executable" ] || return 1
+  printf '%s\n' "$executable"
+}
+
+identity_failure() {
+  echo "CSA_URL_DAEMON_IDENTITY_UNVERIFIED" >&2
+  exit 77
+}
+
+threads_failure() {
+  local pid="$1" rc
+  process_threads_safe "$pid"
+  rc=$?
+  if [ "$rc" -eq 76 ]; then
+    echo "CSA_URL_DAEMON_IO_BLOCKED" >&2
+    exit 76
+  fi
+  [ "$rc" -eq 0 ] || identity_failure
+}
+
+# The lock file is vendor state, not an identity root. Establish ownership from
+# both listeners plus /proc, and only then cross-check a lock PID when present.
+daemon_pid_8765="$(single_listener_pid 8765)" || identity_failure
+daemon_pid_8766="$(single_listener_pid 8766)" || identity_failure
+[ "$daemon_pid_8765" = "$daemon_pid_8766" ] || identity_failure
+daemon_pid="$daemon_pid_8765"
+daemon_start="$(process_start_ticks "$daemon_pid")" || identity_failure
+bin="$(managed_claude_executable "$daemon_pid")" || identity_failure
+threads_failure "$daemon_pid"
+[ "$(process_start_ticks "$daemon_pid" 2>/dev/null || true)" = "$daemon_start" ] || identity_failure
+
+operon_lock="$HOME/.claude-science/operon.lock"
+if [ -e "$operon_lock" ]; then
+  [ -r "$operon_lock" ] || identity_failure
+  lock_pid="$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$operon_lock" 2>/dev/null \
+    | head -n 1 | grep -oE '[0-9]+$' || true)"
+  [ -n "$lock_pid" ] && [ "$lock_pid" = "$daemon_pid" ] || identity_failure
 fi
-if [ ! -x "$bin" ]; then
-  echo "CSA_URL_RUNTIME_MISSING" >&2
-  exit 2
-fi
+
+verify_daemon_identity() {
+  local pid_8765 pid_8766 current_start current_bin thread_rc
+  pid_8765="$(single_listener_pid 8765)" || return 77
+  pid_8766="$(single_listener_pid 8766)" || return 77
+  [ "$pid_8765" = "$daemon_pid" ] && [ "$pid_8766" = "$daemon_pid" ] || return 77
+  current_start="$(process_start_ticks "$daemon_pid")" || return 77
+  [ "$current_start" = "$daemon_start" ] || return 77
+  current_bin="$(managed_claude_executable "$daemon_pid")" || return 77
+  [ "$current_bin" = "$bin" ] || return 77
+  process_threads_safe "$daemon_pid"
+  thread_rc=$?
+  [ "$thread_rc" -eq 0 ] || return "$thread_rc"
+  [ "$(process_start_ticks "$daemon_pid" 2>/dev/null || true)" = "$daemon_start" ] || return 77
+}
 
 attempt=1
 last_rc=4
 while [ "$attempt" -le 3 ]; do
-  "$bin" url
+  verify_daemon_identity
+  identity_rc=$?
+  if [ "$identity_rc" -eq 76 ]; then
+    echo "CSA_URL_DAEMON_IO_BLOCKED" >&2
+    exit 76
+  elif [ "$identity_rc" -ne 0 ]; then
+    identity_failure
+  fi
+  # Resolve through the already verified live process instead of reopening a
+  # mutable filesystem path. Keep the nonce in-process until the same daemon
+  # identity is revalidated after the control call.
+  url_output="$("/proc/$daemon_pid/exe" url)"
   last_rc=$?
   if [ "$last_rc" -eq 0 ]; then
+    verify_daemon_identity
+    identity_rc=$?
+    if [ "$identity_rc" -eq 76 ]; then
+      echo "CSA_URL_DAEMON_IO_BLOCKED" >&2
+      exit 76
+    elif [ "$identity_rc" -ne 0 ]; then
+      identity_failure
+    fi
+    printf '%s\n' "$url_output"
     exit 0
   fi
   case "$last_rc" in
@@ -5118,6 +5333,10 @@ fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Resu
         "WSL 缺少 CSA 生命周期锁工具 flock，无法安全等待服务切换。"
     } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_LOCK_UNREADABLE") {
         "CSA 生命周期锁不可读写，无法安全生成 Claude Science 登录地址。"
+    } else if cleaned_stderr.contains("CSA_URL_DAEMON_IDENTITY_UNVERIFIED") {
+        "Claude Science 的 8765/8766 端口未通过同一受管进程身份校验；CSA 已拒绝向未知本地服务发送登录命令。"
+    } else if cleaned_stderr.contains("CSA_URL_DAEMON_IO_BLOCKED") {
+        "Claude Science 当前处于不可中断 WSL I/O；本地端口仍可能监听，但登录入口暂时不能安全生成。"
     } else if cleaned_stderr.contains("CSA_URL_CONTROL_UNAVAILABLE") {
         "Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成两次退避重试。"
     } else if cleaned_stderr.contains("CSA_URL_DAEMON_TRANSITION") {
@@ -5156,22 +5375,12 @@ fn get_claude_url_impl() -> Result<String, String> {
             )
         }
     })?;
-    let status = current_status();
-    let distro = status
-        .distro
-        .ok_or_else(|| "WSL 不可用，无法打开 Claude Science。".to_string())?;
-    let user = status
-        .linux_user
-        .ok_or_else(|| "无法确定 Claude Science 所属的 WSL 用户。".to_string())?;
-    if !status.runtime_ready {
-        return Err("Claude Science 受管运行时尚未准备完成。".into());
-    }
-    if status.restart_blocked {
-        return Err(
-            "Claude Science 当前处于不可安全打断的 I/O 状态；CSA 不会在此时生成或打开登录地址。"
-                .into(),
-        );
-    }
+    // Do not put the full storage/network/status inspection on the login
+    // critical path. The WSL script below verifies the lifecycle lock,
+    // managed executable and daemon scheduler state in one bounded operation.
+    let distro =
+        selected_distro_quick().map_err(|_| "WSL 不可用，无法打开 Claude Science。".to_string())?;
+    let user = selected_linux_user_quick(&distro)?;
     let output = run_wsl_as_user_with_timeout(
         &distro,
         &user,
@@ -5414,6 +5623,21 @@ mod tests {
         assert!(transition.contains("不是运行时缺失"));
         assert!(!transition.contains(&nonce));
 
+        let io_blocked =
+            claude_url_result(Some(76), &secret_stdout, "CSA_URL_DAEMON_IO_BLOCKED\n").unwrap_err();
+        assert!(io_blocked.contains("不可中断 WSL I/O"));
+        assert!(!io_blocked.contains(&nonce));
+
+        let unverified = claude_url_result(
+            Some(77),
+            &secret_stdout,
+            "CSA_URL_DAEMON_IDENTITY_UNVERIFIED\n",
+        )
+        .unwrap_err();
+        assert!(unverified.contains("同一受管进程身份校验"));
+        assert!(unverified.contains("未知本地服务"));
+        assert!(!unverified.contains(&nonce));
+
         for vendor_code in [70, 74, 75] {
             let vendor_failure = claude_url_result(
                 Some(vendor_code),
@@ -5452,6 +5676,15 @@ mod tests {
         assert!(CLAUDE_URL_SHELL.contains("while [ \"$attempt\" -le 3 ]"));
         assert!(CLAUDE_URL_SHELL.contains("1|2|4) ;;"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_TRANSITION"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_IO_BLOCKED"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_IDENTITY_UNVERIFIED"));
+        assert!(CLAUDE_URL_SHELL.contains("single_listener_pid 8765"));
+        assert!(CLAUDE_URL_SHELL.contains("single_listener_pid 8766"));
+        assert!(CLAUDE_URL_SHELL.contains("managed_claude_executable \"$daemon_pid\""));
+        assert!(CLAUDE_URL_SHELL.contains("process_start_ticks \"$daemon_pid\""));
+        assert!(CLAUDE_URL_SHELL.contains("process_threads_safe \"$daemon_pid\""));
+        assert!(CLAUDE_URL_SHELL.contains("[ \"${argv[1]:-}\" = \"serve\" ]"));
+        assert!(CLAUDE_URL_SHELL.contains("verify_daemon_identity"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_TRANSIENT_RETRY"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_COMMAND_FAILED"));
         assert!(!CLAUDE_URL_SHELL.contains("echo \"$bin\""));
@@ -5525,6 +5758,71 @@ mod tests {
         input.claude_listener_present = true;
         input.network_ready = true;
         assert_eq!(classify_system_state(&input), "running");
+    }
+
+    #[test]
+    fn external_deep_probe_does_not_gate_the_local_managed_ui() {
+        assert!(core_runtime_ready_for_ui(true, false));
+        assert!(!core_runtime_ready_for_ui(false, false));
+        assert!(!core_runtime_ready_for_ui(true, true));
+    }
+
+    #[test]
+    fn failed_deep_inspection_cannot_replace_verified_core_status() {
+        let failed_inspection = SystemStatus {
+            state: "degraded".into(),
+            claude_running: false,
+            bridge_healthy: false,
+            restart_blocked: true,
+            warnings: vec!["WSL deep inspection timed out".into()],
+            network: NetworkQualityStatus {
+                deep_checked: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = network_quality_check_result(failed_inspection);
+
+        assert!(result.deep.is_none());
+        assert_eq!(result.warnings, ["WSL deep inspection timed out"]);
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert!(serialized.get("deep").is_none());
+        assert!(serialized.get("state").is_none());
+        assert!(serialized.get("claudeRunning").is_none());
+        assert!(serialized.get("bridgeHealthy").is_none());
+        assert!(serialized.get("restartBlocked").is_none());
+
+        let completed = SystemStatus {
+            network: NetworkQualityStatus {
+                deep_checked: true,
+                sandbox_egress_state: "failed".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = network_quality_check_result(completed);
+        assert_eq!(result.deep.unwrap().sandbox_egress_state, "failed");
+
+        let busy = SystemStatus {
+            network: NetworkQualityStatus {
+                deep_checked: true,
+                daemon_io_blocked: true,
+                daemon_mount_io_blocked: true,
+                sandbox_egress_state: "daemon_mount_io_busy".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(network_quality_check_result(busy)).unwrap();
+        let deep = serialized.get("deep").unwrap();
+        assert_eq!(
+            deep.get("sandboxEgressState").unwrap(),
+            "daemon_mount_io_busy"
+        );
+        assert!(deep.get("daemonIoBlocked").is_none());
+        assert!(deep.get("daemonMountIoBlocked").is_none());
+        assert!(deep.get("localReady").is_none());
+        assert!(deep.get("ready").is_none());
     }
 
     #[test]
@@ -6328,12 +6626,67 @@ mod tests {
             .map(|offset| action_start + offset)
             .expect("dashboard helper should follow primary action");
         let action = &source[action_start..action_end];
+        let refresh_start = source
+            .find("const refresh = useCallback(async () =>")
+            .expect("refresh should exist");
+        let refresh_end = source[refresh_start..]
+            .find("useEffect(() =>")
+            .map(|offset| refresh_start + offset)
+            .expect("refresh effect should follow refresh callback");
+        let refresh = &source[refresh_start..refresh_end];
+        let deep_start = source
+            .find("async function runNetworkQualityCheck()")
+            .expect("deep network handler should exist");
+        let deep_end = source[deep_start..]
+            .find("async function runAction(")
+            .map(|offset| deep_start + offset)
+            .expect("lifecycle action should follow deep network handler");
+        let deep = &source[deep_start..deep_end];
+        let can_open_start = source
+            .find("const canOpenClaude = Boolean(")
+            .expect("open readiness should exist");
+        let can_open_end = source[can_open_start..]
+            .find("const mutationBusy")
+            .map(|offset| can_open_start + offset)
+            .expect("mutation busy state should follow open readiness");
+        let can_open = &source[can_open_start..can_open_end];
+        let backend_start = include_str!("lib.rs")
+            .find("fn get_claude_url_impl()")
+            .expect("Claude URL implementation should exist");
+        let backend_end = include_str!("lib.rs")[backend_start..]
+            .find("async fn open_claude_science(")
+            .map(|offset| backend_start + offset)
+            .expect("open command should follow URL implementation");
+        let backend = &include_str!("lib.rs")[backend_start..backend_end];
 
         assert!(action.contains("if (busyRef.current) return;"));
+        assert!(action.contains("if (canOpenClaude)"));
         assert!(action.contains("updateBusy(true);"));
         assert!(action.contains("setError(\"\");"));
         assert!(action.contains("await invoke<void>(\"open_claude_science\");"));
-        assert!(action.contains("setStatus(await invoke<SystemStatus>(\"get_system_status\"));"));
+        assert!(!action.contains("get_system_status"));
+        assert!(!refresh.contains("run_network_quality_check"));
+        assert!(deep.contains("invoke<NetworkQualityCheckResult>(\"run_network_quality_check\")"));
+        assert!(deep.contains("setStatus((current) =>"));
+        assert!(deep.contains("...current"));
+        assert!(deep.contains("...current.network"));
+        assert!(deep.contains("...next.deep"));
+        assert!(deep.contains("ready: current.network.localReady"));
+        assert!(!deep.contains("invoke<SystemStatus>(\"run_network_quality_check\")"));
+        assert!(!deep.contains("setStatus(next)"));
+        assert!(source.contains("const [networkChecking, setNetworkChecking] = useState(false);"));
+        assert!(source.contains("networkCheckingRef.current"));
+        assert!(can_open.contains("status.claudeRunning"));
+        assert!(!can_open.contains("status.network.daemonIoBlocked"));
+        assert!(!can_open.contains("status.network.localReady"));
+        assert!(!can_open.contains("status.bridgeHealthy"));
+        assert!(refresh.contains("networkCheckingRef.current"));
+        assert!(source.contains("const mutationBusy = busy || networkChecking;"));
+        assert!(source.contains("function tryBeginMutation()"));
+        assert!(source.contains("if (busyRef.current || networkCheckingRef.current) return false;"));
+        assert!(backend.contains("selected_distro_quick()"));
+        assert!(backend.contains("selected_linux_user_quick(&distro)"));
+        assert!(!backend.contains("current_status()"));
         assert!(source.contains("const statusCommitEpoch = useRef(0);"));
         assert!(source.contains("const requestEpoch = statusCommitEpoch.current;"));
         assert!(source.contains("requestEpoch !== statusCommitEpoch.current"));
