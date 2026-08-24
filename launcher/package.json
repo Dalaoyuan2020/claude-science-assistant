@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:lanes": "node --experimental-strip-types --test tests/all-probes-red.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

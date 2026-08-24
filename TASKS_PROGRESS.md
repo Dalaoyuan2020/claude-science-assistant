@@ -184,3 +184,21 @@ FAIL egress 0ms work.bridge_egress.not_implemented
 PASS grade 3947ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5589 exit=0
 ```
+
+## S3 完成
+
+做了什么：新增生产级 `laneContract.ts`，由 App 实际使用三车道 reducer 与纯 ALLOW 主按钮 selector；主按钮只读取 `AllowStatus + allowLoaded + allowActionBusy`，与设置 busy、Grade、Work 完全分离。Grade、沙盒深检与运行时更新统一使用硬期限、熔断、机器码分类和迟到结果丢弃；timeout/未测到显示灰色，确定故障显示红色并附“仍可打开 Claude Science”。运行时更新后端共享 40 秒总截止时间（小于前端 45 秒），API Key 自动映射的 PowerShell 进程补为 20 秒硬期限。
+
+证据在哪：`launcher/tests/all-probes-red.test.ts` 的 `all_probes_red_button_still_open` 构造出口 502、DrvFS D/p9、磁盘告警、代理冲突、identity 不匹配、canary/版本超时等全红组合，断言按钮仍为“打开 Claude Science”、`disabled=false` 且 ALLOW PID/8765/8766 不变；另有后端提前 timeout、语义 timeout 熔断、并发 supersede 与晚结果反例。Node 6 passed、0 failed；Rust 91 passed、0 failed、4 ignored；`npm run build`、self-test（54 translation tests + 35 passed/3 skipped）和独立最终复核均通过。完整 smoke 输出如下。
+
+下一步：进入 S4，在 WORK 车道新增 Bridge → 上游模型 API 的真实出口探针；复用 smoke 同一实现，现场识别 10808 死代理导致的 502，并只生成需用户确认的修复 Prompt，不自动改系统代理或 Key。
+
+```text
+PASS allow 429ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 429ms budget=3000ms
+PASS open 723ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 329ms health=200 models=200 identity=current modelCount=5
+FAIL egress 0ms work.bridge_egress.not_implemented
+PASS grade 4008ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5491 exit=0
+```

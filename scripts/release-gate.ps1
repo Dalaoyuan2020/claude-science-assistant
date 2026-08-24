@@ -87,6 +87,9 @@ try {
   Invoke-GateStep "frontend production build" $LauncherDir {
     & $npm run build
   }
+  Invoke-GateStep "ALLOW/GRADE/WORK lane contract tests" $LauncherDir {
+    & $npm run test:lanes
+  }
   Invoke-GateStep "Rust unit/integration tests" (Join-Path $LauncherDir "src-tauri") {
     $arguments = @("test", "--jobs", "1")
     if ($Offline) { $arguments += "--offline" }

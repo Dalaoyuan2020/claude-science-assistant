@@ -8,9 +8,24 @@ import {
   buildRuntimeUpgradePrompt,
   type RuntimeUpdateStatus,
 } from "./runtimeUpdate";
+import {
+  classifyNonGatingFailure,
+  createLaneState,
+  createProbeCircuit,
+  laneReducer,
+  nonGatingFailurePresentation,
+  nonGatingFailureIsMuted,
+  primaryButtonView,
+  runNonGatingProbe,
+  type AllowStatus,
+  type LaneState,
+} from "./laneContract";
 import "./App.css";
 
 const APP_VERSION = "V0.1.6";
+const GRADE_STATUS_TIMEOUT_MS = 15_000;
+const NETWORK_QUALITY_TIMEOUT_MS = 25_000;
+const RUNTIME_UPDATE_TIMEOUT_MS = 45_000;
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
 
@@ -61,23 +76,15 @@ interface WorkReport {
   warnings: string[];
 }
 
-interface AllowStatus {
-  wslInstalled: boolean;
-  distro?: string;
-  linuxUser?: string;
-  runtimePresent: boolean;
-  claudeRunning: boolean;
-  claudePid?: number;
-  listenerPresent: boolean;
-  pid8765?: number;
-  pid8766?: number;
-  daemonState: string;
-  listenerProbeOk: boolean;
-  controlSocketPresent: boolean;
-  windowsBridgePid?: number;
-  windowsBridgeProbe: "checked" | "present" | "port_conflict" | "unknown";
-  canOpen: boolean;
-  canStart: boolean;
+type WorkLaneValue =
+  | { probe: "network_quality"; value?: WorkReport; errorCode?: string }
+  | { probe: "runtime_update"; value?: RuntimeUpdateStatus; errorCode?: string };
+
+interface NonGatingProbeNotice {
+  source: "grade.status" | "work.network_quality" | "work.runtime_update";
+  code: string;
+  message: string;
+  muted: boolean;
 }
 
 interface GradeNetworkStatus {
@@ -131,23 +138,6 @@ interface GradeStatus {
   network: GradeNetworkStatus;
   warnings: string[];
 }
-
-const ALLOW_OPEN_INPUTS = ["claudeRunning", "windowsBridgePid"] as const satisfies readonly (keyof AllowStatus)[];
-const PRIMARY_LABEL_INPUTS = ["claudeRunning", "windowsBridgePid", "runtimePresent"] as const satisfies readonly (keyof AllowStatus)[];
-type AllowOpenInput = (typeof ALLOW_OPEN_INPUTS)[number];
-type PrimaryLabelInput = (typeof PRIMARY_LABEL_INPUTS)[number];
-
-const canOpenFromAllow = (allow: Pick<AllowStatus, AllowOpenInput>) => Boolean(
-  allow.claudeRunning
-  && !allow.windowsBridgePid
-);
-
-const primaryLabelFromAllow = (allow: Pick<AllowStatus, PrimaryLabelInput>) => {
-  if (allow.windowsBridgePid) return "先停止旧 Windows Bridge";
-  if (canOpenFromAllow(allow)) return "打开 Claude Science";
-  if (!allow.runtimePresent) return "安装运行环境";
-  return "启动 Claude Science";
-};
 
 interface SystemStatus {
   state: SystemState;
@@ -641,8 +631,10 @@ function App() {
   const [testingKey, setTestingKey] = useState(false);
   const [autoMappingKey, setAutoMappingKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [allowActionBusy, setAllowActionBusy] = useState(false);
   const [networkChecking, setNetworkChecking] = useState(false);
   const [workWarnings, setWorkWarnings] = useState<string[]>([]);
+  const [probeNotice, setProbeNotice] = useState<NonGatingProbeNotice>();
   const [error, setError] = useState("");
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
   const [apiSectionCollapsed, setApiSectionCollapsed] = useState(initialApiSectionCollapsed);
@@ -656,9 +648,17 @@ function App() {
   const allowRefreshEpoch = useRef(0);
   const gradeRefreshInFlight = useRef(false);
   const busyRef = useRef(false);
+  const allowActionBusyRef = useRef(false);
   const networkCheckingRef = useRef(false);
   const statusCommitEpoch = useRef(0);
   const runtimeInitializationAttempted = useRef(false);
+  const runtimeCheckingRef = useRef(false);
+  const laneStateRef = useRef<LaneState<AllowStatus, SystemStatus, WorkLaneValue | undefined>>(
+    createLaneState(initialAllowStatus, initialStatus, undefined),
+  );
+  const gradeStatusCircuitRef = useRef(createProbeCircuit());
+  const networkQualityCircuitRef = useRef(createProbeCircuit());
+  const runtimeUpdateCircuitRef = useRef(createProbeCircuit());
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
@@ -678,14 +678,21 @@ function App() {
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
   const deepNetworkReady = status.network.deepChecked && status.network.sandboxEgressState === "ok";
-  const canOpenClaude = canOpenFromAllow(allowStatus);
+  const primaryButton = useMemo(
+    () => primaryButtonView(allowStatus, allowLoaded, allowActionBusy),
+    [allowActionBusy, allowLoaded, allowStatus],
+  );
+  const canOpenClaude = primaryButton.action === "open";
   const mutationBusy = busy || networkChecking;
-  const summary = status.state === "running" && !deepNetworkReady
+  const baseSummary = status.state === "running" && !deepNetworkReady
     ? {
       title: "Claude Science 已准备好",
       detail: "Bridge、本地端口与 3/3 沙盒出口拓扑已验证；外部 API 深度质检不影响打开",
     }
     : stateText[status.state];
+  const summary = canOpenClaude && ["degraded", "error"].includes(status.state)
+    ? { ...baseSummary, detail: nonGatingFailurePresentation(baseSummary.detail, allowStatus) }
+    : baseSummary;
   const storageStatus = useMemo(
     () => ({ ...status, distro: allowStatus.distro }),
     [allowStatus.distro, status],
@@ -699,16 +706,22 @@ function App() {
       : buildRuntimeRollbackPrompt(runtimeUpdate);
   }, [runtimePromptMode, runtimeUpdate]);
 
+  const commitAllowStatus = useCallback((next: AllowStatus) => {
+    const reduced = laneReducer(laneStateRef.current, { lane: "allow", value: next });
+    laneStateRef.current = reduced;
+    setAllowStatus(reduced.allow);
+  }, []);
+
   const refreshAllow = useCallback(async () => {
     const requestEpoch = ++allowRefreshEpoch.current;
     const next = isTauri
       ? await invoke<AllowStatus>("get_allow_status")
       : browserPreviewAllowStatus;
     if (requestEpoch !== allowRefreshEpoch.current) return next;
-    setAllowStatus(next);
+    commitAllowStatus(next);
     setAllowLoaded(true);
     return next;
-  }, [isTauri]);
+  }, [commitAllowStatus, isTauri]);
 
   const refreshGrade = useCallback(async () => {
     if (gradeRefreshInFlight.current) return;
@@ -716,14 +729,48 @@ function App() {
     const requestEpoch = statusCommitEpoch.current;
     try {
       if (!isTauri) {
-        setStatus(browserPreviewStatus);
+        const reduced = laneReducer(laneStateRef.current, { lane: "grade", value: browserPreviewStatus });
+        laneStateRef.current = reduced;
+        setStatus(reduced.grade);
         return;
       }
-      const next = await invoke<GradeStatus>("get_grade_status");
+      const result = await runNonGatingProbe<GradeStatus>({
+        lane: "grade",
+        key: "status",
+        timeoutMs: GRADE_STATUS_TIMEOUT_MS,
+        circuit: gradeStatusCircuitRef.current,
+        task: () => invoke<GradeStatus>("get_grade_status"),
+        classifyValue: (value) => classifyNonGatingFailure(
+          "grade",
+          "status",
+          value.warnings.join("\n"),
+        ),
+      });
       if (requestEpoch !== statusCommitEpoch.current) return;
-      setStatus((current) => mergeGradeStatus(current, next));
-    } catch (reason) {
-      if (requestEpoch === statusCommitEpoch.current) setError(String(reason));
+      if (!result.ok) {
+        setProbeNotice({
+          source: "grade.status",
+          code: result.code,
+          message: result.message,
+          muted: nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped),
+        });
+        return;
+      }
+      setProbeNotice((current) => current?.source === "grade.status" ? undefined : current);
+      setStatus((current) => {
+        const merged = mergeGradeStatus(current, result.value);
+        const reduced = laneReducer(laneStateRef.current, { lane: "grade", value: merged });
+        laneStateRef.current = reduced;
+        return reduced.grade;
+      });
+      if (result.value.state === "error") {
+        setProbeNotice({
+          source: "grade.status",
+          code: "grade.status.failed",
+          message: result.value.warnings.join("；") || "GRADE probes reported a confirmed failure",
+          muted: false,
+        });
+      }
     } finally {
       gradeRefreshInFlight.current = false;
     }
@@ -793,8 +840,6 @@ function App() {
     };
   }, [initializeRuntimeInBackground, isTauri, refreshAllow, refreshGrade]);
 
-  const primaryLabel = useMemo(() => primaryLabelFromAllow(allowStatus), [allowStatus]);
-
   function updateBusy(value: boolean) {
     if (value) {
       // Invalidate any slower periodic refresh that started before this user
@@ -803,6 +848,16 @@ function App() {
     }
     busyRef.current = value;
     setBusy(value);
+  }
+
+  function updateAllowActionBusy(value: boolean) {
+    if (value) {
+      // ALLOW user actions invalidate older Grade commits without sharing their
+      // busy flag with settings, Grade, or Work operations.
+      statusCommitEpoch.current += 1;
+    }
+    allowActionBusyRef.current = value;
+    setAllowActionBusy(value);
   }
 
   function tryBeginMutation() {
@@ -887,10 +942,11 @@ function App() {
     if (networkCheckingRef.current) return;
     networkCheckingRef.current = true;
     setNetworkChecking(true);
-    statusCommitEpoch.current += 1;
-    const checkEpoch = statusCommitEpoch.current;
     const commitNetworkResult = (next: WorkReport) => {
-      if (checkEpoch !== statusCommitEpoch.current) return;
+      laneStateRef.current = laneReducer(laneStateRef.current, {
+        lane: "work",
+        value: { probe: "network_quality", value: next },
+      });
       setStatus((current) => ({
         ...current,
         network: next.deep
@@ -906,10 +962,15 @@ function App() {
       }));
       setWorkWarnings(next.warnings);
     };
-    setError("");
     try {
-      if (!isTauri) {
-        const next: WorkReport = {
+      const result = await runNonGatingProbe<WorkReport>({
+        lane: "work",
+        key: "network_quality",
+        timeoutMs: NETWORK_QUALITY_TIMEOUT_MS,
+        circuit: networkQualityCircuitRef.current,
+        task: () => isTauri
+          ? invoke<WorkReport>("run_network_quality_check")
+          : Promise.resolve({
           operation: "network_quality",
           ok: true,
           code: "work.network_quality.ok",
@@ -923,14 +984,42 @@ function App() {
             sandboxEgressHttpStatus: 200,
           },
           warnings: browserPreviewStatus.warnings,
-        };
-        commitNetworkResult(next);
-      } else {
-        const next = await invoke<WorkReport>("run_network_quality_check");
-        commitNetworkResult(next);
+        }),
+        classifyValue: (value) => value.ok
+          ? undefined
+          : classifyNonGatingFailure(
+            "work",
+            "network_quality",
+            `${value.code}: ${value.warnings.join("；")}`,
+          ),
+      });
+      if (!result.ok) {
+        laneStateRef.current = laneReducer(laneStateRef.current, {
+          lane: "work",
+          value: { probe: "network_quality", errorCode: result.code },
+        });
+        setWorkWarnings([]);
+        setProbeNotice({
+          source: "work.network_quality",
+          code: result.code,
+          message: result.message,
+          muted: nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped),
+        });
+        return;
       }
-    } catch (reason) {
-      if (checkEpoch === statusCommitEpoch.current) setError(String(reason));
+      commitNetworkResult(result.value);
+      if (!result.value.ok) {
+        const muted = nonGatingFailureIsMuted(result.value.code);
+        if (muted) setWorkWarnings([]);
+        setProbeNotice({
+          source: "work.network_quality",
+          code: result.value.code,
+          message: result.value.warnings.join("；") || "network quality probe reported a confirmed failure",
+          muted,
+        });
+      } else {
+        setProbeNotice((current) => current?.source === "work.network_quality" ? undefined : current);
+      }
     } finally {
       networkCheckingRef.current = false;
       setNetworkChecking(false);
@@ -938,8 +1027,8 @@ function App() {
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
-    if (busyRef.current) return;
-    updateBusy(true);
+    if (allowActionBusyRef.current) return;
+    updateAllowActionBusy(true);
     setError("");
     let actionFailed = false;
     try {
@@ -953,7 +1042,7 @@ function App() {
       } catch (reason) {
         if (!actionFailed) setError(String(reason));
       }
-      updateBusy(false);
+      updateAllowActionBusy(false);
       void refreshGrade();
     }
   }
@@ -1358,10 +1447,10 @@ function App() {
   }
 
   async function primaryAction() {
-    if (!allowLoaded || busyRef.current) return;
-    if (allowStatus.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
-    if (canOpenClaude) {
-      updateBusy(true);
+    if (primaryButton.disabled || allowActionBusyRef.current) return;
+    if (primaryButton.action === "stop_legacy_bridge") return runAction("stop_legacy_windows_bridge");
+    if (primaryButton.action === "open") {
+      updateAllowActionBusy(true);
       setError("");
       try {
         await invoke<void>("open_claude_science");
@@ -1370,11 +1459,11 @@ function App() {
         // can take minutes on DrvFS and must not keep the Open button locked.
         setError(String(reason));
       } finally {
-        updateBusy(false);
+        updateAllowActionBusy(false);
       }
       return;
     }
-    if (!allowStatus.runtimePresent) {
+    if (primaryButton.action === "install") {
       setError("runtime.install_required: 请先在解压目录运行体检 Skill：repair-approved.ps1 -PlanOnly；确认计划后再执行 -ApproveInstall -StartServices。");
       return;
     }
@@ -1421,16 +1510,45 @@ function App() {
   }
 
   async function checkRuntimeUpdate() {
+    if (runtimeCheckingRef.current) return;
+    runtimeCheckingRef.current = true;
     setRuntimeChecking(true);
     setRuntimeError("");
     try {
-      const next = isTauri
-        ? await invoke<RuntimeUpdateStatus>("get_runtime_update_status")
-        : browserPreviewRuntimeStatus;
-      setRuntimeUpdate(next);
-    } catch (reason) {
-      setRuntimeError(String(reason));
+      const result = await runNonGatingProbe<RuntimeUpdateStatus>({
+        lane: "work",
+        key: "runtime_update",
+        timeoutMs: RUNTIME_UPDATE_TIMEOUT_MS,
+        circuit: runtimeUpdateCircuitRef.current,
+        task: () => isTauri
+          ? invoke<RuntimeUpdateStatus>("get_runtime_update_status")
+          : Promise.resolve(browserPreviewRuntimeStatus),
+      });
+      if (!result.ok) {
+        laneStateRef.current = laneReducer(laneStateRef.current, {
+          lane: "work",
+          value: { probe: "runtime_update", errorCode: result.code },
+        });
+        const muted = nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped);
+        setProbeNotice({
+          source: "work.runtime_update",
+          code: result.code,
+          message: result.message,
+          muted,
+        });
+        if (!muted) {
+          setRuntimeError(nonGatingFailurePresentation(`${result.code}: ${result.message}`, allowStatus));
+        }
+        return;
+      }
+      laneStateRef.current = laneReducer(laneStateRef.current, {
+        lane: "work",
+        value: { probe: "runtime_update", value: result.value },
+      });
+      setProbeNotice((current) => current?.source === "work.runtime_update" ? undefined : current);
+      setRuntimeUpdate(result.value);
     } finally {
+      runtimeCheckingRef.current = false;
       setRuntimeChecking(false);
     }
   }
@@ -1516,9 +1634,9 @@ function App() {
         <button
           className="primary-button"
           onClick={primaryAction}
-          disabled={busy || !allowLoaded}
+          disabled={primaryButton.disabled}
         >
-          {primaryLabel}
+          {primaryButton.label}
         </button>
       </section>
 
@@ -1573,14 +1691,24 @@ function App() {
         )}
       </section>
 
+      {probeNotice && (
+        <section className={`notice ${probeNotice.muted ? "probe-muted" : "probe-failure"}`} role="status">
+          <strong>{probeNotice.muted ? "检测暂不可用" : "检测到非阻断故障"}</strong>
+          <p>{nonGatingFailurePresentation(`${probeNotice.code}: ${probeNotice.message}`, allowStatus)}</p>
+        </section>
+      )}
+
       {(error || status.warnings.length > 0 || workWarnings.length > 0) && (
         <section className="notice" role="alert">
           <strong>诊断信息</strong>
           {error && <p>{error}</p>}
           {status.warnings.map((warning) => <p key={warning}>{warning}</p>)}
           {workWarnings.map((warning) => <p key={`work:${warning}`}>{warning}</p>)}
+          {canOpenClaude && (status.warnings.length > 0 || workWarnings.length > 0) && (
+            <p>上述诊断属于 GRADE/WORK，仍可打开 Claude Science</p>
+          )}
           {allowStatus.windowsBridgePid && (
-            <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={mutationBusy}>
+            <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={allowActionBusy}>
               停止旧 Windows Bridge（PID {allowStatus.windowsBridgePid}）
             </button>
           )}
@@ -2145,8 +2273,8 @@ function App() {
         <span>{allowStatus.linuxUser && allowStatus.distro ? `${allowStatus.linuxUser} · ${allowStatus.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
           <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
-          <button onClick={() => runAction("restart_services")} disabled={mutationBusy || !allowStatus.wslInstalled || status.restartBlocked}>重启</button>
-          <button onClick={() => runAction("stop_services")} disabled={mutationBusy || (!status.bridgeRunning && !allowStatus.claudeRunning)}>停止</button>
+          <button onClick={() => runAction("restart_services")} disabled={allowActionBusy || !allowStatus.wslInstalled || status.restartBlocked}>重启</button>
+          <button onClick={() => runAction("stop_services")} disabled={allowActionBusy || (!status.bridgeRunning && !allowStatus.claudeRunning)}>停止</button>
         </div>
       </footer>
     </main>

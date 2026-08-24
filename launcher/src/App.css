@@ -24,7 +24,8 @@ button, input, textarea { font: inherit; }
 .status-orb { width: 70px; height: 70px; border: 1px solid #ffffff3d; border-radius: 50%; display: grid; place-items: center; background: #ffffff0d; }
 .status-orb span { width: 20px; height: 20px; border-radius: 50%; background: #c9d1cc; box-shadow: 0 0 0 8px #ffffff14; }
 .state-running .status-orb span { background: #85e6aa; box-shadow: 0 0 0 8px #85e6aa20, 0 0 22px #85e6aa75; }
-.state-degraded .status-orb span, .state-error .status-orb span { background: #ffbf72; }
+.state-degraded .status-orb span { background: #ffbf72; }
+.state-error .status-orb span { background: #ff7c6f; }
 .state-loading .status-orb span { animation: breathe 1.3s ease-in-out infinite; }
 @keyframes breathe { 50% { transform: scale(.72); opacity: .55; } }
 .eyebrow { display: block; text-transform: uppercase; letter-spacing: .16em; font-size: 10px; font-weight: 700; opacity: .7; }
@@ -53,6 +54,8 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 
 .notice { border: 1px solid #efd8b1; border-radius: 14px; padding: 13px 16px; margin: -12px 0 24px; color: #744f19; background: #fff8e9; font-size: 12px; }
 .notice p { margin: 4px 0 0; }
+.notice.probe-muted { border-color: #d6dcd7; color: #667169; background: #f1f4f1; }
+.notice.probe-failure { border-color: #e2aaa0; color: #7a3027; background: #fff0ed; }
 .notice-action { margin-top: 10px; border: 1px solid #d9b97e; border-radius: 9px; padding: 7px 10px; color: #68440e; background: #fffdf7; cursor: pointer; font-size: 11px; font-weight: 700; }
 
 .migration-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: #10201980; backdrop-filter: blur(4px); }

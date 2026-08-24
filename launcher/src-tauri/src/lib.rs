@@ -696,6 +696,7 @@ struct WindowsStorageSnapshot {
     vhdx_size_bytes: Option<u64>,
     settings_drive: Option<String>,
     settings_drive_free_bytes: Option<u64>,
+    diagnostic: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1323,17 +1324,25 @@ fn legacy_windows_bridge_pid() -> Option<u32> {
         .and_then(|output| parse_first_pid(&output_text(&output)))
 }
 
-fn windows_path_to_wsl(distro: &str, path: &Path) -> Option<String> {
+fn windows_path_to_wsl_result(distro: &str, path: &Path) -> Result<String, String> {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    let output = run_wsl(distro, &["wslpath", "-a", &normalized]).ok()?;
+    let output = run_wsl(distro, &["wslpath", "-a", &normalized])?;
     if !output.status.success() {
-        return None;
+        return Err(format!(
+            "wslpath failed: {}",
+            clean_diagnostic_text(&command_error_text(&output))
+        ));
     }
     output_text(&output)
         .lines()
         .map(str::trim)
         .find(|line| line.starts_with('/'))
         .map(ToOwned::to_owned)
+        .ok_or_else(|| "wslpath did not return an absolute Linux path".to_string())
+}
+
+fn windows_path_to_wsl(distro: &str, path: &Path) -> Option<String> {
+    windows_path_to_wsl_result(distro, path).ok()
 }
 
 fn windows_storage_snapshot(distro: &str) -> WindowsStorageSnapshot {
@@ -1388,13 +1397,24 @@ $vhdxItem = if ($vhdx -and (Test-Path -LiteralPath $vhdx)) { Get-Item -LiteralPa
     .replace("__SETTINGS_PATH__", &settings);
     let mut command = background_command("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    let Ok(output) =
-        command_output_with_timeout(command, Duration::from_secs(5), "WSL 存储位置检查")
-    else {
-        return WindowsStorageSnapshot::default();
-    };
+    let output =
+        match command_output_with_timeout(command, Duration::from_secs(5), "WSL 存储位置检查")
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return WindowsStorageSnapshot {
+                    diagnostic: Some(grade_probe_diagnostic("storage_snapshot", &error)),
+                    ..WindowsStorageSnapshot::default()
+                };
+            }
+        };
     let Ok(data) = serde_json::from_str::<serde_json::Value>(&output_text(&output)) else {
-        return WindowsStorageSnapshot::default();
+        return WindowsStorageSnapshot {
+            diagnostic: Some(
+                "grade.storage_snapshot.failed: Windows storage probe returned invalid JSON".into(),
+            ),
+            ..WindowsStorageSnapshot::default()
+        };
     };
     WindowsStorageSnapshot {
         wsl_base_path: data
@@ -1418,7 +1438,20 @@ $vhdxItem = if ($vhdx -and (Test-Path -LiteralPath $vhdx)) { Get-Item -LiteralPa
         settings_drive_free_bytes: data
             .get("settings_drive_free_bytes")
             .and_then(serde_json::Value::as_u64),
+        diagnostic: None,
     }
+}
+
+fn grade_probe_diagnostic(probe: &str, error: &str) -> String {
+    let suffix = if error.to_ascii_lowercase().contains("timeout")
+        || error.contains("超时")
+        || error.contains("没有响应")
+    {
+        "timeout"
+    } else {
+        "failed"
+    };
+    format!("grade.{probe}.{suffix}: {error}")
 }
 
 fn rounded_gb_from_bytes(bytes: u64) -> f64 {
@@ -1495,7 +1528,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
     let distros = match discover_distros() {
         Ok(items) => items,
         Err(error) => {
-            warnings.push(error);
+            warnings.push(grade_probe_diagnostic("wsl_discovery", &error));
             return SystemStatus {
                 state: "notInstalled".into(),
                 wsl_installed: false,
@@ -1581,6 +1614,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         warnings.push(format!("推荐使用 Ubuntu-24.04；当前兼容使用 {}。", distro));
     }
     let windows_storage = windows_storage_snapshot(&distro);
+    if let Some(diagnostic) = windows_storage.diagnostic.clone() {
+        warnings.push(diagnostic);
+    }
     let wsl_storage_free_gb = windows_storage
         .wsl_drive_free_bytes
         .map(rounded_gb_from_bytes);
@@ -1590,13 +1626,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         .map(rounded_gb_from_bytes);
     let wsl_on_system_drive = is_windows_system_drive(windows_storage.wsl_drive.as_deref());
     let project_files_present = project_runtime_files_present();
-    let project_wsl = project_root()
-        .ok()
-        .and_then(|root| windows_path_to_wsl(&distro, &root));
-    let probe = project_wsl
-        .as_deref()
-        .ok_or_else(|| "无法把当前 CSA 目录转换为 WSL 路径".to_string())
-        .and_then(|path| inspect_wsl_runtime(&distro, path, deep_network_probe));
+    let probe = project_root()
+        .and_then(|root| windows_path_to_wsl_result(&distro, &root))
+        .and_then(|path| inspect_wsl_runtime(&distro, &path, deep_network_probe));
     let probe = match probe {
         Ok(probe) => probe,
         Err(error) => {
@@ -1605,7 +1637,8 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                     .map(|free| free < 1.0)
                     .unwrap_or(false);
             warnings.push(format!(
-                "{error}。启动器已停止后续探测：若 WSL 本身无响应，请检查宿主盘空间与 VHDX；若体检脚本缺失，请重新解压完整 Release ZIP。"
+                "{}。启动器已停止后续探测：若 WSL 本身无响应，请检查宿主盘空间与 VHDX；若体检脚本缺失，请重新解压完整 Release ZIP。",
+                grade_probe_diagnostic("wsl_inspection", &error)
             ));
             return SystemStatus {
                 state: "degraded".into(),
@@ -4174,7 +4207,12 @@ try {
 "#;
     let input = serde_json::to_string(&payload)
         .map_err(|error| format!("无法准备自动映射请求：{error}"))?;
-    let output = run_powershell_with_stdin(script, &input)?;
+    let output = run_powershell_with_stdin_timeout(
+        script,
+        &input,
+        Duration::from_secs(20),
+        "API Key 自动映射",
+    )?;
     let output = redact_secret_text(&output, clean_key);
     let fetch: ModelListFetchResult = serde_json::from_str(&output)
         .map_err(|error| format!("自动映射结果解析失败：{error}; {output}"))?;
@@ -4797,7 +4835,23 @@ fn checked_release_text(output: Output, max_bytes: usize) -> Result<String, Stri
     Ok(text)
 }
 
-fn fetch_official_release_text(relative_path: &str, max_bytes: usize) -> Result<String, String> {
+const RUNTIME_UPDATE_BACKEND_BUDGET: Duration = Duration::from_secs(40);
+
+fn runtime_update_deadline_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            "work.runtime_update.timeout: runtime update probe exceeded its backend deadline"
+                .to_string()
+        })
+}
+
+fn fetch_official_release_text(
+    relative_path: &str,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<String, String> {
     if relative_path.is_empty()
         || relative_path.starts_with('/')
         || relative_path.contains("..")
@@ -4824,18 +4878,21 @@ fn fetch_official_release_text(relative_path: &str, max_bytes: usize) -> Result<
         "65536",
         &url,
     ]);
-    let windows_result =
-        command_output_with_timeout(command, Duration::from_secs(15), "检查官方版本")
-            .and_then(|output| checked_release_text(output, max_bytes));
+    let windows_timeout = runtime_update_deadline_remaining(deadline)?.min(Duration::from_secs(15));
+    let windows_result = command_output_with_timeout(command, windows_timeout, "检查官方版本")
+        .and_then(|output| checked_release_text(output, max_bytes));
     if let Ok(text) = windows_result.as_ref() {
         return Ok(text.clone());
     }
 
-    let wsl_result = discover_distros()
-        .ok()
-        .and_then(|distros| preferred_distro(&distros))
-        .ok_or_else(|| "没有可用于版本检查的 WSL 发行版".to_string())
+    let distro_timeout = runtime_update_deadline_remaining(deadline)?.min(Duration::from_secs(5));
+    let wsl_result = discover_distros_with_timeout(distro_timeout)
+        .and_then(|distros| {
+            preferred_distro(&distros).ok_or_else(|| "没有可用于版本检查的 WSL 发行版".to_string())
+        })
         .and_then(|distro| {
+            let wsl_timeout =
+                runtime_update_deadline_remaining(deadline)?.min(Duration::from_secs(15));
             run_wsl_with_timeout(
                 &distro,
                 &[
@@ -4853,7 +4910,7 @@ fn fetch_official_release_text(relative_path: &str, max_bytes: usize) -> Result<
                     "65536",
                     &url,
                 ],
-                Duration::from_secs(15),
+                wsl_timeout,
             )
         })
         .and_then(|output| checked_release_text(output, max_bytes));
@@ -4929,18 +4986,26 @@ fn release_is_newer(candidate: &str, current: &str) -> bool {
 }
 
 fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
-    let latest_pointer = fetch_official_release_text("latest", 128)?.to_ascii_lowercase();
-    let stable_pointer = fetch_official_release_text("stable", 128)?.to_ascii_lowercase();
+    let deadline = Instant::now() + RUNTIME_UPDATE_BACKEND_BUDGET;
+    let latest_pointer = fetch_official_release_text("latest", 128, deadline)?.to_ascii_lowercase();
+    let stable_pointer = fetch_official_release_text("stable", 128, deadline)?.to_ascii_lowercase();
     if !valid_release_sha8(&latest_pointer) || !valid_release_sha8(&stable_pointer) {
         return Err("Claude Science 官方版本指针格式无效".into());
     }
 
-    let latest_manifest =
-        fetch_official_release_text(&format!("{latest_pointer}/manifest.json"), 64 * 1024)?;
+    let latest_manifest = fetch_official_release_text(
+        &format!("{latest_pointer}/manifest.json"),
+        64 * 1024,
+        deadline,
+    )?;
     let stable_manifest = if latest_pointer == stable_pointer {
         latest_manifest.clone()
     } else {
-        fetch_official_release_text(&format!("{stable_pointer}/manifest.json"), 64 * 1024)?
+        fetch_official_release_text(
+            &format!("{stable_pointer}/manifest.json"),
+            64 * 1024,
+            deadline,
+        )?
     };
     let latest = parse_official_release_manifest(&latest_pointer, &latest_manifest)?;
     let stable = parse_official_release_manifest(&stable_pointer, &stable_manifest)?;
@@ -5972,15 +6037,16 @@ mod tests {
     fn allow_inputs_frozen() {
         const TAX_MESSAGE: &str =
             "ALLOW 输入集合被改动。改它要走 §4.4 的税单（改测试 + 改合同 + 反例测试 + 错误前缀）。";
-        let source = include_str!("../../src/App.tsx");
-        let can_open_start = source
-            .find("const canOpenFromAllow =")
+        let contract = include_str!("../../src/laneContract.ts");
+        let app = include_str!("../../src/App.tsx");
+        let can_open_start = contract
+            .find("export const canOpenFromAllow =")
             .expect("canOpenFromAllow should exist");
-        let can_open_end = source[can_open_start..]
-            .find("const primaryLabelFromAllow =")
+        let can_open_end = contract[can_open_start..]
+            .find("export const primaryLabelFromAllow =")
             .map(|offset| can_open_start + offset)
             .expect("primaryLabelFromAllow should follow canOpenFromAllow");
-        let can_open = &source[can_open_start..can_open_end];
+        let can_open = &contract[can_open_start..can_open_end];
         let actual_can_open_inputs = ts_member_inputs(can_open, "allow");
         let expected_can_open_inputs = ALLOW_OPEN_INPUTS
             .into_iter()
@@ -5991,22 +6057,22 @@ mod tests {
             "{TAX_MESSAGE}"
         );
         assert!(
-            source.contains(
-                "const ALLOW_OPEN_INPUTS = [\"claudeRunning\", \"windowsBridgePid\"] as const"
+            contract.contains(
+                "export const ALLOW_OPEN_INPUTS = [\"claudeRunning\", \"windowsBridgePid\"] as const"
             ),
             "{TAX_MESSAGE}"
         );
         assert!(
-            source.contains("const canOpenClaude = canOpenFromAllow(allowStatus);"),
-            "产品主路径必须调用冻结后的 ALLOW 判据。{TAX_MESSAGE}"
+            app.contains("() => primaryButtonView(allowStatus, allowLoaded, allowActionBusy)"),
+            "产品主路径必须调用冻结后的主按钮选择器。{TAX_MESSAGE}"
         );
 
         let label_start = can_open_end;
-        let label_end = source[label_start..]
-            .find("interface SystemStatus")
+        let label_end = contract[label_start..]
+            .find("export type PrimaryAllowAction")
             .map(|offset| label_start + offset)
-            .expect("SystemStatus should follow the label helper");
-        let label_helper = &source[label_start..label_end];
+            .expect("primary action type should follow the label helper");
+        let label_helper = &contract[label_start..label_end];
         let mut label_inputs = ts_member_inputs(label_helper, "allow");
         if label_helper.contains("canOpenFromAllow(allow)") {
             label_inputs.extend(actual_can_open_inputs);
@@ -6052,23 +6118,75 @@ mod tests {
                 "主按钮文案混入了 GRADE/WORK 输入 {forbidden}。{TAX_MESSAGE}"
             );
         }
+
+        let view_start = contract
+            .find("export function primaryButtonView(")
+            .expect("primaryButtonView should exist");
+        let view_end = contract[view_start..]
+            .find("export function nonGatingFailurePresentation(")
+            .map(|offset| view_start + offset)
+            .expect("non-gating presentation helper should follow primary button selector");
+        let view = &contract[view_start..view_end];
+        assert!(view.contains("label: primaryLabelFromAllow(allow)"));
+        assert!(view.contains("disabled: !allowLoaded || allowActionBusy"));
+        for forbidden in [
+            "status",
+            "network",
+            "workWarnings",
+            "restartBlocked",
+            "busyRef",
+        ] {
+            assert!(
+                !view.contains(forbidden),
+                "主按钮选择器混入了 GRADE/WORK/全局忙状态 {forbidden}。{TAX_MESSAGE}"
+            );
+        }
+
         assert!(
-            source.contains(
-                "const primaryLabel = useMemo(() => primaryLabelFromAllow(allowStatus), [allowStatus]);"
-            ),
-            "产品主路径必须只用 AllowStatus 生成主按钮文案。{TAX_MESSAGE}"
+            app.contains("const primaryButton = useMemo("),
+            "产品主路径必须保存冻结选择器的结果。{TAX_MESSAGE}"
         );
-        let button_start = source
+        let selector_start = app
+            .find("const primaryButton = useMemo(")
+            .expect("primary button selector should exist");
+        let selector_end = app[selector_start..]
+            .find("const mutationBusy")
+            .map(|offset| selector_start + offset)
+            .expect("mutation busy declaration should follow primary selector");
+        let selector = &app[selector_start..selector_end];
+        assert!(selector.contains("primaryButtonView(allowStatus, allowLoaded, allowActionBusy)"));
+        assert!(selector.contains("const canOpenClaude = primaryButton.action === \"open\""));
+        for forbidden in [
+            "status",
+            "network",
+            "workWarnings",
+            "restartBlocked",
+            "busyRef",
+        ] {
+            assert!(
+                !selector.contains(forbidden),
+                "产品主按钮选择路径混入了 GRADE/WORK/全局忙状态 {forbidden}。{TAX_MESSAGE}"
+            );
+        }
+
+        let button_start = app
             .find("className=\"primary-button\"")
             .expect("primary button should exist");
-        let button_end = source[button_start..]
+        let button_end = app[button_start..]
             .find("</button>")
             .map(|offset| button_start + offset)
             .expect("primary button should close");
-        let button = &source[button_start..button_end];
-        assert!(button.contains("disabled={busy || !allowLoaded}"));
-        assert!(button.contains("{primaryLabel}"));
-        for forbidden in ["status.", "networkChecking", "restartBlocked", "正在处理"] {
+        let button = &app[button_start..button_end];
+        assert!(button.contains("disabled={primaryButton.disabled}"));
+        assert!(button.contains("{primaryButton.label}"));
+        for forbidden in [
+            "status",
+            "network",
+            "workWarnings",
+            "restartBlocked",
+            "busy",
+            "正在处理",
+        ] {
             assert!(
                 !button.contains(forbidden),
                 "主按钮渲染混入了 GRADE/WORK 输入 {forbidden}。{TAX_MESSAGE}"
@@ -7483,8 +7601,18 @@ mod tests {
             .map(|offset| grade_start + offset)
             .expect("initializer should follow GRADE refresh");
         let grade = &source[grade_start..grade_end];
+        assert!(grade.contains("await runNonGatingProbe<GradeStatus>({"));
+        assert!(grade.contains("lane: \"grade\""));
+        assert!(grade.contains("key: \"status\""));
+        assert!(grade.contains("timeoutMs: GRADE_STATUS_TIMEOUT_MS"));
+        assert!(grade.contains("circuit: gradeStatusCircuitRef.current"));
         assert!(grade.contains("invoke<GradeStatus>(\"get_grade_status\")"));
-        assert!(grade.contains("setStatus((current) => mergeGradeStatus(current, next))"));
+        assert!(grade.contains("setStatus((current) => {"));
+        assert!(grade.contains("const merged = mergeGradeStatus(current, result.value)"));
+        assert!(
+            grade.contains("laneReducer(laneStateRef.current, { lane: \"grade\", value: merged })")
+        );
+        assert!(grade.contains("return reduced.grade"));
         for forbidden in [
             "get_allow_status",
             "initialize_runtime",
@@ -7550,6 +7678,17 @@ mod tests {
     #[test]
     fn primary_button_is_not_blocked_by_grade_or_work() {
         let source = include_str!("../../src/App.tsx");
+        let selector_start = source
+            .find("const primaryButton = useMemo(")
+            .expect("primary button selector should exist");
+        let selector_end = source[selector_start..]
+            .find("const mutationBusy")
+            .map(|offset| selector_start + offset)
+            .expect("mutation busy state should follow primary selector");
+        let selector = &source[selector_start..selector_end];
+        assert!(selector.contains("primaryButtonView(allowStatus, allowLoaded, allowActionBusy)"));
+        assert!(selector.contains("const canOpenClaude = primaryButton.action === \"open\""));
+
         let button_start = source
             .find("className=\"primary-button\"")
             .expect("primary button should exist");
@@ -7558,16 +7697,201 @@ mod tests {
             .map(|offset| button_start + offset)
             .expect("primary button should close");
         let button = &source[button_start..button_end];
-        assert!(button.contains("disabled={busy || !allowLoaded}"));
-        assert!(button.contains("{primaryLabel}"));
+        assert!(button.contains("disabled={primaryButton.disabled}"));
+        assert!(button.contains("{primaryButton.label}"));
+
+        let action_start = source
+            .find("async function primaryAction()")
+            .expect("primary action should exist");
+        let action_end = source[action_start..]
+            .find("async function openDashboard(")
+            .map(|offset| action_start + offset)
+            .expect("dashboard helper should follow primary action");
+        let action = &source[action_start..action_end];
+        assert!(
+            action.contains("if (primaryButton.disabled || allowActionBusyRef.current) return;")
+        );
+        assert!(action.contains("primaryButton.action === \"stop_legacy_bridge\""));
+        assert!(action.contains("primaryButton.action === \"open\""));
+        assert!(action.contains("primaryButton.action === \"install\""));
+        assert!(action.contains("updateAllowActionBusy(true)"));
+        assert!(action.contains("updateAllowActionBusy(false)"));
+
         for forbidden in [
-            "status",
+            "status.",
+            "status[",
+            "network.",
+            "network[",
             "networkChecking",
             "restartBlocked",
             "workWarnings",
+            "busyRef",
+            "updateBusy(",
+            "mutationBusy",
         ] {
             assert!(!button.contains(forbidden));
+            assert!(!selector.contains(forbidden));
+            assert!(!action.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn grade_and_work_probes_have_hard_non_gating_deadlines() {
+        let source = include_str!("../../src/App.tsx");
+        let contract = include_str!("../../src/laneContract.ts");
+        let css = include_str!("../../src/App.css");
+
+        for deadline in [
+            "const GRADE_STATUS_TIMEOUT_MS = 15_000;",
+            "const NETWORK_QUALITY_TIMEOUT_MS = 25_000;",
+            "const RUNTIME_UPDATE_TIMEOUT_MS = 45_000;",
+        ] {
+            assert!(
+                source.contains(deadline),
+                "missing hard probe deadline: {deadline}"
+            );
+        }
+
+        let grade_start = source
+            .find("const refreshGrade = useCallback(async () =>")
+            .expect("GRADE status probe should exist");
+        let grade_end = source[grade_start..]
+            .find("const initializeRuntimeInBackground = useCallback(async () =>")
+            .map(|offset| grade_start + offset)
+            .expect("initializer should follow GRADE status probe");
+        let grade = &source[grade_start..grade_end];
+        for required in [
+            "await runNonGatingProbe<GradeStatus>({",
+            "lane: \"grade\"",
+            "key: \"status\"",
+            "timeoutMs: GRADE_STATUS_TIMEOUT_MS",
+            "circuit: gradeStatusCircuitRef.current",
+            "task: () => invoke<GradeStatus>(\"get_grade_status\")",
+            "classifyValue: (value) => classifyNonGatingFailure(",
+            "muted: nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped)",
+        ] {
+            assert!(
+                grade.contains(required),
+                "GRADE probe lost non-gating guard: {required}"
+            );
+        }
+        assert!(grade.contains("if (result.value.state === \"error\")"));
+        assert!(grade.contains("muted: false"));
+
+        let network_start = source
+            .find("async function runNetworkQualityCheck()")
+            .expect("network quality WORK probe should exist");
+        let network_end = source[network_start..]
+            .find("async function runAction(")
+            .map(|offset| network_start + offset)
+            .expect("lifecycle action should follow network quality probe");
+        let network = &source[network_start..network_end];
+        for required in [
+            "await runNonGatingProbe<WorkReport>({",
+            "lane: \"work\"",
+            "key: \"network_quality\"",
+            "timeoutMs: NETWORK_QUALITY_TIMEOUT_MS",
+            "circuit: networkQualityCircuitRef.current",
+            "invoke<WorkReport>(\"run_network_quality_check\")",
+            "classifyValue: (value) => value.ok",
+            "classifyNonGatingFailure(",
+            "muted: nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped)",
+        ] {
+            assert!(
+                network.contains(required),
+                "network WORK probe lost non-gating guard: {required}"
+            );
+        }
+        assert!(network.contains("if (!result.value.ok)"));
+        assert!(network.contains("const muted = nonGatingFailureIsMuted(result.value.code)"));
+        assert!(network.contains("muted,"));
+
+        let runtime_start = source
+            .find("async function checkRuntimeUpdate()")
+            .expect("runtime update WORK probe should exist");
+        let runtime_end = source[runtime_start..]
+            .find("function openRuntimePrompt(")
+            .map(|offset| runtime_start + offset)
+            .expect("runtime prompt should follow runtime update probe");
+        let runtime = &source[runtime_start..runtime_end];
+        for required in [
+            "await runNonGatingProbe<RuntimeUpdateStatus>({",
+            "lane: \"work\"",
+            "key: \"runtime_update\"",
+            "timeoutMs: RUNTIME_UPDATE_TIMEOUT_MS",
+            "circuit: runtimeUpdateCircuitRef.current",
+            "invoke<RuntimeUpdateStatus>(\"get_runtime_update_status\")",
+            "if (runtimeCheckingRef.current) return;",
+            "runtimeCheckingRef.current = true;",
+            "runtimeCheckingRef.current = false;",
+        ] {
+            assert!(
+                runtime.contains(required),
+                "runtime WORK probe lost non-gating guard: {required}"
+            );
+        }
+        assert!(runtime.contains(
+            "const muted = nonGatingFailureIsMuted(result.code, result.timedOut, result.skipped)"
+        ));
+        assert!(runtime.contains("muted,"));
+
+        for required in [
+            "globalThis.setTimeout",
+            "if (settled) return;",
+            "if (generation === circuit.generation)",
+            "circuit.openUntil = now() + cooldownMs",
+            "`${lane}.${key}.timeout`",
+            "`${lane}.${key}.circuit_open`",
+            "`${lane}.${key}.superseded`",
+            "const semanticFailure = classifyValue?.(value)",
+            "const classified = classifyNonGatingFailure(lane, key, message)",
+        ] {
+            assert!(
+                contract.contains(required),
+                "probe runner lost deadline/circuit guarantee: {required}"
+            );
+        }
+
+        assert!(source.contains(
+            "className={`notice ${probeNotice.muted ? \"probe-muted\" : \"probe-failure\"}`}"
+        ));
+        assert!(source.contains(
+            "<p>{nonGatingFailurePresentation(`${probeNotice.code}: ${probeNotice.message}`, allowStatus)}</p>"
+        ));
+        assert!(source
+            .contains("detail: nonGatingFailurePresentation(baseSummary.detail, allowStatus)"));
+        assert!(contract.contains("`${message}；仍可打开 Claude Science`"));
+        assert!(css.contains(".notice.probe-muted"));
+        assert!(css.contains(".notice.probe-failure"));
+    }
+
+    #[test]
+    fn backend_probe_deadlines_are_machine_classified_and_bounded() {
+        assert!(grade_probe_diagnostic("wsl_inspection", "8 秒内没有响应")
+            .starts_with("grade.wsl_inspection.timeout:"));
+        assert!(grade_probe_diagnostic("storage_snapshot", "invalid JSON")
+            .starts_with("grade.storage_snapshot.failed:"));
+        assert!(RUNTIME_UPDATE_BACKEND_BUDGET < Duration::from_secs(45));
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test Instant should support a one millisecond subtraction");
+        assert_eq!(
+            runtime_update_deadline_remaining(expired).unwrap_err(),
+            "work.runtime_update.timeout: runtime update probe exceeded its backend deadline"
+        );
+
+        let backend = include_str!("lib.rs");
+        let auto_map_start = backend
+            .find("fn auto_map_api_key_impl(")
+            .expect("auto-map implementation should exist");
+        let auto_map_end = backend[auto_map_start..]
+            .find("async fn auto_map_api_key(")
+            .map(|offset| auto_map_start + offset)
+            .expect("auto-map command should follow its implementation");
+        let auto_map = &backend[auto_map_start..auto_map_end];
+        assert!(auto_map.contains("run_powershell_with_stdin_timeout("));
+        assert!(auto_map.contains("Duration::from_secs(20)"));
+        assert!(!auto_map.contains("run_powershell_with_stdin(script, &input)"));
     }
 
     #[test]
@@ -7598,7 +7922,7 @@ mod tests {
             .expect("lifecycle action should follow deep network handler");
         let deep = &source[deep_start..deep_end];
         let can_open_start = source
-            .find("const canOpenClaude = canOpenFromAllow(allowStatus);")
+            .find("const primaryButton = useMemo(")
             .expect("open readiness should exist");
         let can_open_end = source[can_open_start..]
             .find("const mutationBusy")
@@ -7614,13 +7938,20 @@ mod tests {
             .expect("open command should follow URL implementation");
         let backend = &include_str!("lib.rs")[backend_start..backend_end];
 
-        assert!(action.contains("if (!allowLoaded || busyRef.current) return;"));
-        assert!(action.contains("if (canOpenClaude)"));
-        assert!(action.contains("updateBusy(true);"));
+        assert!(
+            action.contains("if (primaryButton.disabled || allowActionBusyRef.current) return;")
+        );
+        assert!(action.contains("if (primaryButton.action === \"open\")"));
+        assert!(action.contains("updateAllowActionBusy(true);"));
         assert!(action.contains("setError(\"\");"));
         assert!(action.contains("await invoke<void>(\"open_claude_science\");"));
         assert!(!action.contains("get_system_status"));
+        assert!(!action.contains("busyRef"));
+        assert!(!action.contains("updateBusy("));
         assert!(!refresh.contains("run_network_quality_check"));
+        assert!(deep.contains("runNonGatingProbe<WorkReport>"));
+        assert!(deep.contains("timeoutMs: NETWORK_QUALITY_TIMEOUT_MS"));
+        assert!(deep.contains("circuit: networkQualityCircuitRef.current"));
         assert!(deep.contains("invoke<WorkReport>(\"run_network_quality_check\")"));
         assert!(deep.contains("setStatus((current) =>"));
         assert!(deep.contains("...current"));
@@ -7631,7 +7962,8 @@ mod tests {
         assert!(!deep.contains("setStatus(next)"));
         assert!(source.contains("const [networkChecking, setNetworkChecking] = useState(false);"));
         assert!(source.contains("networkCheckingRef.current"));
-        assert!(can_open.contains("canOpenFromAllow(allowStatus)"));
+        assert!(can_open.contains("primaryButtonView(allowStatus, allowLoaded, allowActionBusy)"));
+        assert!(can_open.contains("const canOpenClaude = primaryButton.action === \"open\""));
         assert!(!can_open.contains("status.claudeRunning"));
         assert!(!can_open.contains("status.network.daemonIoBlocked"));
         assert!(!can_open.contains("status.network.localReady"));
@@ -7654,7 +7986,7 @@ mod tests {
         assert!(source.contains("status.network.daemonIoBlocked"));
         assert!(!source.contains("? ` · 守护进程忙（${status.network.daemonWaitChannel"));
         assert!(action.contains("finally"));
-        assert!(action.contains("updateBusy(false);"));
+        assert!(action.contains("updateAllowActionBusy(false);"));
         assert!(!source.contains("get_claude_url"));
     }
 
