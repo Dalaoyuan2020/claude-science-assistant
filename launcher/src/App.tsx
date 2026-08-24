@@ -80,6 +80,58 @@ interface AllowStatus {
   canStart: boolean;
 }
 
+interface GradeNetworkStatus {
+  proxyState: NetworkQualityStatus["proxyState"];
+  localReady: boolean;
+  proxyReachable?: boolean;
+  proxyEndpoints: string[];
+  proxyConflict: boolean;
+  sandboxForwarderCount: number;
+  sandboxForwarderExpectedCount: number;
+  sandboxForwarderTopologyState: string;
+  sandboxHttpForwarderCount: number;
+  sandboxSocksForwarderCount: number;
+  sandboxProbeRole: string;
+  sandboxProbeTransport: string;
+  daemonProcessState: string;
+  daemonWaitChannel: string;
+  daemonIoBlocked: boolean;
+  daemonMountIoBlocked: boolean;
+}
+
+interface GradeStatus {
+  state: SystemState;
+  wslInstalled: boolean;
+  bridgeRunning: boolean;
+  bridgePid?: number;
+  bridgeHealthy: boolean;
+  bridgeIdentity?: unknown;
+  claudeListenerPresent: boolean;
+  claudePort8765: boolean;
+  claudePort8766: boolean;
+  claudeUnverifiedPid?: number;
+  runtimeReady: boolean;
+  sourceBinaryPresent: boolean;
+  bridgeVenvPresent: boolean;
+  wslStoragePath?: string;
+  wslStorageDrive?: string;
+  wslStorageFreeGb?: number;
+  wslVhdxSizeGb?: number;
+  wslRootFreeGb?: number;
+  settingsStorageDrive?: string;
+  settingsStorageFreeGb?: number;
+  storageWarning: boolean;
+  storageBlocked: boolean;
+  restartBlocked: boolean;
+  hostAccessPreferencesPresent: boolean;
+  hostAccessPreferencesParseOk: boolean;
+  drvfsWriteGrantCount: number;
+  broadDrvfsWriteGrantCount: number;
+  drvfsWriteGrants: string[];
+  network: GradeNetworkStatus;
+  warnings: string[];
+}
+
 const ALLOW_OPEN_INPUTS = ["claudeRunning", "windowsBridgePid"] as const satisfies readonly (keyof AllowStatus)[];
 const PRIMARY_LABEL_INPUTS = ["claudeRunning", "windowsBridgePid", "runtimePresent"] as const satisfies readonly (keyof AllowStatus)[];
 type AllowOpenInput = (typeof ALLOW_OPEN_INPUTS)[number];
@@ -125,6 +177,37 @@ interface SystemStatus {
   network: NetworkQualityStatus;
   warnings: string[];
 }
+
+const mergeGradeStatus = (current: SystemStatus, next: GradeStatus): SystemStatus => ({
+  ...current,
+  state: next.state,
+  bridgeRunning: next.bridgeRunning,
+  bridgePid: next.bridgePid,
+  bridgeHealthy: next.bridgeHealthy,
+  claudeListenerPresent: next.claudeListenerPresent,
+  runtimeReady: next.runtimeReady,
+  sourceBinaryPresent: next.sourceBinaryPresent,
+  bridgeVenvPresent: next.bridgeVenvPresent,
+  wslStoragePath: next.wslStoragePath,
+  wslStorageDrive: next.wslStorageDrive,
+  wslStorageFreeGb: next.wslStorageFreeGb,
+  wslVhdxSizeGb: next.wslVhdxSizeGb,
+  wslRootFreeGb: next.wslRootFreeGb,
+  settingsStorageDrive: next.settingsStorageDrive,
+  settingsStorageFreeGb: next.settingsStorageFreeGb,
+  storageWarning: next.storageWarning,
+  storageBlocked: next.storageBlocked,
+  restartBlocked: next.restartBlocked,
+  network: {
+    ...current.network,
+    ...next.network,
+    ready: next.network.localReady
+      && !next.network.daemonIoBlocked
+      && current.network.deepChecked
+      && current.network.sandboxEgressState === "ok",
+  },
+  warnings: next.warnings,
+});
 
 interface Provider {
   id: string;
@@ -526,6 +609,7 @@ const normalizedSchemes = (settings: LauncherSettings): AggregateScheme[] => {
 function App() {
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
   const [allowStatus, setAllowStatus] = useState<AllowStatus>(initialAllowStatus);
+  const [allowLoaded, setAllowLoaded] = useState(false);
   const [providerGroups, setProviderGroups] = useState<ProviderGroup[]>(fallbackProviderGroups);
   const [activeProvider, setActiveProvider] = useState(fallbackSettings.selectedProviderId);
   const [customBaseUrl, setCustomBaseUrl] = useState(fallbackSettings.customBaseUrl);
@@ -558,6 +642,7 @@ function App() {
   const [autoMappingKey, setAutoMappingKey] = useState(false);
   const [busy, setBusy] = useState(false);
   const [networkChecking, setNetworkChecking] = useState(false);
+  const [workWarnings, setWorkWarnings] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [healthCollapsed, setHealthCollapsed] = useState(initialHealthCollapsed);
   const [apiSectionCollapsed, setApiSectionCollapsed] = useState(initialApiSectionCollapsed);
@@ -568,7 +653,8 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimePromptMode, setRuntimePromptMode] = useState<"upgrade" | "rollback">();
   const [runtimeCopyState, setRuntimeCopyState] = useState("");
-  const refreshInFlight = useRef(false);
+  const allowRefreshEpoch = useRef(0);
+  const gradeRefreshInFlight = useRef(false);
   const busyRef = useRef(false);
   const networkCheckingRef = useRef(false);
   const statusCommitEpoch = useRef(0);
@@ -600,8 +686,12 @@ function App() {
       detail: "Bridge、本地端口与 3/3 沙盒出口拓扑已验证；外部 API 深度质检不影响打开",
     }
     : stateText[status.state];
-  const migrationRecommendation = useMemo(() => storageRecommendation(status), [status]);
-  const migrationPrompt = useMemo(() => buildStorageMigrationPrompt(status), [status]);
+  const storageStatus = useMemo(
+    () => ({ ...status, distro: allowStatus.distro }),
+    [allowStatus.distro, status],
+  );
+  const migrationRecommendation = useMemo(() => storageRecommendation(storageStatus), [storageStatus]);
+  const migrationPrompt = useMemo(() => buildStorageMigrationPrompt(storageStatus), [storageStatus]);
   const runtimePrompt = useMemo(() => {
     if (!runtimeUpdate || !runtimePromptMode) return "";
     return runtimePromptMode === "upgrade"
@@ -609,53 +699,78 @@ function App() {
       : buildRuntimeRollbackPrompt(runtimeUpdate);
   }, [runtimePromptMode, runtimeUpdate]);
 
-  const refresh = useCallback(async () => {
-    if (refreshInFlight.current || busyRef.current || networkCheckingRef.current) return;
-    refreshInFlight.current = true;
+  const refreshAllow = useCallback(async () => {
+    const requestEpoch = ++allowRefreshEpoch.current;
+    const next = isTauri
+      ? await invoke<AllowStatus>("get_allow_status")
+      : browserPreviewAllowStatus;
+    if (requestEpoch !== allowRefreshEpoch.current) return next;
+    setAllowStatus(next);
+    setAllowLoaded(true);
+    return next;
+  }, [isTauri]);
+
+  const refreshGrade = useCallback(async () => {
+    if (gradeRefreshInFlight.current) return;
+    gradeRefreshInFlight.current = true;
     const requestEpoch = statusCommitEpoch.current;
-    let initializingRuntime = false;
     try {
       if (!isTauri) {
-        setAllowStatus(browserPreviewAllowStatus);
         setStatus(browserPreviewStatus);
         return;
       }
-      const nextAllow = await invoke<AllowStatus>("get_allow_status");
+      const next = await invoke<GradeStatus>("get_grade_status");
       if (requestEpoch !== statusCommitEpoch.current) return;
-      setAllowStatus(nextAllow);
-      let next: SystemStatus;
-      let initializationError = "";
-      if (!runtimeInitializationAttempted.current) {
-        runtimeInitializationAttempted.current = true;
-        initializingRuntime = true;
-        busyRef.current = true;
-        setBusy(true);
-        try {
-          next = await invoke<SystemStatus>("initialize_runtime");
-        } catch (reason) {
-          initializationError = String(reason);
-          next = await invoke<SystemStatus>("get_system_status");
-        }
-      } else {
-        next = await invoke<SystemStatus>("get_system_status");
-      }
-      if (requestEpoch !== statusCommitEpoch.current) return;
-      setStatus(next);
-      setError(initializationError);
+      setStatus((current) => mergeGradeStatus(current, next));
     } catch (reason) {
-      if (requestEpoch !== statusCommitEpoch.current) return;
-      setStatus((current) => ({ ...current, state: "error" }));
-      setError(String(reason));
+      if (requestEpoch === statusCommitEpoch.current) setError(String(reason));
     } finally {
-      if (initializingRuntime) {
-        busyRef.current = false;
-        setBusy(false);
-      }
-      refreshInFlight.current = false;
+      gradeRefreshInFlight.current = false;
     }
   }, [isTauri]);
 
+  const initializeRuntimeInBackground = useCallback(async () => {
+    if (!isTauri || runtimeInitializationAttempted.current) return;
+    runtimeInitializationAttempted.current = true;
+    const requestEpoch = statusCommitEpoch.current;
+    try {
+      await invoke<unknown>("initialize_runtime");
+    } catch (reason) {
+      if (requestEpoch === statusCommitEpoch.current) setError(String(reason));
+    }
+    try {
+      await refreshAllow();
+    } catch (reason) {
+      if (requestEpoch === statusCommitEpoch.current) setError(String(reason));
+    }
+  }, [isTauri, refreshAllow]);
+
+  const refresh = useCallback(async () => {
+    try {
+      await refreshAllow();
+    } catch (reason) {
+      setError(String(reason));
+    }
+    void refreshGrade();
+  }, [refreshAllow, refreshGrade]);
+
   useEffect(() => {
+    let cancelled = false;
+    let gradeTimer: number | undefined;
+
+    async function paintAllowThenStartBackground() {
+      try {
+        await refreshAllow();
+      } catch (reason) {
+        setError(String(reason));
+      }
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      if (cancelled) return;
+      gradeTimer = window.setInterval(refreshGrade, 30_000);
+      void initializeRuntimeInBackground();
+      void refreshGrade();
+    }
+
     async function loadProviderState() {
       if (!isTauri) return;
       try {
@@ -670,11 +785,13 @@ function App() {
         setError(String(reason));
       }
     }
-    refresh();
-    loadProviderState();
-    const timer = window.setInterval(refresh, 30_000);
-    return () => window.clearInterval(timer);
-  }, [refresh, isTauri]);
+    void paintAllowThenStartBackground();
+    void loadProviderState();
+    return () => {
+      cancelled = true;
+      if (gradeTimer !== undefined) window.clearInterval(gradeTimer);
+    };
+  }, [initializeRuntimeInBackground, isTauri, refreshAllow, refreshGrade]);
 
   const primaryLabel = useMemo(() => primaryLabelFromAllow(allowStatus), [allowStatus]);
 
@@ -767,7 +884,7 @@ function App() {
   }
 
   async function runNetworkQualityCheck() {
-    if (busyRef.current || networkCheckingRef.current || refreshInFlight.current) return;
+    if (networkCheckingRef.current) return;
     networkCheckingRef.current = true;
     setNetworkChecking(true);
     statusCommitEpoch.current += 1;
@@ -786,8 +903,8 @@ function App() {
               && next.deep.sandboxEgressState === "ok",
           }
           : current.network,
-        warnings: next.warnings,
       }));
+      setWorkWarnings(next.warnings);
     };
     setError("");
     try {
@@ -821,15 +938,23 @@ function App() {
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
-    if (!tryBeginMutation()) return;
+    if (busyRef.current) return;
+    updateBusy(true);
     setError("");
+    let actionFailed = false;
     try {
-      setStatus(await invoke<SystemStatus>(command));
-      setAllowStatus(await invoke<AllowStatus>("get_allow_status"));
+      await invoke<unknown>(command);
     } catch (reason) {
+      actionFailed = true;
       setError(String(reason));
     } finally {
+      try {
+        await refreshAllow();
+      } catch (reason) {
+        if (!actionFailed) setError(String(reason));
+      }
       updateBusy(false);
+      void refreshGrade();
     }
   }
 
@@ -1233,7 +1358,7 @@ function App() {
   }
 
   async function primaryAction() {
-    if (busyRef.current) return;
+    if (!allowLoaded || busyRef.current) return;
     if (allowStatus.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
     if (canOpenClaude) {
       updateBusy(true);
@@ -1335,9 +1460,9 @@ function App() {
     : status.bridgeRunning
       ? (status.bridgePid ? `PID ${status.bridgePid}，健康检查失败` : "服务/端口存在，健康检查失败")
       : "已停止";
-  const claudeDetail = status.claudeRunning
-    ? (status.claudePid ? `PID ${status.claudePid}` : "端口已监听")
-    : status.claudeListenerPresent
+  const claudeDetail = allowStatus.claudeRunning
+    ? (allowStatus.claudePid ? `PID ${allowStatus.claudePid}` : "端口已监听")
+    : allowStatus.listenerPresent
       ? "端口存在，受管身份或双端口拓扑待验证"
       : "已停止";
   const proxyStateLabel: Record<string, string> = {
@@ -1358,7 +1483,7 @@ function App() {
           ? " · 深检时遇到瞬时 I/O；不影响本地打开，恢复后可重试"
         : ` · ${status.network.sandboxEgressFailureStage} 阶段失败（${status.network.sandboxEgressState}）`
     : " · 可深度检测";
-  const networkDetail = status.claudeRunning
+  const networkDetail = allowStatus.claudeRunning
     ? `${proxyStateLabel[status.network.proxyState] || status.network.proxyState} · ${status.network.sandboxForwarderCount}/${status.network.sandboxForwarderExpectedCount} 组 HTTP/SOCKS 沙盒出口（${status.network.sandboxForwarderTopologyState}） · ${status.network.sandboxProbeRole}/${status.network.sandboxProbeTransport.toUpperCase()} 探针${deepEgressLabel}`
     : "Claude Science 启动后检查";
   const networkOk = status.network.ready
@@ -1391,7 +1516,7 @@ function App() {
         <button
           className="primary-button"
           onClick={primaryAction}
-          disabled={busy}
+          disabled={busy || !allowLoaded}
         >
           {primaryLabel}
         </button>
@@ -1418,17 +1543,17 @@ function App() {
         </div>
         {!healthCollapsed && (
           <div className="health-grid" id="health-status-grid">
-            <HealthItem label="WSL2" ok={status.wslInstalled} detail={status.distro || "未检测到"} />
+            <HealthItem label="WSL2" ok={allowStatus.wslInstalled} detail={allowStatus.distro || "未检测到"} />
             <HealthItem label="运行时" ok={status.runtimeReady} detail={status.runtimeReady ? "已准备" : "需体检/修复"} />
             <HealthItem label="Bridge" ok={status.bridgeHealthy} detail={bridgeDetail} />
-            <HealthItem label="Claude Science" ok={status.claudeRunning} detail={claudeDetail} />
+            <HealthItem label="Claude Science" ok={allowStatus.claudeRunning} detail={claudeDetail} />
             <HealthItem
               label="沙盒 / API 出口"
               ok={networkOk}
               detail={networkDetail}
               actionLabel={networkChecking ? "检测中…" : "深度检测"}
               onAction={runNetworkQualityCheck}
-              actionDisabled={busy || networkChecking || !status.claudeRunning}
+              actionDisabled={busy || networkChecking || !allowStatus.claudeRunning}
             />
             <HealthItem
               label="WSL 存储"
@@ -1448,14 +1573,15 @@ function App() {
         )}
       </section>
 
-      {(error || status.warnings.length > 0) && (
+      {(error || status.warnings.length > 0 || workWarnings.length > 0) && (
         <section className="notice" role="alert">
           <strong>诊断信息</strong>
           {error && <p>{error}</p>}
           {status.warnings.map((warning) => <p key={warning}>{warning}</p>)}
-          {status.windowsBridgePid && (
+          {workWarnings.map((warning) => <p key={`work:${warning}`}>{warning}</p>)}
+          {allowStatus.windowsBridgePid && (
             <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={mutationBusy}>
-              停止旧 Windows Bridge（PID {status.windowsBridgePid}）
+              停止旧 Windows Bridge（PID {allowStatus.windowsBridgePid}）
             </button>
           )}
           {status.storageWarning && (
@@ -1481,7 +1607,7 @@ function App() {
             </div>
 
             <div className="migration-facts">
-              <div><span>发行版</span><strong>{status.distro || "未检测到"}</strong></div>
+              <div><span>发行版</span><strong>{allowStatus.distro || "未检测到"}</strong></div>
               <div><span>当前位置</span><strong>{status.wslStoragePath || "未定位 VHDX"}</strong></div>
               <div><span>宿主盘剩余</span><strong>{typeof status.wslStorageFreeGb === "number" ? `${status.wslStorageFreeGb.toFixed(1)} GB` : "未检测到"}</strong></div>
               <div><span>Linux 剩余</span><strong>{typeof status.wslRootFreeGb === "number" ? `${status.wslRootFreeGb.toFixed(1)} GB` : "未检测到"}</strong></div>
@@ -2016,11 +2142,11 @@ function App() {
       </section>
 
       <footer>
-        <span>{status.linuxUser && status.distro ? `${status.linuxUser} · ${status.distro}` : "Windows 10/11 · WSL2"}</span>
+        <span>{allowStatus.linuxUser && allowStatus.distro ? `${allowStatus.linuxUser} · ${allowStatus.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
           <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
-          <button onClick={() => runAction("restart_services")} disabled={mutationBusy || !status.wslInstalled || status.restartBlocked}>重启</button>
-          <button onClick={() => runAction("stop_services")} disabled={mutationBusy || (!status.bridgeRunning && !status.claudeRunning)}>停止</button>
+          <button onClick={() => runAction("restart_services")} disabled={mutationBusy || !allowStatus.wslInstalled || status.restartBlocked}>重启</button>
+          <button onClick={() => runAction("stop_services")} disabled={mutationBusy || (!status.bridgeRunning && !allowStatus.claudeRunning)}>停止</button>
         </div>
       </footer>
     </main>

@@ -166,3 +166,21 @@ FAIL egress 0ms work.bridge_egress.not_implemented
 PASS grade 4497ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=6361 exit=0
 ```
+
+## S2 完成
+
+做了什么：把首屏拆为 `refreshAllow / refreshGrade / initializeRuntimeInBackground` 三条独立回路。首次只等待 ALLOW，提交按钮状态后跨过一个 `requestAnimationFrame` 才在后台幂等初始化；初始化不再写全局 busy、不再全量 `setStatus`，完成后只重读 ALLOW。30 秒定时器只调用 `get_grade_status`；Grade 使用 functional merge，只更新仪表字段并保留当前 WORK 深检结果。启动/停止/重启动作忽略旧 `SystemStatus` 返回，随后分别刷新 ALLOW 与 Grade。Claude PID、发行版、旧 Windows Bridge 等身份展示统一读取 `allowStatus`。
+
+证据在哪：`launcher/src/App.tsx`；Rust 源码边界测试 `first_paint_allow_only_initialize_background`、`periodic_refresh_is_grade_only_and_preserves_allow_and_work`、`primary_button_is_not_blocked_by_grade_or_work` 均通过。Rust 为 89 passed、0 failed、4 ignored；`npm run build` 通过（34 modules）。现场 smoke 的 paint 为 535ms、open 为 724ms，均远低于 3s/8s 硬预算。完整输出如下。
+
+下一步：进入 S3，把主按钮 selector 与 ALLOW/Grade/Work reducer 做成可执行纯模块，构造全部探针红灯的真实 fixture，证明按钮文案、disabled、PID 与端口完全不变；同时给非阻断探针补 UI 硬期限与熔断。
+
+```text
+PASS allow 535ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 535ms budget=3000ms
+PASS open 724ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 381ms health=200 models=200 identity=current modelCount=5
+FAIL egress 0ms work.bridge_egress.not_implemented
+PASS grade 3947ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5589 exit=0
+```

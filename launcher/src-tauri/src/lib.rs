@@ -6066,7 +6066,7 @@ mod tests {
             .map(|offset| button_start + offset)
             .expect("primary button should close");
         let button = &source[button_start..button_end];
-        assert!(button.contains("disabled={busy}"));
+        assert!(button.contains("disabled={busy || !allowLoaded}"));
         assert!(button.contains("{primaryLabel}"));
         for forbidden in ["status.", "networkChecking", "restartBlocked", "正在处理"] {
             assert!(
@@ -7400,6 +7400,177 @@ mod tests {
     }
 
     #[test]
+    fn first_paint_allow_only_initialize_background() {
+        let source = include_str!("../../src/App.tsx");
+        let allow_start = source
+            .find("const refreshAllow = useCallback(async () =>")
+            .expect("ALLOW refresh should exist");
+        let allow_end = source[allow_start..]
+            .find("const refreshGrade = useCallback(async () =>")
+            .map(|offset| allow_start + offset)
+            .expect("GRADE refresh should follow ALLOW refresh");
+        let allow = &source[allow_start..allow_end];
+        assert!(allow.contains("invoke<AllowStatus>(\"get_allow_status\")"));
+        assert!(allow.contains("setAllowLoaded(true)"));
+        for forbidden in [
+            "get_grade_status",
+            "get_system_status",
+            "initialize_runtime",
+            "run_network_quality_check",
+            "setStatus(",
+            "setBusy(",
+            "busyRef",
+        ] {
+            assert!(
+                !allow.contains(forbidden),
+                "first-paint ALLOW path contains blocking/non-ALLOW work: {forbidden}"
+            );
+        }
+
+        let initialize_start = source
+            .find("const initializeRuntimeInBackground = useCallback(async () =>")
+            .expect("background initializer should exist");
+        let initialize_end = source[initialize_start..]
+            .find("const refresh = useCallback(async () =>")
+            .map(|offset| initialize_start + offset)
+            .expect("manual refresh should follow background initialize");
+        let initialize = &source[initialize_start..initialize_end];
+        assert!(initialize.contains("invoke<unknown>(\"initialize_runtime\")"));
+        assert!(initialize.contains("await refreshAllow()"));
+        assert!(initialize.contains("const requestEpoch = statusCommitEpoch.current;"));
+        assert_eq!(
+            initialize
+                .matches("requestEpoch === statusCommitEpoch.current")
+                .count(),
+            2
+        );
+        for forbidden in ["get_system_status", "setBusy(", "busyRef", "setStatus("] {
+            assert!(
+                !initialize.contains(forbidden),
+                "background initialize blocks or overwrites the first paint: {forbidden}"
+            );
+        }
+
+        let boot_start = source
+            .find("async function paintAllowThenStartBackground()")
+            .expect("paint pipeline should exist");
+        let boot_end = source[boot_start..]
+            .find("async function loadProviderState()")
+            .map(|offset| boot_start + offset)
+            .expect("provider load should follow paint pipeline");
+        let boot = &source[boot_start..boot_end];
+        let allow_at = boot.find("await refreshAllow()").unwrap();
+        let paint_at = boot.find("requestAnimationFrame").unwrap();
+        let timer_at = boot
+            .find("window.setInterval(refreshGrade, 30_000)")
+            .unwrap();
+        let initialize_at = boot.find("void initializeRuntimeInBackground()").unwrap();
+        let grade_at = boot.find("void refreshGrade()").unwrap();
+        assert!(allow_at < paint_at && paint_at < timer_at);
+        assert!(timer_at < initialize_at && timer_at < grade_at);
+        assert!(!boot.contains("await initializeRuntimeInBackground()"));
+        assert!(!boot.contains("await refreshGrade()"));
+    }
+
+    #[test]
+    fn periodic_refresh_is_grade_only_and_preserves_allow_and_work() {
+        let source = include_str!("../../src/App.tsx");
+        let grade_start = source
+            .find("const refreshGrade = useCallback(async () =>")
+            .expect("GRADE refresh should exist");
+        let grade_end = source[grade_start..]
+            .find("const initializeRuntimeInBackground = useCallback(async () =>")
+            .map(|offset| grade_start + offset)
+            .expect("initializer should follow GRADE refresh");
+        let grade = &source[grade_start..grade_end];
+        assert!(grade.contains("invoke<GradeStatus>(\"get_grade_status\")"));
+        assert!(grade.contains("setStatus((current) => mergeGradeStatus(current, next))"));
+        for forbidden in [
+            "get_allow_status",
+            "initialize_runtime",
+            "get_system_status",
+            "run_network_quality_check",
+            "setAllowStatus",
+        ] {
+            assert!(
+                !grade.contains(forbidden),
+                "periodic GRADE path crossed into another lane: {forbidden}"
+            );
+        }
+        assert!(source.contains("window.setInterval(refreshGrade, 30_000)"));
+        assert!(!source.contains("window.setInterval(refresh, 30_000)"));
+
+        let merge_start = source
+            .find("const mergeGradeStatus =")
+            .expect("GRADE merge should exist");
+        let merge_end = source[merge_start..]
+            .find("interface Provider")
+            .map(|offset| merge_start + offset)
+            .expect("provider types should follow GRADE merge");
+        let merge = &source[merge_start..merge_end];
+        assert!(merge.contains("...current.network"));
+        assert!(merge.contains("...next.network"));
+        assert!(merge.find("...current.network") < merge.find("...next.network"));
+        assert!(merge.contains("current.network.deepChecked"));
+        assert!(merge.contains("current.network.sandboxEgressState"));
+        for forbidden in [
+            "claudeRunning",
+            "claudePid",
+            "windowsBridgePid",
+            "distro:",
+            "linuxUser",
+            "pid8765",
+            "pid8766",
+        ] {
+            assert!(
+                !merge.contains(forbidden),
+                "GRADE merge attempted to write ALLOW-owned field: {forbidden}"
+            );
+        }
+
+        let action_start = source
+            .find("async function runAction(")
+            .expect("lifecycle action should exist");
+        let action_end = source[action_start..]
+            .find("async function applyDraftKey()")
+            .map(|offset| action_start + offset)
+            .expect("API Key action should follow lifecycle action");
+        let action = &source[action_start..action_end];
+        assert!(action.contains("await invoke<unknown>(command)"));
+        assert!(action.contains("await refreshAllow()"));
+        assert!(action.contains("void refreshGrade()"));
+        for forbidden in ["setStatus(", "get_system_status", "networkCheckingRef"] {
+            assert!(
+                !action.contains(forbidden),
+                "lifecycle action overwrote ALLOW/GRADE or was blocked by WORK: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_button_is_not_blocked_by_grade_or_work() {
+        let source = include_str!("../../src/App.tsx");
+        let button_start = source
+            .find("className=\"primary-button\"")
+            .expect("primary button should exist");
+        let button_end = source[button_start..]
+            .find("</button>")
+            .map(|offset| button_start + offset)
+            .expect("primary button should close");
+        let button = &source[button_start..button_end];
+        assert!(button.contains("disabled={busy || !allowLoaded}"));
+        assert!(button.contains("{primaryLabel}"));
+        for forbidden in [
+            "status",
+            "networkChecking",
+            "restartBlocked",
+            "workWarnings",
+        ] {
+            assert!(!button.contains(forbidden));
+        }
+    }
+
+    #[test]
     fn claude_open_ui_serializes_clicks_and_keeps_nonce_off_frontend() {
         let source = include_str!("../../src/App.tsx");
         let action_start = source
@@ -7443,7 +7614,7 @@ mod tests {
             .expect("open command should follow URL implementation");
         let backend = &include_str!("lib.rs")[backend_start..backend_end];
 
-        assert!(action.contains("if (busyRef.current) return;"));
+        assert!(action.contains("if (!allowLoaded || busyRef.current) return;"));
         assert!(action.contains("if (canOpenClaude)"));
         assert!(action.contains("updateBusy(true);"));
         assert!(action.contains("setError(\"\");"));
@@ -7465,7 +7636,7 @@ mod tests {
         assert!(!can_open.contains("status.network.daemonIoBlocked"));
         assert!(!can_open.contains("status.network.localReady"));
         assert!(!can_open.contains("status.bridgeHealthy"));
-        assert!(refresh.contains("networkCheckingRef.current"));
+        assert!(!refresh.contains("networkCheckingRef.current"));
         assert!(source.contains("const mutationBusy = busy || networkChecking;"));
         assert!(source.contains("function tryBeginMutation()"));
         assert!(source.contains("if (busyRef.current || networkCheckingRef.current) return false;"));
