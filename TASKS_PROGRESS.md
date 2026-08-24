@@ -224,3 +224,23 @@ FAIL egress 381ms work.bridge_egress.proxy_dead health=passed proxy=failed model
 PASS grade 3311ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5224 exit=0
 ```
+
+## S5 进行中（合同与安全入口已落地；高风险验收待人工）
+
+做了什么：将任务书 §1–§8 原文冻结为长期合同，并落下防膨胀五问与“非 ALLOW 默认进 GRADE”规则；按 A–E 能力表逐项核对入口。真实 Tauri 中完成刷新、深检、计费说明取消、存储 Prompt、运行时索引与升级/回退 Prompt、供应商/聚合预选取消、打开 Claude Science 等只读点击；浏览器 preview 完成 dummy Key、模型映射和聚合事务接线点击，并明确只算 fixture。验收同时修复全部 preview 成功分支残留旧错误、隐藏 DrvFS 副作用的“重启”文案、三处 `bash -lc` 运输债，以及配置面板 `--noproxy "*"` 在 DrvFS 中被展开导致的 8 秒超时；dashboard origin 进一步固定为 `127.0.0.1:9876`，即使配置中的 host/port 被篡改也不能把 path secret 带离 loopback。
+
+证据在哪：`docs/architecture/CURRENT_CONTRACT.md` 与 MASTER §1–§8 逐行一致；`docs/architecture/PR_CHECKLIST.md` 含五问；34 项能力入口、响应、证据口径和待人工项记录在 `docs/reports/CSA_v016_S5_capability_audit_20260825.md`。Node 11 passed、0 failed；前端 build 35 modules；Rust 库 100 passed、0 failed、4 ignored，独立目标目录集成测试 9 passed、0 failed；总 self-test 为 54 translation tests、package policy、35 passed/3 skipped。最终 smoke 使用独立目标目录的新产物，完整输出如下。
+
+待人工：维护窗口中的启动/停止/修复并重启、旧 Windows Bridge fixture；需要用户明确费用/凭据授权的真实 Key、模型读取、真实接入切换、聚合提交和 egress 第二次确认；发布阶段的 ZIP、SHA-256、包内 secret scan、双入口与并排升级。根据 MASTER“任一条点不动 = S5 未完成”，本阶段不虚报全绿，本轮也不制作正式 Release ZIP。
+
+下一步：用户提供维护窗口及费用/真实凭据操作的明确批准后，完成剩余现场点击；全部能力全绿后再进入正式发布验收。
+
+```text
+PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 322ms budget=3000ms
+PASS open 776ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 416ms health=200 models=200 identity=current modelCount=5
+FAIL egress 379ms work.bridge_egress.proxy_dead health=passed proxy=failed models=skipped request=skipped direct=skipped billable=false gating=false
+PASS grade 3708ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
+```
