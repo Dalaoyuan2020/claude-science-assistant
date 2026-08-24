@@ -51,6 +51,7 @@ interface SystemStatus {
   bridgePid?: number;
   claudeRunning: boolean;
   claudePid?: number;
+  claudeListenerPresent: boolean;
   bridgeHealthy: boolean;
   windowsBridgePid?: number;
   runtimeReady: boolean;
@@ -212,6 +213,7 @@ const initialStatus: SystemStatus = {
   wslInstalled: false,
   bridgeRunning: false,
   claudeRunning: false,
+  claudeListenerPresent: false,
   bridgeHealthy: false,
   runtimeReady: false,
   sourceBinaryPresent: false,
@@ -252,6 +254,7 @@ const browserPreviewStatus: SystemStatus = {
   linuxUser: "preview",
   bridgeRunning: false,
   claudeRunning: false,
+  claudeListenerPresent: false,
   bridgeHealthy: false,
   runtimeReady: true,
   sourceBinaryPresent: true,
@@ -293,7 +296,7 @@ const browserPreviewStatus: SystemStatus = {
 };
 
 const stateText: Record<SystemState, { title: string; detail: string }> = {
-  loading: { title: "正在检查环境", detail: "读取 WSL 和服务状态…" },
+  loading: { title: "正在启动核心服务", detail: "优先确保 Claude Science 就绪，并检查 WSL 与 Bridge 依赖…" },
   notInstalled: { title: "环境尚未就绪", detail: "需要用体检 Skill 安装或修复 WSL2 / Claude Science 运行环境" },
   stopped: { title: "Claude Science 已停止", detail: "环境完整，可以安全启动" },
   degraded: { title: "服务需要修复", detail: "部分组件正在运行，请查看诊断信息" },
@@ -487,6 +490,7 @@ function App() {
   const [runtimeCopyState, setRuntimeCopyState] = useState("");
   const refreshInFlight = useRef(false);
   const busyRef = useRef(false);
+  const runtimeInitializationAttempted = useRef(false);
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const providers = useMemo(() => providerList(providerGroups), [providerGroups]);
@@ -518,21 +522,41 @@ function App() {
   const refresh = useCallback(async () => {
     if (refreshInFlight.current || busyRef.current) return;
     refreshInFlight.current = true;
+    let initializingRuntime = false;
     try {
       if (!isTauri) {
         setStatus(browserPreviewStatus);
         return;
       }
-      let next = await invoke<SystemStatus>("get_system_status");
+      let next: SystemStatus;
+      let initializationError = "";
+      if (!runtimeInitializationAttempted.current) {
+        runtimeInitializationAttempted.current = true;
+        initializingRuntime = true;
+        busyRef.current = true;
+        setBusy(true);
+        try {
+          next = await invoke<SystemStatus>("initialize_runtime");
+        } catch (reason) {
+          initializationError = `Claude Science 核心服务自动启动失败：${String(reason)}`;
+          next = await invoke<SystemStatus>("get_system_status");
+        }
+      } else {
+        next = await invoke<SystemStatus>("get_system_status");
+      }
       if (next.claudeRunning && next.network.localReady && !next.network.deepChecked) {
         next = await invoke<SystemStatus>("run_network_quality_check");
       }
       setStatus(next);
-      setError("");
+      setError(initializationError);
     } catch (reason) {
       setStatus((current) => ({ ...current, state: "error" }));
       setError(String(reason));
     } finally {
+      if (initializingRuntime) {
+        busyRef.current = false;
+        setBusy(false);
+      }
       refreshInFlight.current = false;
     }
   }, [isTauri]);
@@ -552,19 +576,20 @@ function App() {
         setError(String(reason));
       }
     }
-    loadProviderState();
     refresh();
+    loadProviderState();
     const timer = window.setInterval(refresh, 30_000);
     return () => window.clearInterval(timer);
   }, [refresh, isTauri]);
 
   const primaryLabel = useMemo(() => {
+    if (status.windowsBridgePid) return "先停止旧 Windows Bridge";
     if (status.state === "running") return "打开 Claude Science";
     if (status.restartBlocked) return "先处理诊断问题";
     if (status.state === "notInstalled") return "安装运行环境";
     if (status.state === "degraded") return "修复并重启";
     return "启动 Claude Science";
-  }, [status.state, status.restartBlocked]);
+  }, [status.state, status.restartBlocked, status.windowsBridgePid]);
 
   function updateBusy(value: boolean) {
     busyRef.current = value;
@@ -1080,11 +1105,17 @@ function App() {
   }
 
   async function primaryAction() {
+    if (busyRef.current) return;
+    if (status.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
     if (status.state === "running") {
+      updateBusy(true);
+      setError("");
       try {
-        await openUrl(await invoke<string>("get_claude_url"));
+        await invoke<void>("open_claude_science");
       } catch (reason) {
         setError(String(reason));
+      } finally {
+        updateBusy(false);
       }
       return;
     }
@@ -1190,7 +1221,9 @@ function App() {
       : "已停止";
   const claudeDetail = status.claudeRunning
     ? (status.claudePid ? `PID ${status.claudePid}` : "端口已监听")
-    : "已停止";
+    : status.claudeListenerPresent
+      ? "端口存在，受管身份或双端口拓扑待验证"
+      : "已停止";
   const proxyStateLabel: Record<string, string> = {
     direct: "直连环境",
     reachable: "代理可达",
@@ -1298,7 +1331,7 @@ function App() {
           <strong>诊断信息</strong>
           {error && <p>{error}</p>}
           {status.warnings.map((warning) => <p key={warning}>{warning}</p>)}
-          {status.windowsBridgePid && status.bridgeRunning && (
+          {status.windowsBridgePid && (
             <button className="notice-action" onClick={() => runAction("stop_legacy_windows_bridge")} disabled={busy}>
               停止旧 Windows Bridge（PID {status.windowsBridgePid}）
             </button>

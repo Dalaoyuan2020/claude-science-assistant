@@ -47,14 +47,63 @@ auxiliary_fixture=101
 # a file named `serve`, giving the same argv shape as the real daemon.
 TEST_ROOT="$(mktemp -d)"
 candidate_pid=""
+managed_fixture_pid=""
 cleanup() {
   if [ -n "$candidate_pid" ]; then
     kill "$candidate_pid" 2>/dev/null || true
     wait "$candidate_pid" 2>/dev/null || true
   fi
+  if [ -n "$managed_fixture_pid" ]; then
+    kill "$managed_fixture_pid" 2>/dev/null || true
+    wait "$managed_fixture_pid" 2>/dev/null || true
+  fi
   rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+# A daemon may have been launched through patched-current before an atomic
+# upgrade moves that pointer to the next generation. The lifecycle preflight
+# must continue to recognize the old managed executable so it can be stopped
+# safely; resolving argv[0] through the new pointer would misclassify it.
+original_claude_root="$CSA_CLAUDE_ROOT"
+owned_claude_root="$TEST_ROOT/owned-claude"
+owned_runtime_a="$owned_claude_root/patched/runtime-a"
+owned_runtime_b="$owned_claude_root/patched/runtime-b"
+mkdir -p "$owned_runtime_a" "$owned_runtime_b"
+cp "$(readlink -f "$(command -v python3)")" "$owned_runtime_a/claude-science"
+cp "$(readlink -f "$(command -v python3)")" "$owned_runtime_b/claude-science"
+chmod +x "$owned_runtime_a/claude-science" "$owned_runtime_b/claude-science"
+cat >"$owned_runtime_a/serve" <<'PY'
+import time
+
+while True:
+    time.sleep(1)
+PY
+ln -s "$owned_runtime_a" "$owned_claude_root/patched-current"
+(
+  cd "$owned_runtime_a"
+  exec "$owned_claude_root/patched-current/claude-science" serve
+) &
+managed_fixture_pid=$!
+CSA_CLAUDE_ROOT="$owned_claude_root"
+deadline=$((SECONDS + 5))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  managed_claude_pid "$managed_fixture_pid" && break
+  sleep 0.05
+done
+if ! managed_claude_pid "$managed_fixture_pid"; then
+  echo "Lifecycle rejected a managed daemon launched through patched-current." >&2
+  exit 1
+fi
+ln -sfn "$owned_runtime_b" "$owned_claude_root/patched-current"
+managed_claude_pid "$managed_fixture_pid" || {
+  echo "Lifecycle lost ownership after patched-current advanced generations." >&2
+  exit 1
+}
+kill "$managed_fixture_pid"
+wait "$managed_fixture_pid" 2>/dev/null || true
+managed_fixture_pid=""
+CSA_CLAUDE_ROOT="$original_claude_root"
 
 # The detached daemon must inherit its verified Linux runtime directory, not
 # the portable package's /mnt/c or /mnt/e working directory.

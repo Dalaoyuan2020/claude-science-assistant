@@ -18,11 +18,15 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 - MCP 真正按需加载且保留计算环境首装：禁用启动阶段 `QT9` 内置 MCP 与 custom-MCP 元数据预热，catalog snapshot 不再启动 server；保留默认 Python/R/BYOC 的 `NYz` 排队、创建与重试。
 - Git 安全扫描按需执行：启动时不再递归所有持久 RW host grant；首次真实 sandbox 命令和后续新增授权仍经过未削弱的 `_ensureGitScan()` 安全门。
 - 持久授权质检与一键收窄：只读取授权字符串、不遍历目标目录，兼容现代/旧授权格式并识别全部有效 DrvFS RW；“修复并重启”先保存 0600 私有备份，再保留读取、撤销 DrvFS 持久写入。
+- 核心服务优先唤起：启动器首次加载只尝试一次幂等初始化；无监听冲突且运行时可用时自动启动 Claude Science，周期刷新不重复启动。技术依赖仍保持先验证 Bridge、再启动指向它的 Claude Science daemon。
 - 版本身份统一：界面、窗口标题、Tauri/Cargo、便携包 manifest、启动脚本和 Bridge runtime ID 统一为 0.1.6；内置 Claude Science 仍保持 0.1.25。
 
 ## 修复与加固
 
+- “打开 Claude Science”不再把一次性的 control-socket/锁文件切换误报成“服务未启动”：启动器会串行等待 Windows 与 WSL 生命周期锁，固定使用体检确认的 WSL 用户，对瞬态控制通道失败做有限退避重试，并分别报告运行时缺失、生命周期忙、daemon 未就绪和控制通道超时。一次性 nonce 只在 Rust 后端交给系统浏览器，不经过前端状态或诊断文本；仅允许打开 `localhost`/loopback 的 `8765` 登录地址。
 - 不再把“端口打开”直接显示成“系统正常”，也不会把另一个或旧目录的 Bridge 当作当前包。
+- Bridge-only 且没有 Claude 监听者时按普通“待启动”处理；单端口或未验证监听者显示为“拓扑/身份待验证”，不再重复提示“Claude Science 尚未启动”。
+- 旧 Windows Bridge 会阻断自动与手动 WSL 启动，并始终显示显式迁移入口，避免形成双 Bridge；经 `patched-current` 启动的受管 daemon 在运行时指针升级后仍能被检查器与生命周期一致识别。
 - Claude Science 就绪探针不发送任何 daemon HTTP：只验证 `8765/8766` 同 PID、受管 EXE、`serve` argv 和进程线程可安全检查性；事件循环与外网出口由独立 deep SOCKS5H canary 判定，避免把 SPA、feature flag 或图像 provider 混入本地启动门。
 - 代理变量冲突只在新建 Claude Science 子进程的环境里清理，不改 Windows/WSL 系统代理、VPN、DNS、hosts 或证书。
 - 生命周期操作只针对通过端口、可执行路径、启动代际和运行时身份联合验证的 CSA 进程；普通自检与修复不会自动执行全局 `wsl --shutdown`。

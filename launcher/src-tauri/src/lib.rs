@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri_plugin_opener::OpenerExt;
 
 mod runtime_lifecycle;
 
@@ -34,6 +35,8 @@ const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
 const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
 const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-pypi-head-v2";
 const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://pypi.org/simple/pip/";
+const CLAUDE_URL_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const CLAUDE_URL_COMMAND_TIMEOUT: Duration = Duration::from_secs(50);
 
 fn deep_network_result_is_fresh(
     deep_checked: bool,
@@ -58,12 +61,19 @@ fn bridge_config_transition_lock() -> &'static Mutex<()> {
     BRIDGE_CONFIG_TRANSITION.get_or_init(|| Mutex::new(()))
 }
 
-fn service_operation_lock(operation: &str) -> Result<ServiceOperationLock, String> {
+fn service_operation_lock_with_timeout(
+    operation: &str,
+    timeout: Duration,
+) -> Result<ServiceOperationLock, String> {
     let path = settings_path()?
         .parent()
         .ok_or_else(|| "无法定位 CSA 状态目录".to_string())?
         .join("service-lifecycle.lock");
-    ServiceOperationLock::acquire(&path, operation, Duration::from_secs(3))
+    ServiceOperationLock::acquire(&path, operation, timeout)
+}
+
+fn service_operation_lock(operation: &str) -> Result<ServiceOperationLock, String> {
+    service_operation_lock_with_timeout(operation, Duration::from_secs(3))
 }
 
 #[cfg(windows)]
@@ -167,7 +177,7 @@ where
         .map_err(|error| format!("background task failed: {error}"))?
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemStatus {
     state: String,
@@ -178,6 +188,7 @@ struct SystemStatus {
     bridge_pid: Option<u32>,
     claude_running: bool,
     claude_pid: Option<u32>,
+    claude_listener_present: bool,
     bridge_healthy: bool,
     bridge_identity: Option<RuntimeIdentity>,
     windows_bridge_pid: Option<u32>,
@@ -374,6 +385,105 @@ struct WslProbeRuntime {
     port_8765: bool,
     #[serde(default)]
     port_8766: bool,
+}
+
+fn claude_runtime_is_running(runtime: &WslProbeRuntime) -> bool {
+    runtime.claude_owner_verified
+        && runtime.claude_pid.is_some()
+        && runtime.port_8765
+        && runtime.port_8766
+}
+
+fn claude_listener_is_present(runtime: &WslProbeRuntime) -> bool {
+    runtime.claude_pid.is_some()
+        || runtime.claude_unverified_pid.is_some()
+        || runtime.port_8765
+        || runtime.port_8766
+}
+
+fn append_claude_runtime_warning(
+    warnings: &mut Vec<String>,
+    bridge_healthy: bool,
+    runtime: &WslProbeRuntime,
+) {
+    if claude_runtime_is_running(runtime) {
+        return;
+    }
+
+    if claude_listener_is_present(runtime) {
+        let owner = runtime
+            .claude_unverified_pid
+            .map(|pid| format!("PID {pid}"))
+            .unwrap_or_else(|| "未知进程".into());
+        if runtime.port_8765 && runtime.port_8766 {
+            warnings.push(format!(
+                "Claude Science 的 8765/8766 端口正在监听（{owner}），但尚未通过同一受管进程身份校验；CSA 不会误报为已停止，也不会自动终止该进程。"
+            ));
+        } else {
+            let topology = match (runtime.port_8765, runtime.port_8766) {
+                (true, false) => "仅 8765",
+                (false, true) => "仅 8766",
+                _ => "端口归属信息不完整",
+            };
+            warnings.push(format!(
+                "Claude Science 已出现监听进程（{owner}，{topology}），但双端口拓扑尚未就绪；当前按启动中或异常状态处理，不会显示为已停止。"
+            ));
+        }
+    } else if bridge_healthy {
+        warnings.push(
+            "Bridge 已就绪，但 Claude Science 核心服务尚未运行；启动器会把核心服务作为首要启动目标。"
+                .into(),
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+struct SystemStateInputs {
+    host_access_repair_needed: bool,
+    bridge_healthy: bool,
+    claude_running: bool,
+    unit_contract_ok: bool,
+    network_ready: bool,
+    storage_blocked: bool,
+    wsl_runtime_writable: bool,
+    runtime_ready: bool,
+    bridge_running: bool,
+    claude_listener_present: bool,
+    windows_bridge_present: bool,
+}
+
+fn classify_system_state(input: &SystemStateInputs) -> &'static str {
+    if input.host_access_repair_needed {
+        "degraded"
+    } else if input.windows_bridge_present {
+        // Never advertise a normal start/restart path while the legacy
+        // Windows listener exists: doing so could create a second WSL Bridge.
+        "degraded"
+    } else if input.bridge_healthy
+        && input.claude_running
+        && input.unit_contract_ok
+        && input.network_ready
+    {
+        "running"
+    } else if input.storage_blocked || !input.wsl_runtime_writable {
+        "degraded"
+    } else if !input.runtime_ready && !input.bridge_running && !input.claude_listener_present {
+        "notInstalled"
+    } else if input.bridge_healthy
+        && input.runtime_ready
+        && !input.claude_listener_present
+        && input.unit_contract_ok
+        && !input.windows_bridge_present
+    {
+        // A healthy Bridge is Claude Science's dependency, not evidence that
+        // the core daemon needs repair. The primary action can use a normal,
+        // non-destructive start transaction from this state.
+        "stopped"
+    } else if input.bridge_running || input.claude_listener_present {
+        "degraded"
+    } else {
+        "stopped"
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -775,8 +885,22 @@ fn run_wsl_with_timeout(distro: &str, args: &[&str], timeout: Duration) -> Resul
     command_output_with_timeout(command, timeout, &format!("WSL {distro}"))
 }
 
-fn wsl_shell(distro: &str, script: &str) -> Result<Output, String> {
-    run_wsl(distro, &["sh", "-lc", script])
+fn run_wsl_as_user_with_timeout(
+    distro: &str,
+    user: &str,
+    args: &[&str],
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    let mut command = background_command("wsl.exe");
+    command
+        .arg("--distribution")
+        .arg(distro)
+        .arg("--user")
+        .arg(user)
+        .arg("--")
+        .args(args);
+    command_output_with_timeout(command, timeout, label)
 }
 
 fn parse_first_pid(text: &str) -> Option<u32> {
@@ -984,6 +1108,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 bridge_pid: None,
                 claude_running: false,
                 claude_pid: None,
+                claude_listener_present: false,
                 bridge_healthy: false,
                 bridge_identity: None,
                 windows_bridge_pid: legacy_windows_bridge_pid(),
@@ -1017,6 +1142,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             bridge_pid: None,
             claude_running: false,
             claude_pid: None,
+            claude_listener_present: false,
             bridge_healthy: false,
             bridge_identity: None,
             windows_bridge_pid: legacy_windows_bridge_pid(),
@@ -1077,6 +1203,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 bridge_pid: None,
                 claude_running: false,
                 claude_pid: None,
+                claude_listener_present: false,
                 bridge_healthy: false,
                 bridge_identity: None,
                 windows_bridge_pid: None,
@@ -1115,10 +1242,8 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         || probe.runtime.bridge_health_responding
         || probe.runtime.bridge_service_active
         || probe.runtime.port_9876;
-    let claude_running = probe.runtime.claude_owner_verified
-        && claude_pid.is_some()
-        && probe.runtime.port_8765
-        && probe.runtime.port_8766;
+    let claude_running = claude_runtime_is_running(&probe.runtime);
+    let claude_listener_present = claude_listener_is_present(&probe.runtime);
     let unit_matches_project = probe.runtime.unit_matches_project;
     let unit_contract_ok = !probe.wsl.systemd || unit_matches_project == Some(true);
     let proxy_state = if probe.network.proxy_state.trim().is_empty() {
@@ -1274,22 +1399,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             "Port 9876 is answered by a Bridge from another or older CSA package directory; expected {expected}, actual {actual}, source_match={source_match}. Restart from this package to migrate it."
         ));
     }
-    if bridge_running && !claude_running {
-        warnings.push("Bridge is running, but Claude Science is not detected on 8765/8766.".into());
-    }
-    if probe.runtime.claude_unverified_pid.is_some()
-        || ((probe.runtime.port_8765 || probe.runtime.port_8766)
-            && !probe.runtime.claude_owner_verified)
-    {
-        let owner = probe
-            .runtime
-            .claude_unverified_pid
-            .map(|pid| format!("PID {pid}"))
-            .unwrap_or_else(|| "an unknown owner".into());
-        warnings.push(format!(
-            "Claude Science port 8765/8766 is occupied by {owner}, but its executable is not a CSA managed runtime; CSA will not report it ready or stop it automatically."
-        ));
-    }
+    append_claude_runtime_warning(&mut warnings, bridge_healthy, &probe.runtime);
     if unit_matches_project == Some(false) {
         warnings.push("WSL Bridge service does not point to the stable CSA managed runtime; run repair and restart to migrate it.".into());
     }
@@ -1390,11 +1500,10 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         ));
     }
 
-    if bridge_pid.is_some() && claude_pid.is_none() {
-        warnings.push("Bridge 正在运行，但 Claude Science 尚未启动".into());
-    }
-    if bridge_pid.is_some() && windows_bridge_pid.is_some() {
-        warnings.push("检测到 Windows 与 WSL 同时运行 Bridge；请迁移旧 Windows 实例".into());
+    if let Some(pid) = windows_bridge_pid {
+        warnings.push(format!(
+            "检测到旧 Windows Bridge（PID {pid}）；请先显式停止旧实例，再启动 WSL 服务，避免形成双 Bridge。"
+        ));
     }
     if !source_binary_present {
         warnings.push(
@@ -1474,21 +1583,19 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
     let host_access_repair_needed = probe.host_access.preferences_present
         && probe.host_access.preferences_parse_ok
         && probe.host_access.drvfs_write_grant_count > 0;
-    let state = if host_access_repair_needed {
-        "degraded"
-    } else if bridge_healthy && claude_running && unit_contract_ok && network_ready {
-        "running"
-    } else if storage_blocked || !wsl_runtime_writable {
-        "degraded"
-    } else if !runtime_ready && !bridge_running && !claude_running {
-        "notInstalled"
-    } else if bridge_running && windows_bridge_pid.is_some() {
-        "degraded"
-    } else if bridge_running || claude_running {
-        "degraded"
-    } else {
-        "stopped"
-    };
+    let state = classify_system_state(&SystemStateInputs {
+        host_access_repair_needed,
+        bridge_healthy,
+        claude_running,
+        unit_contract_ok,
+        network_ready,
+        storage_blocked,
+        wsl_runtime_writable,
+        runtime_ready,
+        bridge_running,
+        claude_listener_present,
+        windows_bridge_present: windows_bridge_pid.is_some(),
+    });
 
     SystemStatus {
         state: state.into(),
@@ -1499,6 +1606,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         bridge_pid,
         claude_running,
         claude_pid,
+        claude_listener_present,
         bridge_healthy,
         bridge_identity: probe.runtime.bridge_identity,
         windows_bridge_pid,
@@ -4441,9 +4549,55 @@ fn start_services_raw(
     }
 }
 
+fn should_initialize_core_runtime(status: &SystemStatus) -> bool {
+    status.wsl_installed
+        && status.runtime_ready
+        && !status.claude_running
+        && !status.claude_listener_present
+        && !status.restart_blocked
+        && status.windows_bridge_pid.is_none()
+}
+
+fn initialize_runtime_impl() -> Result<SystemStatus, String> {
+    let _service_operation = service_operation_lock("initialize-runtime")?;
+    let before = current_status();
+    if !should_initialize_core_runtime(&before) {
+        return Ok(before);
+    }
+
+    let distro = before
+        .distro
+        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+    let user = before
+        .linux_user
+        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+
+    // Claude Science is the primary product service. The transaction is
+    // requested first during launcher boot, while start_services_raw keeps the
+    // required dependency order: a verified Bridge on 9876 must exist before
+    // the daemon that points ANTHROPIC_BASE_URL at that Bridge is spawned.
+    start_services_raw(&distro, &user, false)?;
+    Ok(current_status())
+}
+
+fn ensure_no_legacy_windows_bridge(status: &SystemStatus) -> Result<(), String> {
+    if let Some(pid) = status.windows_bridge_pid {
+        return Err(format!(
+            "检测到旧 Windows Bridge（PID {pid}）。为避免同时运行 Windows/WSL 双 Bridge，请先在诊断区显式停止旧实例，再启动 Claude Science。"
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn initialize_runtime() -> Result<SystemStatus, String> {
+    run_blocking(initialize_runtime_impl).await
+}
+
 fn start_services_impl() -> Result<SystemStatus, String> {
     let _service_operation = service_operation_lock("start-services")?;
     let before = current_status();
+    ensure_no_legacy_windows_bridge(&before)?;
     if before.state == "running" {
         return Ok(before);
     }
@@ -4507,12 +4661,19 @@ managed_claude_pid() {
   [ -r "/proc/$pid/cmdline" ] || return 1
   raw_executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
   executable="${raw_executable% (deleted)}"
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
   case "$executable" in
-    "$state_root"/runtime/claude-science/patched/*/claude-science|"$legacy_root"/patched/claude-science) ;;
+    "$state_root"/runtime/claude-science/patched/*/claude-science)
+      [ "${argv[0]:-}" = "$executable" ] \
+        || [ "${argv[0]:-}" = "$state_root/runtime/claude-science/patched-current/claude-science" ] \
+        || return 1
+      ;;
+    "$legacy_root"/patched/claude-science)
+      [ "${argv[0]:-}" = "$executable" ] || return 1
+      ;;
     *) return 1;;
   esac
-  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
-  [ "${argv[0]:-}" = "$executable" ] && [ "${argv[1]:-}" = "serve" ]
+  [ "${argv[1]:-}" = "serve" ]
 }
 
 process_start_ticks() {
@@ -4759,6 +4920,7 @@ async fn stop_services() -> Result<SystemStatus, String> {
 fn restart_services_impl() -> Result<SystemStatus, String> {
     let _service_operation = service_operation_lock("restart-services")?;
     let before = current_status();
+    ensure_no_legacy_windows_bridge(&before)?;
     if before.restart_blocked {
         return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应、Claude Science 正处于不可中断 I/O，或安装包不完整。现有服务、WSL 和无关端口不会被停止。".into());
     }
@@ -4782,30 +4944,249 @@ fn selected_distro_quick() -> Result<String, String> {
     preferred_distro(&distros).ok_or_else(|| "WSL 不可用".to_string())
 }
 
-fn get_claude_url_impl() -> Result<String, String> {
-    let distro = selected_distro_quick()?;
-    let output = wsl_shell(
-        &distro,
-        r#"bin="$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science"
+const CLAUDE_URL_SHELL: &str = r#"
+set -u
+state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
+lifecycle_lock="$state_root/runtime/lifecycle.lock"
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "CSA_URL_FLOCK_MISSING" >&2
+  exit 70
+fi
+if [ -f "$lifecycle_lock" ]; then
+  if ! exec 9<>"$lifecycle_lock"; then
+    echo "CSA_URL_LIFECYCLE_LOCK_UNREADABLE" >&2
+    exit 74
+  fi
+  if ! flock -w 25 9; then
+    echo "CSA_URL_LIFECYCLE_BUSY" >&2
+    exit 75
+  fi
+else
+  # Pre-v0.1.6 managed runtimes did not always create this lock. The Windows
+  # cross-process mutex still serializes launcher operations; keep the legacy
+  # URL path usable and rely on the bounded control-channel retries below.
+  echo "CSA_URL_LEGACY_NO_LIFECYCLE_LOCK" >&2
+fi
+
+bin="$HOME/.local/share/csa/runtime/claude-science/patched-current/claude-science"
 if [ ! -x "$bin" ]; then
   bin="$HOME/.local/share/claude-science-api-bridge/patched/claude-science"
 fi
-[ -x "$bin" ] || exit 2
-"$bin" url"#,
-    )?;
-    if !output.status.success() {
-        return Err("无法获取 Claude Science 地址，请先启动服务".into());
-    }
-    output_text(&output)
+if [ ! -x "$bin" ]; then
+  echo "CSA_URL_RUNTIME_MISSING" >&2
+  exit 2
+fi
+
+attempt=1
+last_rc=4
+while [ "$attempt" -le 2 ]; do
+  "$bin" url
+  last_rc=$?
+  if [ "$last_rc" -eq 0 ]; then
+    exit 0
+  fi
+  case "$last_rc" in
+    1|4) ;;
+    *)
+      echo "CSA_URL_COMMAND_FAILED=$last_rc" >&2
+      exit "$last_rc"
+      ;;
+  esac
+  if [ "$attempt" -lt 2 ]; then
+    echo "CSA_URL_TRANSIENT_RETRY=$last_rc" >&2
+    sleep 1
+  fi
+  attempt=$((attempt + 1))
+done
+
+if [ "$last_rc" -eq 1 ]; then
+  echo "CSA_URL_CONTROL_UNAVAILABLE" >&2
+else
+  echo "CSA_URL_DAEMON_NOT_READY" >&2
+fi
+exit "$last_rc"
+"#;
+
+fn safe_claude_loopback_url(output: &str) -> Result<String, String> {
+    let mut saw_url = false;
+    for line in output
         .lines()
-        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "Claude Science 未返回可打开的地址".to_string())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !(line.starts_with("http://") || line.starts_with("https://")) {
+            continue;
+        }
+        saw_url = true;
+        let Ok(url) = tauri::Url::parse(line) else {
+            continue;
+        };
+        let host = url.host_str().unwrap_or_default();
+        let host_without_brackets = host.trim_start_matches('[').trim_end_matches(']');
+        let loopback_host = host_without_brackets.eq_ignore_ascii_case("localhost")
+            || host_without_brackets
+                .parse::<std::net::IpAddr>()
+                .map(|address| address.is_loopback())
+                .unwrap_or(false);
+        let has_nonce = url
+            .query_pairs()
+            .any(|(key, value)| key == "nonce" && !value.is_empty());
+        if url.scheme() == "http"
+            && loopback_host
+            && url.port() == Some(8765)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.fragment().is_none()
+            && has_nonce
+        {
+            return Ok(line.to_string());
+        }
+    }
+    if saw_url {
+        Err("Claude Science 返回了非受信任的登录地址；CSA 已拒绝打开。".into())
+    } else {
+        Err("Claude Science 登录控制通道没有返回可打开的本机地址。".into())
+    }
+}
+
+fn safe_claude_url_error_detail(stderr: &str) -> Option<String> {
+    let cleaned = clean_diagnostic_text(stderr);
+    let mut lines = Vec::new();
+    for line in cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.starts_with("CSA_URL_") {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("nonce")
+            || lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+        {
+            lines.push("<敏感诊断已隐藏>".to_string());
+            continue;
+        }
+        let redacted = line
+            .split_whitespace()
+            .map(|word| {
+                if word.starts_with("http://") || word.starts_with("https://") {
+                    "<地址已隐藏>"
+                } else {
+                    word
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(redacted);
+    }
+    let mut detail = lines.join("；");
+    if detail.chars().count() > 400 {
+        detail = detail.chars().take(400).collect::<String>();
+        detail.push('…');
+    }
+    (!detail.trim().is_empty()).then_some(detail)
+}
+
+fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Result<String, String> {
+    if exit_code == Some(0) {
+        return safe_claude_loopback_url(stdout);
+    }
+
+    let cleaned_stderr = clean_diagnostic_text(stderr);
+    let base = if cleaned_stderr.contains("CSA_URL_RUNTIME_MISSING") || exit_code == Some(2) {
+        "Claude Science 受管运行时入口缺失；请从完整 V0.1.6 便携包执行修复。"
+    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_BUSY") || exit_code == Some(75) {
+        "Claude Science 仍在启动或重启；等待生命周期切换 25 秒后仍未完成，请稍后重试。"
+    } else if cleaned_stderr.contains("CSA_URL_FLOCK_MISSING") || exit_code == Some(70) {
+        "WSL 缺少 CSA 生命周期锁工具 flock，无法安全等待服务切换。"
+    } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_LOCK_UNREADABLE") || exit_code == Some(74)
+    {
+        "CSA 生命周期锁不可读写，无法安全生成 Claude Science 登录地址。"
+    } else if cleaned_stderr.contains("CSA_URL_CONTROL_UNAVAILABLE") || exit_code == Some(1) {
+        "Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成一次退避重试。"
+    } else if cleaned_stderr.contains("CSA_URL_DAEMON_NOT_READY") || exit_code == Some(4) {
+        "Claude Science 当前没有稳定的锁文件或控制 socket，服务可能仍在切换。"
+    } else {
+        "Claude Science 登录地址生成失败。"
+    };
+    if let Some(code) = exit_code {
+        if let Some(detail) = safe_claude_url_error_detail(stderr) {
+            Err(format!("{base}（退出码 {code}）诊断：{detail}"))
+        } else {
+            Err(format!("{base}（退出码 {code}）"))
+        }
+    } else if let Some(detail) = safe_claude_url_error_detail(stderr) {
+        Err(format!("{base} 诊断：{detail}"))
+    } else {
+        Err(base.into())
+    }
+}
+
+fn get_claude_url_impl() -> Result<String, String> {
+    let _service_operation = service_operation_lock_with_timeout(
+        "open-claude-science",
+        CLAUDE_URL_SERVICE_LOCK_TIMEOUT,
+    )
+    .map_err(|error| {
+        if error.contains("Another CSA service operation") {
+            "另一个 CSA 启动器仍在执行启动或重启；等待 30 秒后仍未完成，请稍后再点“打开 Claude Science”。"
+                .to_string()
+        } else {
+            format!(
+                "无法建立 Claude Science 打开操作的跨进程锁：{}",
+                clean_diagnostic_text(&error)
+            )
+        }
+    })?;
+    let status = current_status();
+    let distro = status
+        .distro
+        .ok_or_else(|| "WSL 不可用，无法打开 Claude Science。".to_string())?;
+    let user = status
+        .linux_user
+        .ok_or_else(|| "无法确定 Claude Science 所属的 WSL 用户。".to_string())?;
+    if !status.runtime_ready {
+        return Err("Claude Science 受管运行时尚未准备完成。".into());
+    }
+    if status.restart_blocked {
+        return Err(
+            "Claude Science 当前处于不可安全打断的 I/O 状态；CSA 不会在此时生成或打开登录地址。"
+                .into(),
+        );
+    }
+    let output = run_wsl_as_user_with_timeout(
+        &distro,
+        &user,
+        &["bash", "-lc", CLAUDE_URL_SHELL],
+        CLAUDE_URL_COMMAND_TIMEOUT,
+        "Claude Science 登录地址生成",
+    )
+    .map_err(|error| {
+        format!(
+            "等待 Claude Science 登录控制通道失败：{}",
+            clean_diagnostic_text(&error)
+        )
+    })?;
+    claude_url_result(
+        output.status.code(),
+        &decode_console_output(&output.stdout),
+        &decode_console_output(&output.stderr),
+    )
 }
 
 #[tauri::command]
-async fn get_claude_url() -> Result<String, String> {
-    run_blocking(get_claude_url_impl).await
+async fn open_claude_science(app: tauri::AppHandle) -> Result<(), String> {
+    let url = run_blocking(get_claude_url_impl).await?;
+    app.opener().open_url(url, None::<&str>).map_err(|_| {
+        "已生成本机登录地址，但 Windows 无法打开默认浏览器；请检查默认浏览器关联后重试。"
+            .to_string()
+    })
 }
 
 fn get_dashboard_url_impl() -> Result<String, String> {
@@ -4886,12 +5267,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_system_status,
+            initialize_runtime,
             run_network_quality_check,
             get_runtime_update_status,
             start_services,
             stop_services,
             restart_services,
-            get_claude_url,
+            open_claude_science,
             get_dashboard_url,
             stop_legacy_windows_bridge,
             get_provider_catalog,
@@ -4957,6 +5339,184 @@ mod tests {
             clean_diagnostic_text(&decoded),
             "sh: 2: Syntax error: word unexpected (expecting \"do\")"
         );
+    }
+
+    #[test]
+    fn claude_login_url_accepts_only_the_managed_loopback_origin() {
+        let nonce = "a".repeat(64);
+        for origin in [
+            "http://localhost:8765",
+            "http://127.0.0.1:8765",
+            "http://127.0.0.2:8765",
+            "http://[::1]:8765",
+        ] {
+            let expected = format!("{origin}/?nonce={nonce}");
+            let output = format!("startup warning\n  {expected}  \n");
+            assert_eq!(safe_claude_loopback_url(&output).unwrap(), expected);
+        }
+
+        for candidate in [
+            format!("https://127.0.0.1:8765/?nonce={nonce}"),
+            format!("http://evil.example:8765/?nonce={nonce}"),
+            format!("http://localhost.evil:8765/?nonce={nonce}"),
+            format!("http://localhost@evil.example:8765/?nonce={nonce}"),
+            format!("http://127.0.0.1:9876/?nonce={nonce}"),
+            format!("http://127.0.0.1:8765/login?nonce={nonce}"),
+            format!("http://127.0.0.1:8765/?nonce={nonce}#fragment"),
+            "http://127.0.0.1:8765/".to_string(),
+        ] {
+            let error = safe_claude_loopback_url(&candidate).unwrap_err();
+            assert!(error.contains("非受信任") || error.contains("没有返回"));
+            assert!(!error.contains(&nonce));
+        }
+    }
+
+    #[test]
+    fn claude_login_url_failures_are_classified_without_leaking_nonce() {
+        let nonce = "deadbeef".repeat(8);
+        let secret_stdout = format!("http://127.0.0.1:8765/?nonce={nonce}\n");
+        let control = claude_url_result(
+            Some(1),
+            &secret_stdout,
+            &format!("failed to mint nonce at http://127.0.0.1:8765/?nonce={nonce}\nCSA_URL_CONTROL_UNAVAILABLE\n"),
+        )
+        .unwrap_err();
+        assert!(control.contains("登录控制通道"));
+        assert!(!control.contains(&nonce));
+        assert!(!control.contains("nonce="));
+
+        let missing =
+            claude_url_result(Some(2), &secret_stdout, "CSA_URL_RUNTIME_MISSING\n").unwrap_err();
+        assert!(missing.contains("运行时入口缺失"));
+        assert!(!missing.contains(&nonce));
+
+        let busy =
+            claude_url_result(Some(75), &secret_stdout, "CSA_URL_LIFECYCLE_BUSY\n").unwrap_err();
+        assert!(busy.contains("启动或重启"));
+        assert!(!busy.contains(&nonce));
+
+        let unknown = claude_url_result(
+            Some(9),
+            &secret_stdout,
+            "provider failed at https://example.invalid/private\n",
+        )
+        .unwrap_err();
+        assert!(unknown.contains("退出码 9"));
+        assert!(unknown.contains("<地址已隐藏>"));
+        assert!(!unknown.contains("example.invalid"));
+        assert!(!unknown.contains(&nonce));
+    }
+
+    #[test]
+    fn claude_login_url_waits_for_lifecycle_and_retries_only_transient_codes() {
+        assert!(CLAUDE_URL_SHELL.contains("flock -w 25 9"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_LEGACY_NO_LIFECYCLE_LOCK"));
+        assert!(CLAUDE_URL_SHELL.contains("while [ \"$attempt\" -le 2 ]"));
+        assert!(CLAUDE_URL_SHELL.contains("1|4) ;;"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_TRANSIENT_RETRY"));
+        assert!(CLAUDE_URL_SHELL.contains("CSA_URL_COMMAND_FAILED"));
+        assert!(!CLAUDE_URL_SHELL.contains("echo \"$bin\""));
+    }
+
+    #[test]
+    fn claude_runtime_warning_distinguishes_stopped_partial_and_ready() {
+        let mut runtime = WslProbeRuntime::default();
+        let mut warnings = Vec::new();
+        append_claude_runtime_warning(&mut warnings, false, &runtime);
+        assert!(warnings.is_empty());
+
+        append_claude_runtime_warning(&mut warnings, true, &runtime);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("核心服务尚未运行"));
+
+        runtime.port_8765 = true;
+        runtime.claude_unverified_pid = Some(41);
+        warnings.clear();
+        append_claude_runtime_warning(&mut warnings, true, &runtime);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("双端口拓扑尚未就绪"));
+        assert!(!warnings[0].contains("核心服务尚未运行"));
+
+        runtime.port_8766 = true;
+        warnings.clear();
+        append_claude_runtime_warning(&mut warnings, true, &runtime);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("尚未通过同一受管进程身份校验"));
+
+        runtime.claude_unverified_pid = None;
+        runtime.claude_pid = Some(41);
+        runtime.claude_owner_verified = true;
+        warnings.clear();
+        append_claude_runtime_warning(&mut warnings, true, &runtime);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn bridge_only_is_stopped_but_partial_or_unverified_claude_is_degraded() {
+        let windows_only = SystemStateInputs {
+            windows_bridge_present: true,
+            wsl_runtime_writable: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_system_state(&windows_only), "degraded");
+
+        let mut input = SystemStateInputs {
+            bridge_healthy: true,
+            bridge_running: true,
+            unit_contract_ok: true,
+            runtime_ready: true,
+            wsl_runtime_writable: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_system_state(&input), "stopped");
+
+        input.runtime_ready = false;
+        assert_eq!(classify_system_state(&input), "degraded");
+        input.runtime_ready = true;
+
+        input.claude_listener_present = true;
+        assert_eq!(classify_system_state(&input), "degraded");
+
+        input.claude_listener_present = false;
+        input.windows_bridge_present = true;
+        assert_eq!(classify_system_state(&input), "degraded");
+
+        input.windows_bridge_present = false;
+        input.claude_running = true;
+        input.claude_listener_present = true;
+        input.network_ready = true;
+        assert_eq!(classify_system_state(&input), "running");
+    }
+
+    #[test]
+    fn core_runtime_auto_initialization_is_one_safe_absent_daemon_case() {
+        let mut status = SystemStatus {
+            wsl_installed: true,
+            runtime_ready: true,
+            ..Default::default()
+        };
+        assert!(should_initialize_core_runtime(&status));
+
+        status.claude_listener_present = true;
+        assert!(!should_initialize_core_runtime(&status));
+        status.claude_listener_present = false;
+
+        status.claude_running = true;
+        assert!(!should_initialize_core_runtime(&status));
+        status.claude_running = false;
+
+        status.restart_blocked = true;
+        assert!(!should_initialize_core_runtime(&status));
+        status.restart_blocked = false;
+
+        status.windows_bridge_pid = Some(99);
+        assert!(!should_initialize_core_runtime(&status));
+        assert!(ensure_no_legacy_windows_bridge(&status)
+            .unwrap_err()
+            .contains("双 Bridge"));
+
+        status.windows_bridge_pid = None;
+        assert!(ensure_no_legacy_windows_bridge(&status).is_ok());
     }
 
     #[test]
@@ -5716,6 +6276,27 @@ mod tests {
         assert_eq!(source.matches("activateKey(pendingApiKeyId)").count(), 1);
         assert!(source.contains("onClick={() => preselectKey(entry.id)}"));
         assert!(source.contains("保存到列表"));
+    }
+
+    #[test]
+    fn claude_open_ui_serializes_clicks_and_keeps_nonce_off_frontend() {
+        let source = include_str!("../../src/App.tsx");
+        let action_start = source
+            .find("async function primaryAction()")
+            .expect("primary action should exist");
+        let action_end = source[action_start..]
+            .find("async function openDashboard(")
+            .map(|offset| action_start + offset)
+            .expect("dashboard helper should follow primary action");
+        let action = &source[action_start..action_end];
+
+        assert!(action.contains("if (busyRef.current) return;"));
+        assert!(action.contains("updateBusy(true);"));
+        assert!(action.contains("setError(\"\");"));
+        assert!(action.contains("await invoke<void>(\"open_claude_science\");"));
+        assert!(action.contains("finally"));
+        assert!(action.contains("updateBusy(false);"));
+        assert!(!source.contains("get_claude_url"));
     }
 
     #[test]

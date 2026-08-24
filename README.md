@@ -43,6 +43,7 @@ CSA 把这些步骤收口成一个桌面应用：
 7. **Git 安全扫描按需执行**：保留根路径钉住、授权恢复和 `_ensureGitScan()` 的完整安全门，只跳过 daemon 启动链上的宽泛授权预扫描；首次真实沙盒命令仍先扫描再执行。
 8. **更安全的启动与修复边界**：修复只处理 CSA 精确拥有的进程和新建子进程环境，不改系统代理、VPN、DNS、hosts、证书，也不会把全局 `wsl --shutdown` 当成普通自修动作。
 9. **保留 v0.1.5 聚合能力**：API 接入、三层角色映射、方案一/方案二和事务化切换保持兼容；产品版本升级为 0.1.6，内置 Claude Science 仍锁定已验证的 0.1.25。
+10. **核心服务优先唤起**：启动器首次加载会安全、幂等地确保 Claude Science 运行一次；30 秒状态刷新不会重复启动。若检测到未知监听者、残缺端口拓扑或存储/WSL 阻塞，只报告诊断而不自动变更进程。内部仍按必要的 `Bridge → Claude Science` 依赖顺序执行，因为 daemon 的 `ANTHROPIC_BASE_URL` 指向本地 Bridge。
 
 网络质检的状态机、缓存身份和安全边界见 [架构与产品计划 §10–11](docs/architecture-and-product-plan.zh-CN.md)，安装、升级及已知限制见 [v0.1.6 Release 说明](docs/github-release-v0.1.6.md)。
 
@@ -291,7 +292,7 @@ docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md，
 claude-science-assistant.exe
 ```
 
-首页应该显示 WSL、Bridge、Claude Science 和 Provider 状态。
+启动器会先尝试唤起 Claude Science 核心服务，再加载其余状态与 Provider 信息；首页随后应显示 WSL、Bridge、Claude Science 和 Provider 状态。若安全检查阻止自动启动，首页会保留精确诊断和手动启动入口。
 
 ### 7. 添加供应商
 
@@ -304,7 +305,7 @@ claude-science-assistant.exe
 5. 如 Provider 有多个模型，点击“自动映射”。
 6. 保存并设为当前使用。
 
-保存后点击“启动”或“打开 Claude Science”。
+正常情况下保存后可直接点击“打开 Claude Science”；若自动启动因安全检查未执行，则先按首页提示点击“启动”。
 
 详细教程见 [docs/quick-start.zh-CN.md](docs/quick-start.zh-CN.md)。
 

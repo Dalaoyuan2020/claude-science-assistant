@@ -125,6 +125,20 @@ interrupt unrelated services in the same WSL environment (for example SSH on ano
 daemon stuck in uninterruptible mount I/O is reported and preserved until it becomes safely
 signalable.
 
+## Launcher Says It Cannot Get the Claude Science Address
+
+An open `8765` listener is not by itself enough to mint the one-time browser login URL. The URL
+command also needs a matching `operon.lock` and a responsive local control socket. During a managed
+restart those objects can briefly disappear even while the launcher's previous status still says
+`running`.
+
+V0.1.6 serializes the open action with both launcher and WSL lifecycle locks, uses the inspected WSL
+user explicitly, retries only the transient daemon/control exit codes, and reports permanent failures
+separately. It opens only a validated loopback URL on port `8765`, and the one-time nonce is handed
+directly from the Rust backend to the system browser rather than returned to the web frontend. Do not
+copy login URLs into diagnostics. If the launcher reports that the lifecycle remains busy after its
+bounded wait, let the current start/restart finish and refresh; do not restart all of WSL.
+
 ## Tool Call Markers Appear As Text
 
 Some OpenAI-compatible providers emit native tool-call markers in normal text.

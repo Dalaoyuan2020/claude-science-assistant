@@ -291,12 +291,19 @@ managed_claude_pid() {
   [ -r "/proc/$pid/cmdline" ] || return 1
   raw_executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
   executable="${raw_executable% (deleted)}"
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
   case "$executable" in
-    "$CSA_CLAUDE_ROOT"/patched/*/claude-science|"$LEGACY_STATE_DIR"/patched/claude-science) ;;
+    "$CSA_CLAUDE_ROOT"/patched/*/claude-science)
+      [ "${argv[0]:-}" = "$executable" ] \
+        || [ "${argv[0]:-}" = "$CSA_CLAUDE_ROOT/patched-current/claude-science" ] \
+        || return 1
+      ;;
+    "$LEGACY_STATE_DIR"/patched/claude-science)
+      [ "${argv[0]:-}" = "$executable" ] || return 1
+      ;;
     *) return 1;;
   esac
-  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || true
-  [ "${argv[0]:-}" = "$executable" ] && [ "${argv[1]:-}" = "serve" ]
+  [ "${argv[1]:-}" = "serve" ]
 }
 
 process_start_ticks_shell() {
@@ -977,6 +984,10 @@ if [ "${CSA_REPAIR_DRVFS_GRANTS:-0}" = "1" ]; then
   fi
 fi
 
+# Claude Science is the primary product service, but its managed daemon points
+# ANTHROPIC_BASE_URL at the local Bridge. Keep the technical dependency order
+# Bridge -> Claude Science even though the launcher requests this whole
+# transaction as its first, one-shot initialization action.
 csa_stage_bridge_runtime "$PROJECT_DIR" "$CSA_PACKAGE_VERSION"
 BRIDGE_POINTER_CHANGED="$CSA_POINTER_CHANGED"
 BRIDGE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"

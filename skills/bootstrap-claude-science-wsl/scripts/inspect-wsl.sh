@@ -37,6 +37,10 @@ listener_pids() {
   ss -ltnp "sport = :$port" 2>/dev/null \
     | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
 }
+port_is_listening() {
+  local port="$1"
+  ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN
+}
 bridge_pid_list="$(listener_pids 9876 || true)"
 bridge_pid=""
 if [ "$(printf '%s\n' "$bridge_pid_list" | sed '/^$/d' | wc -l)" = "1" ]; then
@@ -53,15 +57,25 @@ if [ "$(printf '%s\n' "$claude_primary_pid_list" | sed '/^$/d' | wc -l)" = "1" ]
   && [ "$claude_primary_pid_list" = "$claude_auxiliary_pid_list" ]; then
   candidate_pid="$claude_primary_pid_list"
   candidate_executable="$(readlink -f "/proc/$candidate_pid/exe" 2>/dev/null || true)"
-  candidate_command="$(tr '\0' ' ' <"/proc/$candidate_pid/cmdline" 2>/dev/null || true)"
+  candidate_argv=()
+  mapfile -d '' -t candidate_argv <"/proc/$candidate_pid/cmdline" 2>/dev/null || true
+  candidate_argv0="${candidate_argv[0]:-}"
+  candidate_argv1="${candidate_argv[1]:-}"
+  candidate_argv_matches=false
   case "$candidate_executable" in
-    "$state_root"/runtime/claude-science/patched/*/claude-science|"$legacy_state_root"/patched/claude-science)
-      if [[ "$candidate_command" == *"$candidate_executable serve"* ]]; then
-        claude_pid="$candidate_pid"
-        claude_owner_verified=true
+    "$state_root"/runtime/claude-science/patched/*/claude-science)
+      if [ "$candidate_argv0" = "$candidate_executable" ] || [ "$candidate_argv0" = "$patched_bin" ]; then
+        candidate_argv_matches=true
       fi
       ;;
+    "$legacy_state_root"/patched/claude-science)
+      [ "$candidate_argv0" = "$candidate_executable" ] && candidate_argv_matches=true
+      ;;
   esac
+  if [ "$candidate_argv_matches" = true ] && [ "$candidate_argv1" = serve ]; then
+    claude_pid="$candidate_pid"
+    claude_owner_verified=true
+  fi
   if [ "$claude_owner_verified" != true ]; then
     claude_unverified_pid="$candidate_pid"
   fi
@@ -438,8 +452,8 @@ printf '"bridge_identity":%s,' "$bridge_identity_json"
 printf '"bridge_service_active":%s,' "$bridge_service_active"
 printf '"unit_matches_project":%s,' "$unit_matches_project"
 printf '"port_9876":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":9876 "')"
-printf '"port_8765":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8765 "')"
-printf '"port_8766":%s' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8766 "')"
+printf '"port_8765":%s,' "$(json_bool port_is_listening 8765)"
+printf '"port_8766":%s' "$(json_bool port_is_listening 8766)"
 printf '},'
 printf '"network":%s,' "$network_json"
 printf '"host_access":%s,' "$host_access_json"
