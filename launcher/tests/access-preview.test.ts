@@ -12,21 +12,26 @@ function functionBody(startMarker: string, endMarker: string) {
   return source.slice(start, end);
 }
 
-test("preview access transactions clear stale errors on success", () => {
-  const activateKey = functionBody("async function activateKey", "function updateRoleSubscription");
-  const saveAggregate = functionBody("async function saveRoleMappings", "function loadAggregateSchemeDraft");
-  const confirmAggregate = functionBody("async function confirmPendingAggregateScheme", "function cancelPendingAggregateScheme");
+function previewBranch(startMarker: string, endMarker: string, tauriMarker: string) {
+  const body = functionBody(startMarker, endMarker);
+  const start = body.indexOf("if (!isTauri) {");
+  const end = body.indexOf(tauriMarker, start);
+  assert.ok(start >= 0, `missing preview branch in ${startMarker}`);
+  assert.ok(end > start, `missing Tauri boundary in ${startMarker}`);
+  return body.slice(start, end);
+}
 
+test("preview access transactions clear stale errors on success", () => {
   for (const [name, body] of [
-    ["API key activation", activateKey],
-    ["aggregate route-table save", saveAggregate],
-    ["aggregate scheme confirmation", confirmAggregate],
+    ["API key save", previewBranch("async function applyDraftKey", "async function testDraftApiKey", "if (!tryBeginMutation())")],
+    ["API key test", previewBranch("async function testDraftApiKey", "async function autoMapDraftApiKey", "setTestingKey(true)")],
+    ["API key auto-map", previewBranch("async function autoMapDraftApiKey", "async function activateKey", "setAutoMappingKey(true)")],
+    ["API key activation", previewBranch("async function activateKey", "function updateRoleSubscription", "if (!tryBeginMutation())")],
+    ["aggregate route-table save", previewBranch("async function saveRoleMappings", "function loadAggregateSchemeDraft", "if (!tryBeginMutation())")],
+    ["aggregate scheme confirmation", previewBranch("async function confirmPendingAggregateScheme", "function cancelPendingAggregateScheme", "if (!tryBeginMutation())")],
+    ["API key deletion", previewBranch("async function deleteKey", "async function primaryAction", "if (!tryBeginMutation())")],
   ] as const) {
-    assert.match(
-      body,
-      /if \(!isTauri\) \{[\s\S]*?setError\(""\);/,
-      `${name} can leave an old error visible after success`,
-    );
+    assert.match(body, /setError\(""\);/, `${name} can leave an old error visible after success`);
   }
 });
 

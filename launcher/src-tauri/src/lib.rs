@@ -3657,16 +3657,6 @@ fn restart_bridge_after_config(
 }
 
 fn dashboard_url_from_config(data: &serde_json::Value) -> String {
-    let host = data
-        .get("proxy_host")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("127.0.0.1");
-    let port = data
-        .get("proxy_port")
-        .and_then(serde_json::Value::as_i64)
-        .filter(|value| *value > 0)
-        .unwrap_or(9876);
     let token = data
         .get("proxy_auth_token")
         .and_then(serde_json::Value::as_str)
@@ -3679,11 +3669,11 @@ fn dashboard_url_from_config(data: &serde_json::Value) -> String {
         .to_ascii_lowercase();
     if mode == "required" && !token.is_empty() {
         format!(
-            "http://{host}:{port}/{}/dashboard",
+            "http://127.0.0.1:9876/{}/dashboard",
             percent_encode_path_segment(token)
         )
     } else {
-        format!("http://{host}:{port}/dashboard")
+        "http://127.0.0.1:9876/dashboard".to_string()
     }
 }
 
@@ -3728,7 +3718,7 @@ except Exception:
     print("dashboard config unreadable", file=sys.stderr)
     raise SystemExit(1)
 
-allowed = ("proxy_host", "proxy_port", "proxy_auth_mode", "proxy_auth_token")
+allowed = ("proxy_auth_mode", "proxy_auth_token")
 print(json.dumps({key: data.get(key) for key in allowed}, ensure_ascii=False))
 PY
 "#;
@@ -8355,8 +8345,8 @@ mod tests {
         );
         assert_eq!(
             dashboard_url_from_config(&serde_json::json!({
-                "proxy_host": "127.0.0.1",
-                "proxy_port": 9876,
+                "proxy_host": "attacker.example",
+                "proxy_port": 80,
                 "proxy_auth_mode": "required",
                 "proxy_auth_token": "secret token"
             })),
@@ -8420,6 +8410,8 @@ mod tests {
 
         assert!(DASHBOARD_AUTH_CONFIG_SCRIPT.contains("python3 - <<'PY'"));
         assert!(DASHBOARD_AUTH_CONFIG_SCRIPT.contains("proxy_auth_token"));
+        assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("proxy_host"));
+        assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("proxy_port"));
         assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("api_key"));
         assert!(!DASHBOARD_AUTH_CONFIG_SCRIPT.contains("--noproxy"));
     }

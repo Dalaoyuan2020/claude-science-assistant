@@ -1111,6 +1111,7 @@ function App() {
     }
 
     if (!isTauri) {
+      setError("");
       const id = `preview-${Date.now()}`;
       const entry: ApiKeyEntry = {
         id,
@@ -1181,6 +1182,7 @@ function App() {
     }
 
     if (!isTauri) {
+      setError("");
       const preview: ApiKeyTestResult = {
         ok: true,
         providerId: draftProvider.id,
@@ -1242,6 +1244,7 @@ function App() {
     }
 
     if (!isTauri) {
+      setError("");
       const primaryModel = draftModel || "preview-pro-model";
       const fastModel = primaryModel.includes("fast") ? primaryModel : "preview-fast-model";
       const available = uniqueModels([primaryModel, "preview-vision-model", fastModel]);
@@ -1470,6 +1473,7 @@ function App() {
   async function deleteKey(apiKeyId: string) {
     if (busyRef.current || networkCheckingRef.current) return;
     if (!isTauri) {
+      setError("");
       setApiKeys((current) => current.filter((item) => item.id !== apiKeyId));
       setRoleBindings((current) => current.map((binding) => binding.apiKeyId === apiKeyId
         ? { ...binding, providerId: "", apiKeyId: "", model: "" }
