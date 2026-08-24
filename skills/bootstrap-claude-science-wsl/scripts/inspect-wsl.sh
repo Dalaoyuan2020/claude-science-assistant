@@ -154,6 +154,7 @@ if [ -f "$preferences_file" ]; then
 import json
 import re
 import sys
+import time
 
 result = {
     "preferences_present": True,
@@ -168,13 +169,59 @@ result = {
 try:
     with open(sys.argv[1], encoding="utf-8") as stream:
         preferences = json.load(stream)
+    if not isinstance(preferences, dict):
+        raise TypeError("preferences root must be an object")
     approval = preferences.get("approvalGrants", {})
-    always = approval.get("always", {}) if isinstance(approval, dict) else {}
-    allow = always.get("allow", {}) if isinstance(always, dict) else {}
-    host = allow.get("host", []) if isinstance(allow, dict) else []
-    if not isinstance(host, list):
-        raise TypeError("approvalGrants.always.allow.host must be an array")
-    write_grants = sorted({item for item in host if isinstance(item, str) and item.startswith("rw:")})
+    host = []
+    if isinstance(approval, list):
+        for index, item in enumerate(approval):
+            if not isinstance(item, dict):
+                raise TypeError(f"approvalGrants[{index}] must be an object")
+            kind = item.get("kind")
+            key = item.get("key")
+            if not isinstance(kind, str) or not isinstance(key, str):
+                raise TypeError(f"approvalGrants[{index}].kind and .key must be strings")
+            if kind == "host":
+                host.append(key)
+    elif isinstance(approval, dict):
+        always = approval.get("always", {})
+        if not isinstance(always, dict):
+            raise TypeError("approvalGrants.always must be an object")
+        allow = always.get("allow", {})
+        if not isinstance(allow, dict):
+            raise TypeError("approvalGrants.always.allow must be an object")
+        modern_host = allow.get("host", [])
+        if not isinstance(modern_host, list) or any(not isinstance(item, str) for item in modern_host):
+            raise TypeError("approvalGrants.always.allow.host must be a string array")
+        host.extend(modern_host)
+    else:
+        raise TypeError("approvalGrants must be an object or legacy array")
+
+    migrated = preferences.get("_migratedToApprovalGrants", False)
+    if not isinstance(migrated, bool):
+        raise TypeError("_migratedToApprovalGrants must be a boolean")
+    if not migrated:
+        legacy = preferences.get("hostGrants", [])
+        if not isinstance(legacy, list):
+            raise TypeError("hostGrants must be an array")
+        now_ms = time.time() * 1000
+        for index, item in enumerate(legacy):
+            if not isinstance(item, dict):
+                raise TypeError(f"hostGrants[{index}] must be an object")
+            path = item.get("path")
+            mode = item.get("mode")
+            expires_at = item.get("expiresAt")
+            if not isinstance(path, str) or mode not in {"ro", "rw"}:
+                raise TypeError(f"hostGrants[{index}] has an invalid path or mode")
+            if expires_at is not None and (
+                isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
+            ):
+                raise TypeError(f"hostGrants[{index}].expiresAt must be a number")
+            if expires_at and expires_at <= now_ms:
+                continue
+            host.append(f"{mode}:{path}")
+
+    write_grants = sorted({item for item in host if item.startswith("rw:")})
     drvfs = [item for item in write_grants if re.match(r"^rw:/mnt/[A-Za-z](?:/|$)", item)]
     broad_pattern = re.compile(
         r"^rw:/mnt/[A-Za-z](?:/(?:Downloads|Documents|Desktop)|"

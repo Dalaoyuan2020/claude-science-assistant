@@ -79,7 +79,10 @@ try {
     "CSA_PACKAGE_VERSION=$PackageVersion"
     "CSA_MERGE_STDERR=1"
   )
-  if ($ForceRestart) { $startEnvironment += "CSA_FORCE_RESTART=1" }
+  if ($ForceRestart) {
+    $startEnvironment += "CSA_FORCE_RESTART=1"
+    $startEnvironment += "CSA_REPAIR_DRVFS_GRANTS=1"
+  }
   $output = @(& wsl.exe -d $Distro -u $User -- env @startEnvironment `
     bash "$ProjectWsl/scripts/start-claude-science-wsl.sh" 2>$null)
   $exitCode = $LASTEXITCODE

@@ -100,20 +100,20 @@ result and temporarily blocks restart rather than leaving Bridge and Claude Scie
 Refresh after the I/O returns.
 
 The managed launcher starts Claude Science with an ext4 managed-runtime directory as its working
-directory. Its content-addressed managed binary copy skips the eager startup warmup of 24 bundled
-MCPs, custom-MCP metadata, the skeleton MCP/Conda environment, and the single boot-time Git scan
-across all persisted writable host grants. Connectors and their environments remain available on
-demand. The Git safety implementation is not removed: the first real sandbox wrapper still calls
+directory. Its content-addressed managed binary copy skips eager startup of 24 bundled MCPs,
+custom-MCP metadata, and the single boot-time Git scan across persisted writable host grants. It
+keeps the upstream `NYz` queue/provision/retry path for default Python, R, and BYOC environments;
+only the conda-management wrapper receives the vendor's initialized empty Git snapshot, because it
+has no user/frame workspace write surface. The first real analysis/MCP sandbox wrapper still calls
 `_ensureGitScan()` before execution, and later grant changes retain `warmGitScan()`.
 The original Claude Science binary is not modified.
 
-The read-only status probe parses grant strings without walking their paths. A broad grant such as
-`rw:/mnt/e/Downloads` is reported before it can become a misleading network failure. Narrow it to a
-specific project/output directory (prefer read-only where possible). After the daemon is safely
-stopped, `python3 scripts/csa-narrow-broad-host-grants.py --apply` can remove only exact broad global
-RW grants. To preserve reads while revoking all persistent writes under `/mnt/<drive>`, use
-`--convert-drvfs-rw-to-ro`. Both modes write a private 0600 content-hash backup before atomically
-replacing `preferences.json`; ext4 RW grants and unrelated preferences are preserved.
+The read-only status probe reproduces the modern and legacy grant-load union without walking granted
+paths. Any effective DrvFS RW grant is reported before it can become a misleading network failure.
+When such a grant is present, **修复并重启** safely stops the daemon, writes a private 0600
+content-hash backup, and converts persistent `/mnt/<drive>` writes to read-only. Manual `--apply`
+still removes only exact standard broad roots; `--convert-drvfs-rw-to-ro` performs the same RO
+conversion directly. ext4 RW grants and unrelated preferences are preserved.
 
 If `proxy_state` is `unreachable` or `conflict`, use the launcher's **修复并重启** action after the
 current experiment finishes. A Bridge-only restart cannot refresh proxy variables already inherited

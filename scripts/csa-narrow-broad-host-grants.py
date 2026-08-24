@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +30,33 @@ BROAD_DRVFS_RW = re.compile(
 ANY_DRVFS_RW = re.compile(r"^rw:(/mnt/[A-Za-z](?:/.*)?)/?$", re.IGNORECASE)
 
 
-def _broad_grants(preferences: dict[str, Any]) -> list[str]:
+def _migration_complete(preferences: dict[str, Any]) -> bool:
+    migrated = preferences.get("_migratedToApprovalGrants", False)
+    if not isinstance(migrated, bool):
+        raise TypeError("_migratedToApprovalGrants must be a boolean")
+    return migrated
+
+
+def _approval_host_keys(preferences: dict[str, Any]) -> list[str]:
+    """Return host keys loaded from either approvalGrants storage schema."""
+
     approval = preferences.get("approvalGrants", {})
+    if isinstance(approval, list):
+        host: list[str] = []
+        for index, item in enumerate(approval):
+            if not isinstance(item, dict):
+                raise TypeError(f"approvalGrants[{index}] must be an object")
+            kind = item.get("kind")
+            key = item.get("key")
+            if not isinstance(kind, str) or not isinstance(key, str):
+                raise TypeError(
+                    f"approvalGrants[{index}].kind and .key must be strings"
+                )
+            if kind == "host":
+                host.append(key)
+        return host
     if not isinstance(approval, dict):
-        raise TypeError("approvalGrants must be an object")
+        raise TypeError("approvalGrants must be an object or legacy array")
     always = approval.get("always", {})
     if not isinstance(always, dict):
         raise TypeError("approvalGrants.always must be an object")
@@ -42,60 +66,140 @@ def _broad_grants(preferences: dict[str, Any]) -> list[str]:
     host = allow.get("host", [])
     if not isinstance(host, list):
         raise TypeError("approvalGrants.always.allow.host must be an array")
+    for index, item in enumerate(host):
+        if not isinstance(item, str):
+            raise TypeError(
+                f"approvalGrants.always.allow.host[{index}] must be a string"
+            )
+    return host
+
+
+def _legacy_host_rows(preferences: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate and return the legacy hostGrants array, if present."""
+
+    if "hostGrants" not in preferences:
+        return []
+    legacy = preferences["hostGrants"]
+    if not isinstance(legacy, list):
+        raise TypeError("hostGrants must be an array")
+    for index, item in enumerate(legacy):
+        if not isinstance(item, dict):
+            raise TypeError(f"hostGrants[{index}] must be an object")
+        path = item.get("path")
+        mode = item.get("mode")
+        if not isinstance(path, str):
+            raise TypeError(f"hostGrants[{index}].path must be a string")
+        if mode not in {"ro", "rw"}:
+            raise TypeError(f"hostGrants[{index}].mode must be 'ro' or 'rw'")
+        expires_at = item.get("expiresAt")
+        if expires_at is not None and (
+            isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
+        ):
+            raise TypeError(f"hostGrants[{index}].expiresAt must be a number")
+    return legacy
+
+
+def _legacy_host_key(item: dict[str, Any]) -> str:
+    return f"{item['mode']}:{item['path']}"
+
+
+def _legacy_host_is_active(item: dict[str, Any], now_ms: float) -> bool:
+    expires_at = item.get("expiresAt")
+    # Match the vendor's `if (expiresAt && expiresAt <= Date.now())` check.
+    return expires_at in (None, 0) or expires_at > now_ms
+
+
+def _effective_host_keys(
+    preferences: dict[str, Any], *, now_ms: float | None = None
+) -> list[str]:
+    """Reproduce the vendor load union without touching any granted path."""
+
+    host = list(_approval_host_keys(preferences))
+    legacy = _legacy_host_rows(preferences)
+    migrated = _migration_complete(preferences)
+    if not migrated:
+        current_ms = time.time() * 1000 if now_ms is None else now_ms
+        host.extend(
+            _legacy_host_key(item)
+            for item in legacy
+            if _legacy_host_is_active(item, current_ms)
+        )
+    return host
+
+
+def _broad_grants(preferences: dict[str, Any]) -> list[str]:
     return sorted(
         {
             item
-            for item in host
-            if isinstance(item, str) and BROAD_DRVFS_RW.fullmatch(item)
+            for item in _effective_host_keys(preferences)
+            if BROAD_DRVFS_RW.fullmatch(item)
         }
     )
+
+
+def _origin_containers(approval: dict[str, Any]) -> list[dict[str, Any]]:
+    always = approval.get("always", {})
+    candidates = [approval.get("alwaysOrigins")]
+    if isinstance(always, dict):
+        candidates.append(always.get("alwaysOrigins"))
+    containers: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate is None or any(candidate is existing for existing in containers):
+            continue
+        if not isinstance(candidate, dict):
+            raise TypeError("alwaysOrigins must be an object")
+        containers.append(candidate)
+    return containers
 
 
 def narrow_preferences(preferences: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Return a deep JSON copy with only exact broad global RW grants removed."""
 
     updated = json.loads(json.dumps(preferences))
-    broad = _broad_grants(updated)
+    approval_keys = _approval_host_keys(updated)
+    legacy = _legacy_host_rows(updated)
+    migrated = _migration_complete(updated)
+    current_ms = time.time() * 1000
+    approval_broad = {
+        item for item in approval_keys if BROAD_DRVFS_RW.fullmatch(item)
+    }
+    legacy_broad = {
+        _legacy_host_key(item)
+        for item in legacy
+        if not migrated
+        and _legacy_host_is_active(item, current_ms)
+        and BROAD_DRVFS_RW.fullmatch(_legacy_host_key(item))
+    }
+    broad = sorted(approval_broad | legacy_broad)
     if not broad:
         return updated, []
 
-    approval = updated["approvalGrants"]
-    always = approval["always"]
-    allow = always["allow"]
-    allow["host"] = [item for item in allow["host"] if item not in broad]
+    approval = updated.get("approvalGrants", {})
+    if isinstance(approval, list):
+        updated["approvalGrants"] = [
+            item
+            for item in approval
+            if not (item["kind"] == "host" and item["key"] in approval_broad)
+        ]
+    else:
+        always = approval.get("always", {})
+        allow = always.get("allow", {})
+        host = allow.get("host", [])
+        allow["host"] = [item for item in host if item not in approval_broad]
+        for container in _origin_containers(approval):
+            host_origins = container.get("host", {})
+            if not isinstance(host_origins, dict):
+                raise TypeError("alwaysOrigins.host must be an object")
+            for grant in approval_broad:
+                host_origins.pop(grant, None)
 
-    origins = always.get("alwaysOrigins", approval.get("alwaysOrigins"))
-    # Claude Science 0.1.25 stores alwaysOrigins beside `always`, under
-    # approvalGrants.  Accept a nested future shape without creating fields.
-    origin_containers: list[dict[str, Any]] = []
-    top_origins = approval.get("alwaysOrigins")
-    if top_origins is not None:
-        if not isinstance(top_origins, dict):
-            raise TypeError("approvalGrants.alwaysOrigins must be an object")
-        origin_containers.append(top_origins)
-    if origins is not None and origins is not top_origins:
-        if not isinstance(origins, dict):
-            raise TypeError("alwaysOrigins must be an object")
-        origin_containers.append(origins)
-    for container in origin_containers:
-        host_origins = container.get("host", {})
-        if not isinstance(host_origins, dict):
-            raise TypeError("alwaysOrigins.host must be an object")
-        for grant in broad:
-            host_origins.pop(grant, None)
-
-    legacy = updated.get("hostGrants")
-    if legacy is not None:
-        if not isinstance(legacy, list):
-            raise TypeError("hostGrants must be an array")
-        broad_paths = {BROAD_DRVFS_RW.fullmatch(grant).group(1).rstrip("/") for grant in broad}
+    if not migrated and "hostGrants" in updated:
         updated["hostGrants"] = [
             item
             for item in legacy
             if not (
-                isinstance(item, dict)
-                and str(item.get("mode", "")).lower() == "rw"
-                and str(item.get("path", "")).rstrip("/") in broad_paths
+                _legacy_host_is_active(item, current_ms)
+                and _legacy_host_key(item) in legacy_broad
             )
         ]
 
@@ -108,72 +212,119 @@ def convert_drvfs_writes_to_read_only(
     """Preserve access while converting every persistent DrvFS RW grant to RO."""
 
     updated = json.loads(json.dumps(preferences))
+    approval_keys = _approval_host_keys(updated)
+    legacy = _legacy_host_rows(updated)
+    migrated = _migration_complete(updated)
+    current_ms = time.time() * 1000
     approval = updated.get("approvalGrants", {})
-    if not isinstance(approval, dict):
-        raise TypeError("approvalGrants must be an object")
-    always = approval.get("always", {})
-    if not isinstance(always, dict):
-        raise TypeError("approvalGrants.always must be an object")
-    allow = always.get("allow", {})
-    if not isinstance(allow, dict):
-        raise TypeError("approvalGrants.always.allow must be an object")
-    host = allow.get("host", [])
-    if not isinstance(host, list):
-        raise TypeError("approvalGrants.always.allow.host must be an array")
-
-    conversions: dict[str, str] = {}
-    for item in host:
-        if not isinstance(item, str):
-            continue
+    approval_conversions: dict[str, str] = {}
+    for item in approval_keys:
         match = ANY_DRVFS_RW.fullmatch(item)
         if match:
-            conversions[item] = f"ro:{match.group(1).rstrip('/')}"
+            approval_conversions[item] = f"ro:{match.group(1).rstrip('/')}"
+    legacy_conversions: dict[str, str] = {}
+    if not migrated:
+        for item in legacy:
+            key = _legacy_host_key(item)
+            match = ANY_DRVFS_RW.fullmatch(key)
+            if _legacy_host_is_active(item, current_ms) and match:
+                legacy_conversions[key] = f"ro:{match.group(1).rstrip('/')}"
+    conversions = {**approval_conversions, **legacy_conversions}
     if not conversions:
         return updated, {}
 
-    projected: list[Any] = []
-    for item in host:
-        replacement = conversions.get(item, item)
-        if replacement not in projected:
-            projected.append(replacement)
-    allow["host"] = projected
+    if isinstance(approval, list):
+        for item in approval:
+            if item["kind"] == "host" and item["key"] in approval_conversions:
+                item["key"] = approval_conversions[item["key"]]
+    else:
+        always = approval.get("always", {})
+        allow = always.get("allow", {})
+        host = allow.get("host", [])
+        projected: list[Any] = []
+        for item in host:
+            replacement = approval_conversions.get(item, item)
+            if replacement not in projected:
+                projected.append(replacement)
+        allow["host"] = projected
+        for container in _origin_containers(approval):
+            host_origins = container.get("host", {})
+            if not isinstance(host_origins, dict):
+                raise TypeError("alwaysOrigins.host must be an object")
+            for original, replacement in approval_conversions.items():
+                origin = host_origins.pop(original, None)
+                if origin is not None and replacement not in host_origins:
+                    host_origins[replacement] = origin
 
-    origin_containers: list[dict[str, Any]] = []
-    for candidate in (approval.get("alwaysOrigins"), always.get("alwaysOrigins")):
-        if candidate is None or any(candidate is existing for existing in origin_containers):
-            continue
-        if not isinstance(candidate, dict):
-            raise TypeError("alwaysOrigins must be an object")
-        origin_containers.append(candidate)
-    for container in origin_containers:
-        host_origins = container.get("host", {})
-        if not isinstance(host_origins, dict):
-            raise TypeError("alwaysOrigins.host must be an object")
-        for original, replacement in conversions.items():
-            origin = host_origins.pop(original, None)
-            if origin is not None and replacement not in host_origins:
-                host_origins[replacement] = origin
-
-    legacy = updated.get("hostGrants")
-    if legacy is not None:
-        if not isinstance(legacy, list):
-            raise TypeError("hostGrants must be an array")
+    if not migrated:
         for item in legacy:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path", "")).rstrip("/")
-            if str(item.get("mode", "")).lower() == "rw" and re.match(
-                r"^/mnt/[A-Za-z](?:/|$)", path
+            if (
+                _legacy_host_is_active(item, current_ms)
+                and _legacy_host_key(item) in legacy_conversions
             ):
                 item["mode"] = "ro"
 
     return updated, conversions
 
 
-def _write_exclusive(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+def _open_nofollow_flags(base: int) -> int:
+    flags = base
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _read_regular_nofollow(
+    path: Path, *, make_private: bool = False, owner: tuple[int, int] | None = None
+) -> tuple[bytes, os.stat_result]:
+    if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
+        raise OSError(f"refusing symlink: {path}")
+    descriptor = os.open(path, _open_nofollow_flags(os.O_RDONLY))
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"refusing non-regular file: {path}")
+        if make_private:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                os.chmod(path, 0o600)
+            if owner is not None and hasattr(os, "fchown"):
+                try:
+                    os.fchown(descriptor, owner[0], owner[1])
+                except PermissionError:
+                    pass
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read(), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _write_exclusive(
+    path: Path,
+    payload: bytes,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> None:
+    flags = _open_nofollow_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     descriptor = os.open(path, flags, mode)
     try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"refusing non-regular backup: {path}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, mode)
+        else:
+            os.chmod(path, mode)
+        if owner is not None and hasattr(os, "fchown"):
+            try:
+                os.fchown(descriptor, owner[0], owner[1])
+            except PermissionError:
+                pass
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             stream.write(payload)
             stream.flush()
@@ -182,8 +333,20 @@ def _write_exclusive(path: Path, payload: bytes, mode: int = 0o600) -> None:
         os.close(descriptor)
 
 
+def _fsync_directory(path: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    directory_fd = os.open(
+        path, _open_nofollow_flags(os.O_RDONLY | os.O_DIRECTORY)
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def apply_narrowing(path: Path, *, convert_drvfs_to_ro: bool = False) -> dict[str, Any]:
-    original = path.read_bytes()
+    original, metadata = _read_regular_nofollow(path)
     preferences = json.loads(original.decode("utf-8"))
     if not isinstance(preferences, dict):
         raise TypeError("preferences root must be an object")
@@ -208,43 +371,49 @@ def apply_narrowing(path: Path, *, convert_drvfs_to_ro: bool = False) -> dict[st
     if not removed and not conversions:
         return result
 
-    metadata = path.stat()
     backup = path.with_name(f"{path.name}.csa-v0.1.6-{digest[:16]}.bak")
-    if backup.exists():
-        if backup.read_bytes() != original:
+    try:
+        backup_bytes, _ = _read_regular_nofollow(
+            backup,
+            make_private=True,
+            owner=(metadata.st_uid, metadata.st_gid),
+        )
+        if backup_bytes != original:
             raise FileExistsError(f"backup exists with different content: {backup}")
-    else:
-        _write_exclusive(backup, original)
-        os.chmod(backup, 0o600)
-        if hasattr(os, "chown"):
-            try:
-                os.chown(backup, metadata.st_uid, metadata.st_gid)
-            except PermissionError:
-                pass
+    except FileNotFoundError:
+        _write_exclusive(
+            backup,
+            original,
+            owner=(metadata.st_uid, metadata.st_gid),
+        )
+        _fsync_directory(path.parent)
 
     encoded = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.csa-", dir=path.parent)
     temporary = Path(temporary_name)
     try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
+        else:
+            os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        if hasattr(os, "fchown"):
+            try:
+                os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+            except PermissionError:
+                pass
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
-        if hasattr(os, "chown"):
-            try:
-                os.chown(temporary, metadata.st_uid, metadata.st_gid)
-            except PermissionError:
-                pass
-        if path.read_bytes() != original:
+        current, current_metadata = _read_regular_nofollow(path)
+        if (
+            current != original
+            or current_metadata.st_dev != metadata.st_dev
+            or current_metadata.st_ino != metadata.st_ino
+        ):
             raise RuntimeError("preferences changed concurrently; refusing to replace it")
         os.replace(temporary, path)
-        if hasattr(os, "O_DIRECTORY"):
-            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()

@@ -15,9 +15,9 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 - Bridge 包迁移：Bridge 以 `bridge-0.1.6-<bundle-hash>` 内容寻址目录激活，`/health.runtime_identity` 同时报告版本、build ID、源码哈希和 PID。
 - 沙盒出口探针：经真实 `analysis/socks.sock`、SOCKS5H 和固定 PyPI HTTPS HEAD 验证出口；不发送模型请求，不产生模型费用，并要求同一进程身份下相邻两次成功才发布绿色缓存。
 - 挂载 I/O 诊断：单独报告 Linux `D` 状态与 `p9_client_rpc` 等 wait channel，区分 WSL DrvFS/9P 卡住、沙盒转发失败和公网出口故障。
-- MCP 真正按需加载：禁用启动阶段 `QT9` 内置 MCP、custom-MCP 元数据和 skeleton Conda 环境预热，catalog snapshot 不再启动 server；只有实际使用 connector/MCP 时才加载对应进程与环境。
+- MCP 真正按需加载且保留计算环境首装：禁用启动阶段 `QT9` 内置 MCP 与 custom-MCP 元数据预热，catalog snapshot 不再启动 server；保留默认 Python/R/BYOC 的 `NYz` 排队、创建与重试。
 - Git 安全扫描按需执行：启动时不再递归所有持久 RW host grant；首次真实 sandbox 命令和后续新增授权仍经过未削弱的 `_ensureGitScan()` 安全门。
-- 宽泛授权质检：只读取授权字符串、不遍历目标目录，识别 Windows drive root、Downloads、Documents、Desktop 等高风险 RW grant，并给出具体收窄建议。
+- 持久授权质检与一键收窄：只读取授权字符串、不遍历目标目录，兼容现代/旧授权格式并识别全部有效 DrvFS RW；“修复并重启”先保存 0600 私有备份，再保留读取、撤销 DrvFS 持久写入。
 - 版本身份统一：界面、窗口标题、Tauri/Cargo、便携包 manifest、启动脚本和 Bridge runtime ID 统一为 0.1.6；内置 Claude Science 仍保持 0.1.25。
 
 ## 修复与加固
@@ -39,7 +39,7 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 
 1. 不卸载 WSL、Ubuntu 或 Claude Science 数据，也不要覆盖旧解压目录。
 2. 把 v0.1.6 完整 ZIP 解压到新目录，关闭旧启动器后运行新 EXE。
-3. 点击“修复并重启”，让新版把 Bridge 激活到受管 `bridge-0.1.6-<bundle-hash>` 运行时；不要要求 `source_path` 继续指向便携包原目录。
+3. 点击“修复并重启”，让新版把 Bridge 激活到受管 `bridge-0.1.6-<bundle-hash>` 运行时；若检测到有效 DrvFS RW 授权，此动作会先备份偏好并将其转换为 RO（ext4 RW 不变）。不要要求 `source_path` 继续指向便携包原目录。
 4. 刷新状态，确认 Bridge runtime identity 的 `version=0.1.6`、build ID/源码哈希匹配，`8765/8766` 属于同一个受管 Claude Science PID，网络质检无冲突。
 5. 完成一次你实际使用的模型或视觉请求。验收稳定前保留旧目录；需要回退时关闭新版，再从旧完整包启动。
 
@@ -47,7 +47,7 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 
 - 网络质检使用固定、匿名、非计费的 PyPI canary，只证明本机指定沙盒出口链路可用，不等于所有模型供应商都已通过真实鉴权和计费请求。
 - Claude Science 本地就绪检查不请求 `GET /`、`GET /health` 或任何业务 API；固定 PyPI canary 只经沙盒 SOCKS5H 出口执行匿名 HEAD，不进入提示词、模型或 MCP 业务调用链。
-- V0.1.6 不会在 daemon 启动阶段扫描 Windows RW grant，因此 UI 和端口就绪不再被该扫描拖死；但首次真实 sandbox 命令仍会 fail-closed 地执行 Git safety scan。请把 `rw:/mnt/e/Downloads` 一类授权收窄到具体项目/输出目录（能只读就不用 RW），或把热代码与 `.git` 放到 WSL ext4。可在 daemon 安全停止后运行 `python3 scripts/csa-narrow-broad-host-grants.py --apply` 精确删除宽泛项，或运行 `python3 scripts/csa-narrow-broad-host-grants.py --convert-drvfs-rw-to-ro` 保留读取并撤销全部永久 DrvFS 写权限；工具都会先保存 0600 原始备份。
+- V0.1.6 不会在 daemon 或默认 Python/R 首装阶段递归扫描 Windows RW grant，因此 UI 和端口就绪不再被该扫描拖死；首次真实 analysis/MCP sandbox 命令仍会 fail-closed 地执行 Git safety scan。检测到 DrvFS RW 时请用“修复并重启”自动保留读取并撤销持久写入，或把需写入的热代码与 `.git` 放到 WSL ext4。手工工具仍支持 `--apply` 精确删除标准宽泛项和 `--convert-drvfs-rw-to-ro` 转 RO，且都会先保存 0600 原始备份。
 - Visual/多模态能力仍取决于所选上游模型与供应商。模型名匹配只能生成建议，不能替代真实图片请求验收。
 
 ## 发布校验

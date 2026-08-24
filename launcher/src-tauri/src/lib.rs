@@ -1383,7 +1383,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
     if probe.host_access.drvfs_write_grant_count > 0 {
         let grants = probe.host_access.drvfs_write_grants.join(", ");
         warnings.push(format!(
-            "Detected {} persistent writable Windows/DrvFS grant(s) ({} broad): {}. CSA v0.1.6 skips known boot-only MCP/Git warmups, but the first real sandbox command must still run the upstream Git safety scan. Prefer read-only access, an ext4 workspace, or a narrowly scoped output directory to avoid p9_client_rpc stalls.",
+            "Detected {} persistent writable Windows/DrvFS grant(s) ({} standard broad-root match): {}. The first real analysis/MCP sandbox command must still run the upstream Git safety scan. Choose Repair and Restart to preserve read access while converting these grants to read-only with a private backup; keep writable projects on WSL ext4 or grant only a narrow output leaf.",
             probe.host_access.drvfs_write_grant_count,
             probe.host_access.broad_drvfs_write_grant_count,
             if grants.is_empty() { "path details unavailable" } else { grants.as_str() }
@@ -1471,7 +1471,12 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         );
     }
 
-    let state = if bridge_healthy && claude_running && unit_contract_ok && network_ready {
+    let host_access_repair_needed = probe.host_access.preferences_present
+        && probe.host_access.preferences_parse_ok
+        && probe.host_access.drvfs_write_grant_count > 0;
+    let state = if host_access_repair_needed {
+        "degraded"
+    } else if bridge_healthy && claude_running && unit_contract_ok && network_ready {
         "running"
     } else if storage_blocked || !wsl_runtime_writable {
         "degraded"
@@ -5849,6 +5854,9 @@ mod tests {
                 "if [ \"${CSA_BRIDGE_ONLY:-0}\" != \"1\" ]; then\n  stop_existing_claude_for_activation || exit 1",
             )
             .expect("full activation should stop Claude before Bridge staging");
+        let host_grant_repair = script
+            .find("if [ \"${CSA_REPAIR_DRVFS_GRANTS:-0}\" = \"1\" ]; then")
+            .expect("explicit DrvFS repair should be present");
         let bridge_only = script
             .find("if [ \"${CSA_BRIDGE_ONLY:-0}\" = \"1\" ]")
             .expect("bridge-only mode should be present");
@@ -5861,6 +5869,8 @@ mod tests {
 
         assert!(unsafe_preflight < bridge_stage);
         assert!(full_activation_stop < bridge_stage);
+        assert!(full_activation_stop < host_grant_repair);
+        assert!(host_grant_repair < bridge_stage);
         assert!(script[unsafe_preflight..bridge_stage]
             .contains("runtime pointers, and unrelated ports unchanged"));
         assert!(bridge_only < token_refresh);
@@ -5873,6 +5883,7 @@ mod tests {
     #[test]
     fn managed_runtime_layout_is_stable_and_downgrade_guarded() {
         let start = include_str!("../../../scripts/start-claude-science-wsl.sh");
+        let windows_start = include_str!("../../../scripts/start-claude-science-wsl.ps1");
         let layout = include_str!("../../../scripts/csa-runtime-layout.sh");
         let service = include_str!("../../../scripts/install-wsl-bridge-service.sh");
         let inspect =
@@ -5882,10 +5893,14 @@ mod tests {
         assert!(start.contains("csa_stage_claude_runtime"));
         assert!(start.contains("trap restore_runtime_after_failure EXIT"));
         assert!(start.contains("csa_print_bridge_identity"));
-        assert!(start.contains("byok-demand-mcp-lazy-git-scan-v6"));
+        assert!(start.contains("byok-demand-mcp-lazy-git-scan-v8"));
         assert!(start.contains("git_boot_warmup_old"));
+        assert!(start.contains("conda_git_scan_old"));
+        assert!(start.contains("conda_profile_old"));
+        assert!(start.contains("Keep Fastify's NYz onReady hook intact"));
         assert!(start.contains("async _ensureGitScan()"));
         assert!(start.contains("curl --noproxy '*'"));
+        assert!(windows_start.contains("CSA_REPAIR_DRVFS_GRANTS=1"));
         assert!(layout.contains("Implicit Claude Science downgrade rejected"));
         assert!(layout.contains("csa_backup_before_downgrade"));
         assert!(layout.contains("mv -Tf \"$temporary\" \"$link_path\""));

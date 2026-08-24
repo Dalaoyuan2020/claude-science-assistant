@@ -117,9 +117,18 @@ git_old = b"p_.pinBaseRootsAfterGrantProjection(),p_.warmGitScan(),p_.setStoreDe
 git_new = b"p_.pinBaseRootsAfterGrantProjection(),void           0,p_.setStoreDeniedDomains(TP())"
 custom_mcp_old = b"let p_=Date.now();return T2"
 custom_mcp_new = b"let p_=Date.now();return;T2"
-skeleton_old = b"NYz(G.log,JK_({db:Y.db}),{mcpEnvFirst:!0})"
-skeleton_core = b"Promise.resolve()"
-skeleton_new = skeleton_core + (b" " * (len(skeleton_old) - len(skeleton_core)))
+conda_git_old = b"let G=await this._ensureGitScan(),W=rL.conda"
+conda_git_core = b"let G=XV9,W=rL.conda"
+conda_git_new = conda_git_core + (b" " * (len(conda_git_old) - len(conda_git_core)))
+conda_profile_old = (
+    b'userGrantsVisible:!0,condaHomeVisibleInConfig:!0,'
+    b'resetAllowWriteToDefaults:!0,workspaceDenyWriteCarveOuts:!1,'
+    b'workspaceTmpContentHide:!0,denyLinkCreation:!1,network:"inherit",'
+    b'gpuPassthrough:!1,writablePaths:"condaHome"'
+)
+conda_profile_new = conda_profile_old.replace(
+    b"userGrantsVisible:!0", b"userGrantsVisible:!1", 1
+)
 
 if len(old) != 136 or len(new_core) >= len(old) or len(new) != len(old):
     raise SystemExit("lazy MCP patch must remain an equal-length 136-byte replacement")
@@ -137,10 +146,14 @@ if len(custom_mcp_old) != 27 or len(custom_mcp_new) != 27:
     raise SystemExit("custom MCP warmup patch must remain an equal-length 27-byte replacement")
 if data.count(custom_mcp_old) != 1 or data.count(custom_mcp_new) != 0:
     raise SystemExit("locked vendor binary custom MCP boot warmup identity changed")
-if len(skeleton_old) != 42 or len(skeleton_new) != 42:
-    raise SystemExit("skeleton MCP warmup patch must remain an equal-length 42-byte replacement")
-if data.count(skeleton_old) != 1 or data.count(skeleton_new) != 0:
-    raise SystemExit("locked vendor binary skeleton MCP boot warmup identity changed")
+if len(conda_git_old) != 44 or len(conda_git_new) != 44:
+    raise SystemExit("conda Git-scan patch must remain an equal-length 44-byte replacement")
+if data.count(conda_git_old) != 1 or data.count(conda_git_new) != 0:
+    raise SystemExit("locked vendor binary conda Git-scan identity changed")
+if len(conda_profile_old) != 217 or len(conda_profile_new) != 217:
+    raise SystemExit("conda profile patch must remain an equal-length 217-byte replacement")
+if data.count(conda_profile_old) != 1 or data.count(conda_profile_new) != 0:
+    raise SystemExit("locked vendor binary conda profile identity changed")
 
 markers = {
     b"._loadBundledServer(": 2,
@@ -155,6 +168,8 @@ markers = {
     b"if(G?.mcpEnvFirst)try{await w.ensureMcpEnv({})": 1,
     b"async wrapCondaCommand(z,O)": 1,
     b"let G=await this._ensureGitScan(),W=rL.conda": 1,
+    b"XV9={bareArtifactConjunct:!1,gitDirs:[],pointerFiles:[]": 1,
+    b"z.gitScan??w.scanGitStructures": 1,
     b'if(W==="rw"&&!G?.reassert)O.warmGitScan?.().catch(()=>{})': 1,
     b"async _ensureGitScan()": 1,
     b"await this._ensureGitScan()": 4,

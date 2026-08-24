@@ -383,6 +383,7 @@ if ($claudeDetected -and $claudeMountIoBlocked) {
   $warnings.Add("Claude Science is currently in uninterruptible I/O ($claudeProcessState at $claudeWaitChannel); CSA will not report network ready or attempt a partial restart until it becomes safely stoppable.")
 }
 $hostAccess = if ($wslProbe) { Get-OptionalProperty $wslProbe "host_access" $null } else { $null }
+$hostAccessRepairNeeded = $false
 if ($hostAccess) {
   $preferencesPresent = [bool](Get-OptionalProperty $hostAccess "preferences_present" $false)
   $preferencesParseOk = [bool](Get-OptionalProperty $hostAccess "preferences_parse_ok" $false)
@@ -392,14 +393,17 @@ if ($hostAccess) {
     $warnings.Add("Claude Science preferences.json exists but its host-access grants could not be parsed safely; no granted path was walked or modified.")
   }
   if ($drvfsGrantCount -gt 0) {
+    $hostAccessRepairNeeded = $preferencesPresent -and $preferencesParseOk
     $drvfsGrants = @((Get-OptionalProperty $hostAccess "drvfs_write_grants" @())) -join ", "
     if (-not $drvfsGrants) { $drvfsGrants = "path details unavailable" }
-    $warnings.Add("Detected $drvfsGrantCount persistent writable Windows/DrvFS grant(s) ($broadGrantCount broad): $drvfsGrants. V0.1.6 skips known boot-only warmups, but a real sandbox command must still run the Git safety scan; prefer read-only access, ext4, or a narrow output leaf.")
+    $warnings.Add("Detected $drvfsGrantCount persistent writable Windows/DrvFS grant(s) ($broadGrantCount standard broad-root match): $drvfsGrants. Repair and Restart preserves read access, stores a private backup, and converts these grants to read-only; keep writable work on WSL ext4 or grant only a narrow output leaf.")
   }
 }
 
 $overall = "not_ready"
-if ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject -and $networkReady) {
+if ($hostAccessRepairNeeded) {
+  $overall = "repair_required"
+} elseif ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject -and $networkReady) {
   $overall = if ($storageWarning) { "ready_with_storage_warning" } else { "ready" }
 } elseif ($bridgeHealthy) {
   $overall = "bridge_ready"

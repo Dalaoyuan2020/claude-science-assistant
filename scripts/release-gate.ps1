@@ -106,6 +106,7 @@ try {
       "$projectWsl/tests/runtime_layout_test.sh"
       "$projectWsl/tests/runtime_activation_integration_test.sh"
       "$projectWsl/tests/runtime_network_contract_functions_test.sh"
+      "$projectWsl/tests/inspect_host_access_integration_test.sh"
       "$projectWsl/tests/runtime_lifecycle_20cycle_test.sh"
     )
     & wsl.exe -d $Distro -- bash -n @syntaxFiles
@@ -118,6 +119,9 @@ try {
   }
   Invoke-GateStep "WSL runtime network contract functions" $ProjectDir {
     & wsl.exe -d $Distro -- bash "$projectWsl/tests/runtime_network_contract_functions_test.sh" "$projectWsl"
+  }
+  Invoke-GateStep "WSL host-access schema inspection" $ProjectDir {
+    & wsl.exe -d $Distro -- bash "$projectWsl/tests/inspect_host_access_integration_test.sh" "$projectWsl"
   }
   Invoke-GateStep "WSL Unix socket adapter" $ProjectDir {
     & wsl.exe -d $Distro -- python3 "$projectWsl/tests/unix_socket_adapter_integration_test.py" "$projectWsl"

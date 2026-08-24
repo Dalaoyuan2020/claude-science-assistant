@@ -952,6 +952,31 @@ if [ "${CSA_BRIDGE_ONLY:-0}" != "1" ]; then
   stop_existing_claude_for_activation || exit 1
 fi
 
+# A launcher "repair and restart" explicitly converts persistent DrvFS write
+# grants to read-only after the managed daemon has stopped.  This preserves
+# data access, keeps ext4 write grants unchanged, and prevents the first real
+# sandbox Git scan from recursively traversing a Windows mount.  The helper
+# writes a private content-addressed backup before an atomic preference update.
+if [ "${CSA_REPAIR_DRVFS_GRANTS:-0}" = "1" ]; then
+  HOST_GRANT_REPAIR_HELPER="$PROJECT_DIR/scripts/csa-narrow-broad-host-grants.py"
+  HOST_GRANT_PREFERENCES="$HOME/.claude-science/preferences.json"
+  if [ ! -f "$HOST_GRANT_REPAIR_HELPER" ]; then
+    echo "Host-access repair helper is missing: $HOST_GRANT_REPAIR_HELPER" >&2
+    exit 2
+  fi
+  if [ -f "$HOST_GRANT_PREFERENCES" ]; then
+    if ! HOST_GRANT_REPAIR_OUTPUT="$(
+      "$PYTHON_BIN" "$HOST_GRANT_REPAIR_HELPER" \
+        --preferences "$HOST_GRANT_PREFERENCES" \
+        --convert-drvfs-rw-to-ro
+    )"; then
+      echo "Persistent DrvFS host-access repair failed; runtime activation was not started." >&2
+      exit 1
+    fi
+    echo "Persistent DrvFS host-access repair: $HOST_GRANT_REPAIR_OUTPUT"
+  fi
+fi
+
 csa_stage_bridge_runtime "$PROJECT_DIR" "$CSA_PACKAGE_VERSION"
 BRIDGE_POINTER_CHANGED="$CSA_POINTER_CHANGED"
 BRIDGE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
@@ -991,7 +1016,7 @@ CLAUDE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
 CLAUDE_CANDIDATE_RUNTIME="$CSA_CLAUDE_RUNTIME_DIR"
 SOURCE_BIN="$CSA_CLAUDE_RUNTIME_DIR/claude-science"
 SOURCE_SHA="$CSA_CLAUDE_SOURCE_SHA256"
-PATCH_PROFILE="byok-demand-mcp-lazy-git-scan-v6"
+PATCH_PROFILE="byok-demand-mcp-lazy-git-scan-v8"
 if [ -n "$PATCH_DIR_OVERRIDE" ]; then
   PATCH_DIR="$PATCH_DIR_OVERRIDE"
 else
@@ -1084,12 +1109,19 @@ git_boot_warmup_new = (
 )
 custom_mcp_warmup_old = b"let p_=Date.now();return T2"
 custom_mcp_warmup_new = b"let p_=Date.now();return;T2"
-skeleton_env_warmup_old = (
-    b"NYz(G.log,JK_({db:Y.db}),{mcpEnvFirst:!0})"
+conda_git_scan_old = b"let G=await this._ensureGitScan(),W=rL.conda"
+conda_git_scan_core = b"let G=XV9,W=rL.conda"
+conda_git_scan_new = conda_git_scan_core + b" " * (
+    len(conda_git_scan_old) - len(conda_git_scan_core)
 )
-skeleton_env_warmup_core = b"Promise.resolve()"
-skeleton_env_warmup_new = skeleton_env_warmup_core + b" " * (
-    len(skeleton_env_warmup_old) - len(skeleton_env_warmup_core)
+conda_profile_old = (
+    b'userGrantsVisible:!0,condaHomeVisibleInConfig:!0,'
+    b'resetAllowWriteToDefaults:!0,workspaceDenyWriteCarveOuts:!1,'
+    b'workspaceTmpContentHide:!0,denyLinkCreation:!1,network:"inherit",'
+    b'gpuPassthrough:!1,writablePaths:"condaHome"'
+)
+conda_profile_new = conda_profile_old.replace(
+    b"userGrantsVisible:!0", b"userGrantsVisible:!1", 1
 )
 
 pairs = [
@@ -1145,14 +1177,26 @@ pairs = [
         [custom_mcp_warmup_old],
         custom_mcp_warmup_new,
     ),
-    # Fastify onReady independently provisions a skeleton MCP environment with
-    # mcpEnvFirst=true.  That boot-only conda command is sandbox-wrapped and
-    # enters _ensureGitScan even after every catalog warmup is disabled.  Leave
-    # NYz/T2 intact for explicit environment work; replace only this unique
-    # onReady expression with an already-resolved promise.
+    # Keep Fastify's NYz onReady hook intact: it queues and provisions the
+    # default Python/R and BYOC skeleton environments, and its status queue is
+    # also the source for the retry API.  The conda profile has no frame or user
+    # workspace binds and writes only under the managed conda home, so a Git
+    # scan of unrelated user grants cannot contribute a policy decision there.
+    # Pass the vendor's initialized empty-scan object (not null/undefined, which
+    # would trigger JQG's recursive fallback).  Analysis/MCP/real sandbox
+    # wrappers retain their fail-closed _ensureGitScan calls.
     (
-        [skeleton_env_warmup_old],
-        skeleton_env_warmup_new,
+        [conda_git_scan_old],
+        conda_git_scan_new,
+    ),
+    # On the locked Linux build the conda profile already exposes only the
+    # managed conda home as writable.  Align its generic policy flag with that
+    # contract so JQG does not even canonicalize persisted user-grant roots.
+    # This Linux-x64-only patch must not be generalized to the vendor's macOS
+    # profile, which documents a different compatibility quirk.
+    (
+        [conda_profile_old],
+        conda_profile_new,
     ),
     # The sandbox manager eagerly scans every persisted writable host grant at
     # daemon boot.  A broad DrvFS grant such as rw:/mnt/e/Downloads recursively
@@ -1186,10 +1230,14 @@ if len(custom_mcp_warmup_old) != 27 or len(custom_mcp_warmup_new) != 27:
     raise SystemExit("Unsupported launcher patch; custom MCP warmup replacement must remain 27 bytes")
 if data.count(custom_mcp_warmup_old) + data.count(custom_mcp_warmup_new) != 1:
     raise SystemExit("Unsupported Claude Science daemon build; custom MCP boot warmup identity is not unique")
-if len(skeleton_env_warmup_old) != 42 or len(skeleton_env_warmup_new) != 42:
-    raise SystemExit("Unsupported launcher patch; skeleton MCP warmup replacement must remain 42 bytes")
-if data.count(skeleton_env_warmup_old) + data.count(skeleton_env_warmup_new) != 1:
-    raise SystemExit("Unsupported Claude Science daemon build; skeleton MCP boot warmup identity is not unique")
+if len(conda_git_scan_old) != 44 or len(conda_git_scan_new) != 44:
+    raise SystemExit("Unsupported launcher patch; conda Git-scan replacement must remain 44 bytes")
+if data.count(conda_git_scan_old) + data.count(conda_git_scan_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; conda Git-scan identity is not unique")
+if len(conda_profile_old) != 217 or len(conda_profile_new) != 217:
+    raise SystemExit("Unsupported launcher patch; conda profile replacement must remain 217 bytes")
+if data.count(conda_profile_old) + data.count(conda_profile_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; conda profile identity is not unique")
 if len(git_boot_warmup_old) != 85 or len(git_boot_warmup_new) != 85:
     raise SystemExit("Unsupported launcher patch; lazy Git boot replacement must remain 85 bytes")
 if data.count(git_boot_warmup_old) + data.count(git_boot_warmup_new) != 1:
@@ -1205,6 +1253,8 @@ catalog_markers = {
     b"if(G?.mcpEnvFirst)try{await w.ensureMcpEnv({})": 1,
     b"async wrapCondaCommand(z,O)": 1,
     b"let G=await this._ensureGitScan(),W=rL.conda": 1,
+    b"XV9={bareArtifactConjunct:!1,gitDirs:[],pointerFiles:[]": 1,
+    b"z.gitScan??w.scanGitStructures": 1,
     b'if(W==="rw"&&!G?.reassert)O.warmGitScan?.().catch(()=>{})': 1,
 }
 for marker, expected_count in catalog_markers.items():
@@ -1270,8 +1320,10 @@ if after.count(catalog_guard_old) != 0 or after.count(catalog_guard_new) != 1:
     raise SystemExit("patch verification failed; lazy MCP catalog guard was not replaced exactly once")
 if after.count(custom_mcp_warmup_old) != 0 or after.count(custom_mcp_warmup_new) != 1:
     raise SystemExit("patch verification failed; custom MCP boot warmup was not replaced exactly once")
-if after.count(skeleton_env_warmup_old) != 0 or after.count(skeleton_env_warmup_new) != 1:
-    raise SystemExit("patch verification failed; skeleton MCP boot warmup was not replaced exactly once")
+if after.count(conda_git_scan_old) != 0 or after.count(conda_git_scan_new) != 1:
+    raise SystemExit("patch verification failed; conda-only Git scan was not replaced exactly once")
+if after.count(conda_profile_old) != 0 or after.count(conda_profile_new) != 1:
+    raise SystemExit("patch verification failed; conda user-grant visibility was not disabled exactly once")
 if after.count(git_boot_warmup_old) != 0 or after.count(git_boot_warmup_new) != 1:
     raise SystemExit("patch verification failed; eager Git warmup was not replaced exactly once")
 
