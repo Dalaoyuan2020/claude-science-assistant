@@ -148,3 +148,21 @@ FAIL egress 0ms work.bridge_egress.not_implemented
 PASS grade 5524ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=7291 exit=0
 ```
+
+## S1 完成
+
+做了什么：正式拆出 `AllowStatus / GradeStatus / WorkReport` 与 `get_allow_status / get_grade_status` command；GUI 与 smoke 共用同一 ALLOW/Grade 实现。主按钮的可打开判据冻结为 `claudeRunning && !windowsBridgePid`，文案只从 `AllowStatus` 产生且固定为四条；`restartBlocked`、聚合 `state`、出口与深检不再参与主按钮。已知启动、登录、Bridge、Grade、Work 与 WSL 运输故障使用分层前缀和不同后缀。缺少 WSL 或发行版时 ALLOW 返回可渲染状态，不再把首屏本身变成错误。
+
+证据在哪：`launcher/src-tauri/src/lib.rs` 的 `allow_inputs_frozen` 同时执行断言 A（canOpen 输入集合严格等于二元冻结集合）与断言 B（主按钮文案输入只能是 ALLOW 字段），并验证产品实际调用纯函数；三车道序列化反向测试阻止 DTO 串线。Rust 为 86 passed、0 failed、4 ignored；`npm run build` 通过（34 modules）。完整 smoke 输出如下。
+
+下一步：进入 S2，把 `initialize_runtime` 移到首次 ALLOW paint 之后的后台；30 秒刷新只取 Grade 并只合并 Grade，生命周期动作完成后单独刷新 ALLOW；补首屏/周期/按钮源码边界测试。
+
+```text
+PASS allow 533ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 533ms budget=3000ms
+PASS open 837ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 492ms health=200 models=200 identity=current modelCount=5
+FAIL egress 0ms work.bridge_egress.not_implemented
+PASS grade 4497ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=6361 exit=0
+```

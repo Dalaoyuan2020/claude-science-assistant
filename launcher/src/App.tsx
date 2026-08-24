@@ -53,10 +53,49 @@ interface DeepNetworkQualityStatus {
   sandboxEgressHttpStatus?: number;
 }
 
-interface NetworkQualityCheckResult {
+interface WorkReport {
+  operation: string;
+  ok: boolean;
+  code: string;
   deep?: DeepNetworkQualityStatus;
   warnings: string[];
 }
+
+interface AllowStatus {
+  wslInstalled: boolean;
+  distro?: string;
+  linuxUser?: string;
+  runtimePresent: boolean;
+  claudeRunning: boolean;
+  claudePid?: number;
+  listenerPresent: boolean;
+  pid8765?: number;
+  pid8766?: number;
+  daemonState: string;
+  listenerProbeOk: boolean;
+  controlSocketPresent: boolean;
+  windowsBridgePid?: number;
+  windowsBridgeProbe: "checked" | "present" | "port_conflict" | "unknown";
+  canOpen: boolean;
+  canStart: boolean;
+}
+
+const ALLOW_OPEN_INPUTS = ["claudeRunning", "windowsBridgePid"] as const satisfies readonly (keyof AllowStatus)[];
+const PRIMARY_LABEL_INPUTS = ["claudeRunning", "windowsBridgePid", "runtimePresent"] as const satisfies readonly (keyof AllowStatus)[];
+type AllowOpenInput = (typeof ALLOW_OPEN_INPUTS)[number];
+type PrimaryLabelInput = (typeof PRIMARY_LABEL_INPUTS)[number];
+
+const canOpenFromAllow = (allow: Pick<AllowStatus, AllowOpenInput>) => Boolean(
+  allow.claudeRunning
+  && !allow.windowsBridgePid
+);
+
+const primaryLabelFromAllow = (allow: Pick<AllowStatus, PrimaryLabelInput>) => {
+  if (allow.windowsBridgePid) return "先停止旧 Windows Bridge";
+  if (canOpenFromAllow(allow)) return "打开 Claude Science";
+  if (!allow.runtimePresent) return "安装运行环境";
+  return "启动 Claude Science";
+};
 
 interface SystemStatus {
   state: SystemState;
@@ -223,6 +262,29 @@ const roleDefinitions: { role: SubscriptionRole; label: string; detail: string }
   { role: "vision", label: "视觉", detail: "Sonnet · 多模态" },
   { role: "fast", label: "日常", detail: "Haiku / Fast · 快速响应" },
 ];
+
+const initialAllowStatus: AllowStatus = {
+  wslInstalled: false,
+  runtimePresent: false,
+  claudeRunning: false,
+  listenerPresent: false,
+  daemonState: "unknown",
+  listenerProbeOk: false,
+  controlSocketPresent: false,
+  windowsBridgeProbe: "unknown",
+  canOpen: false,
+  canStart: false,
+};
+
+const browserPreviewAllowStatus: AllowStatus = {
+  ...initialAllowStatus,
+  wslInstalled: true,
+  distro: "Ubuntu-24.04",
+  linuxUser: "preview",
+  runtimePresent: true,
+  listenerProbeOk: true,
+  windowsBridgeProbe: "checked",
+};
 
 const initialStatus: SystemStatus = {
   state: "loading",
@@ -463,6 +525,7 @@ const normalizedSchemes = (settings: LauncherSettings): AggregateScheme[] => {
 
 function App() {
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
+  const [allowStatus, setAllowStatus] = useState<AllowStatus>(initialAllowStatus);
   const [providerGroups, setProviderGroups] = useState<ProviderGroup[]>(fallbackProviderGroups);
   const [activeProvider, setActiveProvider] = useState(fallbackSettings.selectedProviderId);
   const [customBaseUrl, setCustomBaseUrl] = useState(fallbackSettings.customBaseUrl);
@@ -529,10 +592,7 @@ function App() {
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
   const deepNetworkReady = status.network.deepChecked && status.network.sandboxEgressState === "ok";
-  const canOpenClaude = Boolean(
-    status.claudeRunning
-    && !status.windowsBridgePid,
-  );
+  const canOpenClaude = canOpenFromAllow(allowStatus);
   const mutationBusy = busy || networkChecking;
   const summary = status.state === "running" && !deepNetworkReady
     ? {
@@ -556,9 +616,13 @@ function App() {
     let initializingRuntime = false;
     try {
       if (!isTauri) {
+        setAllowStatus(browserPreviewAllowStatus);
         setStatus(browserPreviewStatus);
         return;
       }
+      const nextAllow = await invoke<AllowStatus>("get_allow_status");
+      if (requestEpoch !== statusCommitEpoch.current) return;
+      setAllowStatus(nextAllow);
       let next: SystemStatus;
       let initializationError = "";
       if (!runtimeInitializationAttempted.current) {
@@ -569,7 +633,7 @@ function App() {
         try {
           next = await invoke<SystemStatus>("initialize_runtime");
         } catch (reason) {
-          initializationError = `Claude Science 核心服务自动启动失败：${String(reason)}`;
+          initializationError = String(reason);
           next = await invoke<SystemStatus>("get_system_status");
         }
       } else {
@@ -612,14 +676,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [refresh, isTauri]);
 
-  const primaryLabel = useMemo(() => {
-    if (status.windowsBridgePid) return "先停止旧 Windows Bridge";
-    if (canOpenClaude) return "打开 Claude Science";
-    if (status.restartBlocked) return "先处理诊断问题";
-    if (status.state === "notInstalled") return "安装运行环境";
-    if (status.state === "degraded") return "修复并重启";
-    return "启动 Claude Science";
-  }, [canOpenClaude, status.state, status.restartBlocked, status.windowsBridgePid]);
+  const primaryLabel = useMemo(() => primaryLabelFromAllow(allowStatus), [allowStatus]);
 
   function updateBusy(value: boolean) {
     if (value) {
@@ -715,7 +772,7 @@ function App() {
     setNetworkChecking(true);
     statusCommitEpoch.current += 1;
     const checkEpoch = statusCommitEpoch.current;
-    const commitNetworkResult = (next: NetworkQualityCheckResult) => {
+    const commitNetworkResult = (next: WorkReport) => {
       if (checkEpoch !== statusCommitEpoch.current) return;
       setStatus((current) => ({
         ...current,
@@ -735,7 +792,10 @@ function App() {
     setError("");
     try {
       if (!isTauri) {
-        const next: NetworkQualityCheckResult = {
+        const next: WorkReport = {
+          operation: "network_quality",
+          ok: true,
+          code: "work.network_quality.ok",
           deep: {
             deepChecked: true,
             sandboxUnixSocketState: "connected",
@@ -749,7 +809,7 @@ function App() {
         };
         commitNetworkResult(next);
       } else {
-        const next = await invoke<NetworkQualityCheckResult>("run_network_quality_check");
+        const next = await invoke<WorkReport>("run_network_quality_check");
         commitNetworkResult(next);
       }
     } catch (reason) {
@@ -765,6 +825,7 @@ function App() {
     setError("");
     try {
       setStatus(await invoke<SystemStatus>(command));
+      setAllowStatus(await invoke<AllowStatus>("get_allow_status"));
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -1173,8 +1234,7 @@ function App() {
 
   async function primaryAction() {
     if (busyRef.current) return;
-    if (networkCheckingRef.current && !canOpenClaude) return;
-    if (status.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
+    if (allowStatus.windowsBridgePid) return runAction("stop_legacy_windows_bridge");
     if (canOpenClaude) {
       updateBusy(true);
       setError("");
@@ -1189,22 +1249,8 @@ function App() {
       }
       return;
     }
-    if (status.restartBlocked) {
-      if (status.network.daemonMountIoBlocked) {
-        setError(`Claude Science 当前阻塞在 WSL 挂载盘 I/O（${status.network.daemonWaitChannel || "mount I/O"}）。端口虽在监听，但进程暂时无法安全停止；请等待 MCP 预热/I/O 返回后刷新。启动器不会关闭整个 WSL，也不会影响 2222 等无关服务。`);
-        return;
-      }
-      if (status.network.daemonIoBlocked) {
-        setError(`Claude Science 当前处于不可中断 I/O（${status.network.daemonProcessState || "D"} / ${status.network.daemonWaitChannel || "unknown"}）。启动器将保留 Claude Science、Bridge、WSL 和无关端口，待进程恢复后再允许修复。`);
-        return;
-      }
-      const location = status.wslStoragePath || "当前 WSL 虚拟磁盘";
-      setError(`当前不适合自动启动或重启（${location}）。请先根据诊断信息检查磁盘空间、WSL 状态或重新解压完整安装包；启动器不会冒险修改环境。`);
-      return;
-    }
-    if (status.state === "degraded") return runAction("restart_services");
-    if (status.state === "notInstalled") {
-      setError("请先在解压目录运行体检 Skill：repair-approved.ps1 -PlanOnly；确认计划后再执行 -ApproveInstall -StartServices。");
+    if (!allowStatus.runtimePresent) {
+      setError("runtime.install_required: 请先在解压目录运行体检 Skill：repair-approved.ps1 -PlanOnly；确认计划后再执行 -ApproveInstall -StartServices。");
       return;
     }
     return runAction("start_services");
@@ -1345,9 +1391,9 @@ function App() {
         <button
           className="primary-button"
           onClick={primaryAction}
-          disabled={busy || status.state === "loading" || (networkChecking && !canOpenClaude)}
+          disabled={busy}
         >
-          {busy ? (accessMode === "aggregate" ? "正在验证三个模型…" : "正在处理…") : primaryLabel}
+          {primaryLabel}
         </button>
       </section>
 

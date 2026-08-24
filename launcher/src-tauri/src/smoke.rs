@@ -1,7 +1,8 @@
 use super::{
-    background_command, command_output_with_stdin_timeout, command_output_with_timeout,
-    current_status, get_claude_url_impl, output_text, preferred_distro, project_root,
-    runtime_identity_from_health,
+    allow_status_impl, background_command, command_output_with_stdin_timeout,
+    command_output_with_timeout, derive_can_open, get_claude_url_impl, grade_status_impl,
+    output_text, preferred_distro, project_root, runtime_identity_from_health, AllowStatus,
+    ALLOW_OPEN_INPUTS,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,7 +22,6 @@ const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_millis(1_600);
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAINT_BUDGET: Duration = Duration::from_secs(3);
 const OPEN_BUDGET: Duration = Duration::from_secs(8);
-const ALLOW_OPEN_INPUTS: [&str; 2] = ["claudeRunning", "windowsBridgePid"];
 
 const ALLOW_PROBE_SHELL: &str = r#"
 set -u
@@ -354,25 +354,6 @@ struct AllowProbePayload {
     control_socket_present: bool,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct AllowStatus {
-    pub(crate) distro: String,
-    pub(crate) linux_user: String,
-    pub(crate) runtime_present: bool,
-    pub(crate) claude_running: bool,
-    pub(crate) claude_pid: Option<u32>,
-    pub(crate) listener_present: bool,
-    pub(crate) pid_8765: Option<u32>,
-    pub(crate) pid_8766: Option<u32>,
-    pub(crate) daemon_state: String,
-    pub(crate) listener_probe_ok: bool,
-    pub(crate) control_socket_present: bool,
-    pub(crate) windows_bridge_pid: Option<u32>,
-    pub(crate) windows_bridge_probe: String,
-    pub(crate) can_open: bool,
-    pub(crate) can_start: bool,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct BridgeProbePayload {
     error_code: String,
@@ -428,7 +409,7 @@ impl SmokeBackend for LiveSmokeBackend {
     }
 
     fn grade_status(&self) -> GradeProbe {
-        let status = current_status();
+        let status = grade_status_impl();
         GradeProbe {
             state: status.state,
             warnings: status.warnings.len(),
@@ -511,17 +492,27 @@ fn windows_listener_pids_from_netstat(text: &str, port: u16) -> Vec<u32> {
     pids
 }
 
-fn quick_preferred_distro() -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DistroProbe {
+    WslMissing,
+    NoDistro,
+    Selected(String),
+}
+
+fn quick_distro_probe() -> Result<DistroProbe, String> {
     let mut command = background_command("wsl.exe");
     command.args(["--list", "--quiet"]);
-    let output = command_output_with_timeout(
+    let output = match command_output_with_timeout(
         command,
         DISTRO_DISCOVERY_TIMEOUT,
         "ALLOW WSL distro discovery",
-    )
-    .map_err(|_| "transport.wsl_distro_probe".to_string())?;
+    ) {
+        Ok(output) => output,
+        Err(error) if error.contains("启动失败") => return Ok(DistroProbe::WslMissing),
+        Err(_) => return Err("transport.wsl_distro_probe".into()),
+    };
     if !output.status.success() {
-        return Err("transport.wsl_distro_probe".into());
+        return Ok(DistroProbe::WslMissing);
     }
     let distros = output_text(&output)
         .lines()
@@ -530,7 +521,16 @@ fn quick_preferred_distro() -> Result<String, String> {
         .filter(|value| !value.to_ascii_lowercase().starts_with("docker-desktop"))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    preferred_distro(&distros).ok_or_else(|| "runtime.wsl_distro_missing".to_string())
+    Ok(preferred_distro(&distros)
+        .map(DistroProbe::Selected)
+        .unwrap_or(DistroProbe::NoDistro))
+}
+
+fn quick_preferred_distro() -> Result<String, String> {
+    match quick_distro_probe()? {
+        DistroProbe::Selected(distro) => Ok(distro),
+        DistroProbe::WslMissing | DistroProbe::NoDistro => Err("runtime.wsl_distro_missing".into()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,10 +629,6 @@ if($null -ne $verifiedId) {{ "CSA:$verifiedId" }} else {{ 'PORT_CONFLICT' }}
     }
 }
 
-fn derive_can_open(claude_running: bool, windows_bridge_pid: Option<u32>) -> bool {
-    claude_running && windows_bridge_pid.is_none()
-}
-
 fn derive_can_start(
     runtime_present: bool,
     listener_probe_ok: bool,
@@ -640,6 +636,32 @@ fn derive_can_start(
     windows_probe: WindowsBridgeProbe,
 ) -> bool {
     runtime_present && listener_probe_ok && !listener_present && windows_probe.safe_to_start()
+}
+
+fn stopped_allow_status(
+    wsl_installed: bool,
+    distro: Option<String>,
+    windows_probe: WindowsBridgeProbe,
+) -> AllowStatus {
+    let windows_bridge_pid = windows_probe.pid();
+    AllowStatus {
+        wsl_installed,
+        distro,
+        linux_user: None,
+        runtime_present: false,
+        claude_running: false,
+        claude_pid: None,
+        listener_present: false,
+        pid_8765: None,
+        pid_8766: None,
+        daemon_state: "stopped".into(),
+        listener_probe_ok: false,
+        control_socket_present: false,
+        windows_bridge_pid,
+        windows_bridge_probe: windows_probe.state().into(),
+        can_open: derive_can_open(false, windows_bridge_pid),
+        can_start: false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,9 +721,20 @@ fn identity_matches_expected_package(
         && source_sha256.eq_ignore_ascii_case(&expected.source_sha256)
 }
 
-pub(crate) fn allow_status_impl() -> Result<AllowStatus, String> {
+pub(crate) fn probe_allow_status() -> Result<AllowStatus, String> {
     let windows_probe = thread::spawn(quick_windows_bridge_pid);
-    let distro = quick_preferred_distro()?;
+    let distro_probe = quick_distro_probe()?;
+    let distro = match distro_probe {
+        DistroProbe::Selected(distro) => distro,
+        DistroProbe::WslMissing => {
+            let windows_probe = windows_probe.join().unwrap_or(WindowsBridgeProbe::Unknown);
+            return Ok(stopped_allow_status(false, None, windows_probe));
+        }
+        DistroProbe::NoDistro => {
+            let windows_probe = windows_probe.join().unwrap_or(WindowsBridgeProbe::Unknown);
+            return Ok(stopped_allow_status(true, None, windows_probe));
+        }
+    };
     let output = run_wsl_stdin(
         &distro,
         "bash",
@@ -709,9 +742,9 @@ pub(crate) fn allow_status_impl() -> Result<AllowStatus, String> {
         ALLOW_PROBE_SHELL,
         ALLOW_PROBE_TIMEOUT,
         "ALLOW WSL probe",
-    )
-    .map_err(|_| "transport.wsl_allow_probe".to_string())?;
+    );
     let windows_probe = windows_probe.join().unwrap_or(WindowsBridgeProbe::Unknown);
+    let output = output.map_err(|_| "transport.wsl_allow_probe".to_string())?;
     let windows_bridge_pid = windows_probe.pid();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -735,8 +768,9 @@ pub(crate) fn allow_status_impl() -> Result<AllowStatus, String> {
         windows_probe,
     );
     Ok(AllowStatus {
-        distro,
-        linux_user: payload.linux_user,
+        wsl_installed: true,
+        distro: Some(distro),
+        linux_user: Some(payload.linux_user),
         runtime_present: payload.runtime_present,
         claude_running: payload.claude_running,
         claude_pid: payload.claude_pid,
@@ -882,11 +916,12 @@ fn run_smoke_with_backend<B: SmokeBackend>(
                 Ok(status) => {
                     required_pass += 1;
                     lines.push(format!(
-                        "PASS allow {}ms inputs={} distro={} linuxUser={} claudeRunning={} claudePid={} windowsBridgePid={} windowsBridgeProbe={} runtimePresent={} listenerProbeOk={} listenerPresent={} daemonState={} pid8765={} pid8766={} controlSocket={} canOpen={} canStart={}",
+                        "PASS allow {}ms inputs={} wslInstalled={} distro={} linuxUser={} claudeRunning={} claudePid={} windowsBridgePid={} windowsBridgeProbe={} runtimePresent={} listenerProbeOk={} listenerPresent={} daemonState={} pid8765={} pid8766={} controlSocket={} canOpen={} canStart={}",
                         allow_result.as_ref().expect("ALLOW result missing").1.as_millis(),
                         ALLOW_OPEN_INPUTS.join(","),
-                        status.distro,
-                        status.linux_user,
+                        status.wsl_installed,
+                        status.distro.as_deref().unwrap_or("none"),
+                        status.linux_user.as_deref().unwrap_or("none"),
                         status.claude_running,
                         status.claude_pid.map(|value| value.to_string()).unwrap_or_else(|| "none".into()),
                         status.windows_bridge_pid.map(|value| value.to_string()).unwrap_or_else(|| "none".into()),
@@ -1062,8 +1097,9 @@ mod tests {
         fn allow_status(&self) -> Result<AllowStatus, String> {
             self.allow_calls.set(self.allow_calls.get() + 1);
             Ok(AllowStatus {
-                distro: "Ubuntu-24.04".into(),
-                linux_user: "test-user".into(),
+                wsl_installed: true,
+                distro: Some("Ubuntu-24.04".into()),
+                linux_user: Some("test-user".into()),
                 runtime_present: true,
                 claude_running: true,
                 claude_pid: Some(42),
@@ -1150,6 +1186,28 @@ mod tests {
         assert!(output.contains("exit=0"));
         assert!(!output.contains("must-never-appear"));
         assert!(output.contains("nonce=present"));
+    }
+
+    #[test]
+    fn missing_wsl_or_distro_still_returns_a_renderable_allow_status() {
+        let no_wsl = stopped_allow_status(false, None, WindowsBridgeProbe::Absent);
+        assert!(!no_wsl.wsl_installed);
+        assert!(no_wsl.distro.is_none());
+        assert!(no_wsl.linux_user.is_none());
+        assert!(!no_wsl.can_open);
+        assert!(!no_wsl.can_start);
+        assert_eq!(no_wsl.daemon_state, "stopped");
+
+        let no_distro = stopped_allow_status(true, None, WindowsBridgeProbe::Absent);
+        assert!(no_distro.wsl_installed);
+        assert!(no_distro.distro.is_none());
+        assert!(!no_distro.can_open);
+        assert!(!no_distro.can_start);
+
+        let legacy = stopped_allow_status(false, None, WindowsBridgeProbe::Present(99));
+        assert_eq!(legacy.windows_bridge_pid, Some(99));
+        assert_eq!(legacy.windows_bridge_probe, "present");
+        assert!(!legacy.can_open);
     }
 
     #[test]

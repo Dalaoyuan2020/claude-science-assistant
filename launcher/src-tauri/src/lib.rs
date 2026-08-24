@@ -98,8 +98,34 @@ fn service_operation_lock_with_timeout(
     ServiceOperationLock::acquire(&path, operation, timeout)
 }
 
+fn classify_service_operation_error(operation: &str, error: String) -> String {
+    if ERROR_LAYER_PREFIXES
+        .iter()
+        .any(|candidate| error.starts_with(candidate))
+    {
+        return error;
+    }
+    let (held_code, unavailable_code) = if operation == "provider-transition" {
+        (
+            "bridge.transition_lock_held",
+            "bridge.transition_lock_unavailable",
+        )
+    } else {
+        ("runtime.lock_held", "runtime.lock_unavailable")
+    };
+    if error.contains("Another CSA service operation") {
+        format!("{held_code}:{operation}")
+    } else {
+        format!(
+            "{unavailable_code}:{operation}: {}",
+            clean_diagnostic_text(&error)
+        )
+    }
+}
+
 fn service_operation_lock(operation: &str) -> Result<ServiceOperationLock, String> {
     service_operation_lock_with_timeout(operation, Duration::from_secs(3))
+        .map_err(|error| classify_service_operation_error(operation, error))
 }
 
 fn service_operation_quick_lock(
@@ -110,13 +136,8 @@ fn service_operation_quick_lock(
         .parent()
         .ok_or_else(|| "无法定位 CSA 状态目录".to_string())?
         .join("service-lifecycle.lock");
-    ServiceOperationLock::acquire_quick(&path, timeout).map_err(|error| {
-        if error.contains("Another CSA service operation") {
-            format!("runtime.lock_held:{operation}")
-        } else {
-            format!("runtime.lock_unavailable:{operation}")
-        }
-    })
+    ServiceOperationLock::acquire_quick(&path, timeout)
+        .map_err(|error| classify_service_operation_error(operation, error))
 }
 
 #[cfg(windows)]
@@ -281,6 +302,57 @@ where
         .map_err(|error| format!("background task failed: {error}"))?
 }
 
+const ERROR_LAYER_PREFIXES: [&str; 6] = [
+    "login.",
+    "runtime.",
+    "bridge.",
+    "grade.",
+    "work.",
+    "transport.",
+];
+
+fn ensure_error_prefix(prefix: &str, error: String) -> String {
+    if ERROR_LAYER_PREFIXES
+        .iter()
+        .any(|candidate| error.starts_with(candidate))
+    {
+        error
+    } else {
+        format!("{prefix}: {}", clean_diagnostic_text(&error))
+    }
+}
+
+const ALLOW_OPEN_INPUTS: [&str; 2] = ["claudeRunning", "windowsBridgePid"];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AllowStatus {
+    wsl_installed: bool,
+    distro: Option<String>,
+    linux_user: Option<String>,
+    runtime_present: bool,
+    claude_running: bool,
+    claude_pid: Option<u32>,
+    listener_present: bool,
+    pid_8765: Option<u32>,
+    pid_8766: Option<u32>,
+    daemon_state: String,
+    listener_probe_ok: bool,
+    control_socket_present: bool,
+    windows_bridge_pid: Option<u32>,
+    windows_bridge_probe: String,
+    can_open: bool,
+    can_start: bool,
+}
+
+fn derive_can_open(claude_running: bool, windows_bridge_pid: Option<u32>) -> bool {
+    claude_running && windows_bridge_pid.is_none()
+}
+
+fn allow_status_impl() -> Result<AllowStatus, String> {
+    smoke::probe_allow_status()
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemStatus {
@@ -293,6 +365,9 @@ struct SystemStatus {
     claude_running: bool,
     claude_pid: Option<u32>,
     claude_listener_present: bool,
+    claude_port_8765: bool,
+    claude_port_8766: bool,
+    claude_unverified_pid: Option<u32>,
     bridge_healthy: bool,
     bridge_identity: Option<RuntimeIdentity>,
     windows_bridge_pid: Option<u32>,
@@ -309,8 +384,93 @@ struct SystemStatus {
     storage_warning: bool,
     storage_blocked: bool,
     restart_blocked: bool,
+    host_access_preferences_present: bool,
+    host_access_preferences_parse_ok: bool,
+    drvfs_write_grant_count: u32,
+    broad_drvfs_write_grant_count: u32,
+    drvfs_write_grants: Vec<String>,
     network: NetworkQualityStatus,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GradeStatus {
+    state: String,
+    wsl_installed: bool,
+    bridge_running: bool,
+    bridge_pid: Option<u32>,
+    bridge_healthy: bool,
+    bridge_identity: Option<RuntimeIdentity>,
+    claude_listener_present: bool,
+    claude_port_8765: bool,
+    claude_port_8766: bool,
+    claude_unverified_pid: Option<u32>,
+    runtime_ready: bool,
+    source_binary_present: bool,
+    bridge_venv_present: bool,
+    wsl_storage_path: Option<String>,
+    wsl_storage_drive: Option<String>,
+    wsl_storage_free_gb: Option<f64>,
+    wsl_vhdx_size_gb: Option<f64>,
+    wsl_root_free_gb: Option<f64>,
+    settings_storage_drive: Option<String>,
+    settings_storage_free_gb: Option<f64>,
+    storage_warning: bool,
+    storage_blocked: bool,
+    restart_blocked: bool,
+    host_access_preferences_present: bool,
+    host_access_preferences_parse_ok: bool,
+    drvfs_write_grant_count: u32,
+    broad_drvfs_write_grant_count: u32,
+    drvfs_write_grants: Vec<String>,
+    network: GradeNetworkStatus,
+    warnings: Vec<String>,
+}
+
+impl From<SystemStatus> for GradeStatus {
+    fn from(status: SystemStatus) -> Self {
+        Self {
+            state: status.state,
+            wsl_installed: status.wsl_installed,
+            bridge_running: status.bridge_running,
+            bridge_pid: status.bridge_pid,
+            bridge_healthy: status.bridge_healthy,
+            bridge_identity: status.bridge_identity,
+            claude_listener_present: status.claude_listener_present,
+            claude_port_8765: status.claude_port_8765,
+            claude_port_8766: status.claude_port_8766,
+            claude_unverified_pid: status.claude_unverified_pid,
+            runtime_ready: status.runtime_ready,
+            source_binary_present: status.source_binary_present,
+            bridge_venv_present: status.bridge_venv_present,
+            wsl_storage_path: status.wsl_storage_path,
+            wsl_storage_drive: status.wsl_storage_drive,
+            wsl_storage_free_gb: status.wsl_storage_free_gb,
+            wsl_vhdx_size_gb: status.wsl_vhdx_size_gb,
+            wsl_root_free_gb: status.wsl_root_free_gb,
+            settings_storage_drive: status.settings_storage_drive,
+            settings_storage_free_gb: status.settings_storage_free_gb,
+            storage_warning: status.storage_warning,
+            storage_blocked: status.storage_blocked,
+            restart_blocked: status.restart_blocked,
+            host_access_preferences_present: status.host_access_preferences_present,
+            host_access_preferences_parse_ok: status.host_access_preferences_parse_ok,
+            drvfs_write_grant_count: status.drvfs_write_grant_count,
+            broad_drvfs_write_grant_count: status.broad_drvfs_write_grant_count,
+            drvfs_write_grants: status.drvfs_write_grants,
+            network: GradeNetworkStatus::from(&status.network),
+            warnings: status
+                .warnings
+                .into_iter()
+                .filter(|warning| !work_lane_warning(warning))
+                .collect(),
+        }
+    }
+}
+
+fn grade_status_impl() -> GradeStatus {
+    GradeStatus::from(current_status())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,6 +537,50 @@ impl Default for NetworkQualityStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct GradeNetworkStatus {
+    proxy_state: String,
+    local_ready: bool,
+    proxy_reachable: Option<bool>,
+    proxy_endpoints: Vec<String>,
+    proxy_conflict: bool,
+    sandbox_forwarder_count: u32,
+    sandbox_forwarder_expected_count: u32,
+    sandbox_forwarder_topology_state: String,
+    sandbox_http_forwarder_count: u32,
+    sandbox_socks_forwarder_count: u32,
+    sandbox_probe_role: String,
+    sandbox_probe_transport: String,
+    daemon_process_state: String,
+    daemon_wait_channel: String,
+    daemon_io_blocked: bool,
+    daemon_mount_io_blocked: bool,
+}
+
+impl From<&NetworkQualityStatus> for GradeNetworkStatus {
+    fn from(network: &NetworkQualityStatus) -> Self {
+        Self {
+            proxy_state: network.proxy_state.clone(),
+            local_ready: network.local_ready,
+            proxy_reachable: network.proxy_reachable,
+            proxy_endpoints: network.proxy_endpoints.clone(),
+            proxy_conflict: network.proxy_conflict,
+            sandbox_forwarder_count: network.sandbox_forwarder_count,
+            sandbox_forwarder_expected_count: network.sandbox_forwarder_expected_count,
+            sandbox_forwarder_topology_state: network.sandbox_forwarder_topology_state.clone(),
+            sandbox_http_forwarder_count: network.sandbox_http_forwarder_count,
+            sandbox_socks_forwarder_count: network.sandbox_socks_forwarder_count,
+            sandbox_probe_role: network.sandbox_probe_role.clone(),
+            sandbox_probe_transport: network.sandbox_probe_transport.clone(),
+            daemon_process_state: network.daemon_process_state.clone(),
+            daemon_wait_channel: network.daemon_wait_channel.clone(),
+            daemon_io_blocked: network.daemon_io_blocked,
+            daemon_mount_io_blocked: network.daemon_mount_io_blocked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DeepNetworkQualityStatus {
     deep_checked: bool,
     deep_checked_at_unix: Option<u64>,
@@ -405,7 +609,10 @@ impl From<&NetworkQualityStatus> for DeepNetworkQualityStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NetworkQualityCheckResult {
+struct WorkReport {
+    operation: String,
+    ok: bool,
+    code: String,
     // Never return local readiness, daemon scheduler state, PID or topology
     // from the long-running probe. Only deep quality fields may be merged into
     // the last shallow status, so a probe cannot disable local login.
@@ -414,14 +621,38 @@ struct NetworkQualityCheckResult {
     warnings: Vec<String>,
 }
 
-fn network_quality_check_result(status: SystemStatus) -> NetworkQualityCheckResult {
+fn work_lane_warning(warning: &str) -> bool {
+    warning.starts_with("Sandbox deep egress quality check")
+}
+
+fn network_quality_work_report(status: SystemStatus) -> WorkReport {
     let deep = status
         .network
         .deep_checked
         .then(|| DeepNetworkQualityStatus::from(&status.network));
-    NetworkQualityCheckResult {
+    let ok = deep
+        .as_ref()
+        .is_some_and(|report| report.sandbox_egress_state == "ok");
+    let code = match deep
+        .as_ref()
+        .map(|report| report.sandbox_egress_state.as_str())
+    {
+        Some("ok") => "work.network_quality.ok",
+        Some("daemon_busy") => "work.network_quality.daemon_busy",
+        Some("daemon_mount_io_busy") => "work.network_quality.daemon_mount_io_busy",
+        Some("not_checked") | None => "work.network_quality.not_checked",
+        Some(_) => "work.network_quality.failed",
+    };
+    WorkReport {
+        operation: "network_quality".into(),
+        ok,
+        code: code.into(),
         deep,
-        warnings: status.warnings,
+        warnings: status
+            .warnings
+            .into_iter()
+            .filter(|warning| work_lane_warning(warning))
+            .collect(),
     }
 }
 
@@ -1275,6 +1506,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 claude_running: false,
                 claude_pid: None,
                 claude_listener_present: false,
+                claude_port_8765: false,
+                claude_port_8766: false,
+                claude_unverified_pid: None,
                 bridge_healthy: false,
                 bridge_identity: None,
                 windows_bridge_pid: legacy_windows_bridge_pid(),
@@ -1291,6 +1525,11 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 storage_warning: false,
                 storage_blocked: false,
                 restart_blocked: false,
+                host_access_preferences_present: false,
+                host_access_preferences_parse_ok: false,
+                drvfs_write_grant_count: 0,
+                broad_drvfs_write_grant_count: 0,
+                drvfs_write_grants: Vec::new(),
                 network: NetworkQualityStatus::default(),
                 warnings,
             };
@@ -1309,6 +1548,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             claude_running: false,
             claude_pid: None,
             claude_listener_present: false,
+            claude_port_8765: false,
+            claude_port_8766: false,
+            claude_unverified_pid: None,
             bridge_healthy: false,
             bridge_identity: None,
             windows_bridge_pid: legacy_windows_bridge_pid(),
@@ -1325,6 +1567,11 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             storage_warning: false,
             storage_blocked: false,
             restart_blocked: false,
+            host_access_preferences_present: false,
+            host_access_preferences_parse_ok: false,
+            drvfs_write_grant_count: 0,
+            broad_drvfs_write_grant_count: 0,
+            drvfs_write_grants: Vec::new(),
             network: NetworkQualityStatus::default(),
             warnings,
         };
@@ -1370,6 +1617,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 claude_running: false,
                 claude_pid: None,
                 claude_listener_present: false,
+                claude_port_8765: false,
+                claude_port_8766: false,
+                claude_unverified_pid: None,
                 bridge_healthy: false,
                 bridge_identity: None,
                 windows_bridge_pid: None,
@@ -1386,6 +1636,11 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 storage_warning: storage_blocked,
                 storage_blocked,
                 restart_blocked: true,
+                host_access_preferences_present: false,
+                host_access_preferences_parse_ok: false,
+                drvfs_write_grant_count: 0,
+                broad_drvfs_write_grant_count: 0,
+                drvfs_write_grants: Vec::new(),
                 network: NetworkQualityStatus::default(),
                 warnings,
             };
@@ -1773,6 +2028,9 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         claude_running,
         claude_pid,
         claude_listener_present,
+        claude_port_8765: probe.runtime.port_8765,
+        claude_port_8766: probe.runtime.port_8766,
+        claude_unverified_pid: probe.runtime.claude_unverified_pid,
         bridge_healthy,
         bridge_identity: probe.runtime.bridge_identity,
         windows_bridge_pid,
@@ -1789,6 +2047,11 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         storage_warning,
         storage_blocked,
         restart_blocked,
+        host_access_preferences_present: probe.host_access.preferences_present,
+        host_access_preferences_parse_ok: probe.host_access.preferences_parse_ok,
+        drvfs_write_grant_count: probe.host_access.drvfs_write_grant_count,
+        broad_drvfs_write_grant_count: probe.host_access.broad_drvfs_write_grant_count,
+        drvfs_write_grants: probe.host_access.drvfs_write_grants,
         network,
         warnings,
     }
@@ -3774,6 +4037,7 @@ async fn test_api_key(
         )
     })
     .await
+    .map_err(|error| ensure_error_prefix("bridge.api_key_test_failed", error))
 }
 
 fn auto_map_api_key_impl(
@@ -3979,6 +4243,7 @@ async fn auto_map_api_key(
         )
     })
     .await
+    .map_err(|error| ensure_error_prefix("bridge.api_key_auto_map_failed", error))
 }
 
 fn launcher_settings_body(settings: &LauncherSettings) -> Result<String, String> {
@@ -4070,6 +4335,7 @@ async fn save_provider_selection(
         save_provider_selection_impl(selected_provider_id, custom_base_url, custom_confirmed)
     })
     .await
+    .map_err(|error| ensure_error_prefix("bridge.provider_save_failed", error))
 }
 
 fn save_api_key_impl(
@@ -4164,6 +4430,7 @@ async fn save_api_key(
         )
     })
     .await
+    .map_err(|error| ensure_error_prefix("bridge.api_key_save_failed", error))
 }
 
 fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
@@ -4208,7 +4475,9 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
 
 #[tauri::command]
 async fn activate_api_key(api_key_id: String) -> Result<LauncherState, String> {
-    run_blocking(move || activate_api_key_impl(api_key_id)).await
+    run_blocking(move || activate_api_key_impl(api_key_id))
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.api_key_activate_failed", error))
 }
 
 #[cfg(test)]
@@ -4388,7 +4657,9 @@ fn save_and_activate_aggregate_scheme_impl(
 async fn save_and_activate_aggregate_scheme(
     scheme: StoredAggregateScheme,
 ) -> Result<LauncherState, String> {
-    run_blocking(move || save_and_activate_aggregate_scheme_impl(scheme)).await
+    run_blocking(move || save_and_activate_aggregate_scheme_impl(scheme))
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.aggregate_save_activate_failed", error))
 }
 
 fn activate_aggregate_scheme_impl(scheme_id: String) -> Result<LauncherState, String> {
@@ -4404,7 +4675,9 @@ fn activate_aggregate_scheme_impl(scheme_id: String) -> Result<LauncherState, St
 
 #[tauri::command]
 async fn activate_aggregate_scheme(scheme_id: String) -> Result<LauncherState, String> {
-    run_blocking(move || activate_aggregate_scheme_impl(scheme_id)).await
+    run_blocking(move || activate_aggregate_scheme_impl(scheme_id))
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.aggregate_activate_failed", error))
 }
 
 fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
@@ -4454,22 +4727,41 @@ fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
 
 #[tauri::command]
 async fn delete_api_key(api_key_id: String) -> Result<LauncherState, String> {
-    run_blocking(move || delete_api_key_impl(api_key_id)).await
+    run_blocking(move || delete_api_key_impl(api_key_id))
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.api_key_delete_failed", error))
 }
 
 #[tauri::command]
 async fn get_system_status() -> Result<SystemStatus, String> {
-    run_blocking(|| Ok(current_status())).await
+    run_blocking(|| Ok(current_status()))
+        .await
+        .map_err(|error| ensure_error_prefix("grade.status_failed", error))
 }
 
 #[tauri::command]
-async fn run_network_quality_check() -> Result<NetworkQualityCheckResult, String> {
+async fn get_allow_status() -> Result<AllowStatus, String> {
+    run_blocking(allow_status_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.allow_status_failed", error))
+}
+
+#[tauri::command]
+async fn get_grade_status() -> Result<GradeStatus, String> {
+    run_blocking(|| Ok(grade_status_impl()))
+        .await
+        .map_err(|error| ensure_error_prefix("grade.status_failed", error))
+}
+
+#[tauri::command]
+async fn run_network_quality_check() -> Result<WorkReport, String> {
     run_blocking(|| {
-        Ok(network_quality_check_result(current_status_with_options(
+        Ok(network_quality_work_report(current_status_with_options(
             true,
         )))
     })
     .await
+    .map_err(|error| ensure_error_prefix("work.network_quality_failed", error))
 }
 
 fn valid_release_sha8(value: &str) -> bool {
@@ -4672,7 +4964,9 @@ fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
 
 #[tauri::command]
 async fn get_runtime_update_status() -> Result<RuntimeUpdateStatus, String> {
-    run_blocking(get_runtime_update_status_impl).await
+    run_blocking(get_runtime_update_status_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("work.runtime_update_status_failed", error))
 }
 
 // The inner startup can legitimately spend up to ~100 seconds in the
@@ -4686,7 +4980,8 @@ fn start_services_raw(
     user: &str,
     force_restart: bool,
 ) -> Result<RuntimeIdentity, String> {
-    let script = project_root()?
+    let script = project_root()
+        .map_err(|error| ensure_error_prefix("runtime.package_root_missing", error))?
         .join("scripts")
         .join("start-claude-science-wsl.ps1");
     let mut command = background_command("powershell.exe");
@@ -4709,12 +5004,14 @@ fn start_services_raw(
         command.arg("-ForceRestart");
     }
     let output =
-        command_output_with_timeout(command, START_SERVICES_TIMEOUT, "Claude Science 启动")?;
+        command_output_with_timeout(command, START_SERVICES_TIMEOUT, "Claude Science 启动")
+            .map_err(|error| ensure_error_prefix("runtime.start_process_failed", error))?;
     if output.status.success() {
         parse_runtime_identity(&output_text(&output))
+            .map_err(|error| ensure_error_prefix("bridge.identity_invalid", error))
     } else {
         Err(format!(
-            "Claude Science 启动失败：{}",
+            "runtime.start_process_failed: Claude Science 启动失败：{}",
             command_error_text(&output)
         ))
     }
@@ -4738,10 +5035,10 @@ fn initialize_runtime_impl() -> Result<SystemStatus, String> {
 
     let distro = before
         .distro
-        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+        .ok_or_else(|| "runtime.wsl_distro_missing: 请先安装 WSL2 和 Ubuntu".to_string())?;
     let user = before
         .linux_user
-        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+        .ok_or_else(|| "runtime.wsl_user_missing: 无法确定 WSL 默认用户".to_string())?;
 
     // Claude Science is the primary product service. The transaction is
     // requested first during launcher boot, while start_services_raw keeps the
@@ -4754,7 +5051,7 @@ fn initialize_runtime_impl() -> Result<SystemStatus, String> {
 fn ensure_no_legacy_windows_bridge(status: &SystemStatus) -> Result<(), String> {
     if let Some(pid) = status.windows_bridge_pid {
         return Err(format!(
-            "检测到旧 Windows Bridge（PID {pid}）。为避免同时运行 Windows/WSL 双 Bridge，请先在诊断区显式停止旧实例，再启动 Claude Science。"
+            "runtime.legacy_windows_bridge_present: 检测到旧 Windows Bridge（PID {pid}）。为避免同时运行 Windows/WSL 双 Bridge，请先在诊断区显式停止旧实例，再启动 Claude Science。"
         ));
     }
     Ok(())
@@ -4762,7 +5059,9 @@ fn ensure_no_legacy_windows_bridge(status: &SystemStatus) -> Result<(), String> 
 
 #[tauri::command]
 async fn initialize_runtime() -> Result<SystemStatus, String> {
-    run_blocking(initialize_runtime_impl).await
+    run_blocking(initialize_runtime_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.initialize_failed", error))
 }
 
 fn start_services_impl() -> Result<SystemStatus, String> {
@@ -4774,7 +5073,7 @@ fn start_services_impl() -> Result<SystemStatus, String> {
     }
     if before.restart_blocked {
         return Err(format!(
-            "当前诊断不允许自动启动（{}）。请先检查磁盘空间、WSL 状态、守护进程 I/O 阻塞和安装包完整性；CSA 不会停止 Bridge、关闭 WSL 或影响无关端口。",
+            "runtime.start_blocked: 当前诊断不允许自动启动（{}）。请先检查磁盘空间、WSL 状态、守护进程 I/O 阻塞和安装包完整性；CSA 不会停止 Bridge、关闭 WSL 或影响无关端口。",
             before
                 .wsl_storage_path
                 .as_deref()
@@ -4783,17 +5082,19 @@ fn start_services_impl() -> Result<SystemStatus, String> {
     }
     let distro = before
         .distro
-        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+        .ok_or_else(|| "runtime.wsl_distro_missing: 请先安装 WSL2 和 Ubuntu".to_string())?;
     let user = before
         .linux_user
-        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+        .ok_or_else(|| "runtime.wsl_user_missing: 无法确定 WSL 默认用户".to_string())?;
     start_services_raw(&distro, &user, false)?;
     Ok(current_status())
 }
 
 #[tauri::command]
 async fn start_services() -> Result<SystemStatus, String> {
-    run_blocking(start_services_impl).await
+    run_blocking(start_services_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.start_failed", error))
 }
 
 const STOP_SERVICES_SHELL: &str = "bash";
@@ -5066,9 +5367,13 @@ fn stop_services_raw(distro: &str) -> Result<(), String> {
         distro,
         &[STOP_SERVICES_SHELL, "-lc", STOP_SERVICES_SCRIPT],
         STOP_SERVICES_TIMEOUT,
-    )?;
+    )
+    .map_err(|error| ensure_error_prefix("transport.stop_services_failed", error))?;
     if !output.status.success() {
-        return Err(format!("停止服务失败：{}", command_error_text(&output)));
+        return Err(format!(
+            "runtime.stop_process_failed: 停止服务失败：{}",
+            command_error_text(&output)
+        ));
     }
     Ok(())
 }
@@ -5085,7 +5390,9 @@ fn stop_services_impl() -> Result<SystemStatus, String> {
 
 #[tauri::command]
 async fn stop_services() -> Result<SystemStatus, String> {
-    run_blocking(stop_services_impl).await
+    run_blocking(stop_services_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.stop_failed", error))
 }
 
 fn restart_services_impl() -> Result<SystemStatus, String> {
@@ -5093,21 +5400,23 @@ fn restart_services_impl() -> Result<SystemStatus, String> {
     let before = current_status();
     ensure_no_legacy_windows_bridge(&before)?;
     if before.restart_blocked {
-        return Err("当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应、Claude Science 正处于不可中断 I/O，或安装包不完整。现有服务、WSL 和无关端口不会被停止。".into());
+        return Err("work.restart_blocked: 当前诊断不允许自动重启；可能是磁盘空间不足、WSL 只读/无响应、Claude Science 正处于不可中断 I/O，或安装包不完整。现有服务、WSL 和无关端口不会被停止。".into());
     }
     let distro = before
         .distro
-        .ok_or_else(|| "请先安装 WSL2 和 Ubuntu".to_string())?;
+        .ok_or_else(|| "runtime.wsl_distro_missing: 请先安装 WSL2 和 Ubuntu".to_string())?;
     let user = before
         .linux_user
-        .ok_or_else(|| "无法确定 WSL 默认用户".to_string())?;
+        .ok_or_else(|| "runtime.wsl_user_missing: 无法确定 WSL 默认用户".to_string())?;
     start_services_raw(&distro, &user, true)?;
     Ok(current_status())
 }
 
 #[tauri::command]
 async fn restart_services() -> Result<SystemStatus, String> {
-    run_blocking(restart_services_impl).await
+    run_blocking(restart_services_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("work.restart_failed", error))
 }
 
 fn selected_distro_quick() -> Result<String, String> {
@@ -5357,9 +5666,9 @@ fn safe_claude_loopback_url(output: &str) -> Result<String, String> {
         }
     }
     if saw_url {
-        Err("Claude Science 返回了非受信任的登录地址；CSA 已拒绝打开。".into())
+        Err("login.untrusted_url: Claude Science 返回了非受信任的登录地址；CSA 已拒绝打开。".into())
     } else {
-        Err("Claude Science 登录控制通道没有返回可打开的本机地址。".into())
+        Err("login.url_missing: Claude Science 登录控制通道没有返回可打开的本机地址。".into())
     }
 }
 
@@ -5415,25 +5724,27 @@ fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Resu
     // vendor CLI also uses small exit codes (including 2), so raw-code mapping
     // creates false "runtime missing" diagnostics while the binary is present.
     let base = if cleaned_stderr.contains("CSA_URL_RUNTIME_MISSING") {
-        "Claude Science 受管运行时入口缺失；请从完整 V0.1.6 便携包执行修复。"
+        "runtime.entry_missing: Claude Science 受管运行时入口缺失；请从完整 V0.1.6 便携包执行修复。"
     } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_BUSY") {
-        "Claude Science 仍在启动或重启；等待生命周期切换 25 秒后仍未完成，请稍后重试。"
+        "login.lifecycle_busy: Claude Science 仍在启动或重启；生命周期锁当前正忙，请稍后重试。"
     } else if cleaned_stderr.contains("CSA_URL_FLOCK_MISSING") {
-        "WSL 缺少 CSA 生命周期锁工具 flock，无法安全等待服务切换。"
+        "runtime.flock_missing: WSL 缺少 CSA 生命周期锁工具 flock，无法安全等待服务切换。"
+    } else if cleaned_stderr.contains("CSA_URL_TIMEOUT_MISSING") {
+        "runtime.timeout_missing: WSL 缺少 timeout，无法为登录预检建立硬期限。"
     } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_LOCK_UNREADABLE") {
-        "CSA 生命周期锁不可读写，无法安全生成 Claude Science 登录地址。"
+        "runtime.lifecycle_lock_unreadable: CSA 生命周期锁不可读写，无法安全生成 Claude Science 登录地址。"
     } else if cleaned_stderr.contains("CSA_URL_DAEMON_IDENTITY_UNVERIFIED") {
-        "Claude Science 的 8765/8766 端口未通过同一受管进程身份校验；CSA 已拒绝向未知本地服务发送登录命令。"
+        "login.daemon_identity_unverified: Claude Science 的 8765/8766 端口未通过同一受管进程身份校验；CSA 已拒绝向未知本地服务发送登录命令。"
     } else if cleaned_stderr.contains("CSA_URL_DAEMON_IO_BLOCKED") {
-        "Claude Science 当前处于不可中断 WSL I/O；本地端口仍可能监听，但登录入口暂时不能安全生成。"
+        "login.daemon_io_blocked: Claude Science 当前处于不可中断 WSL I/O；本地端口仍可能监听，但登录入口暂时不能安全生成。"
     } else if cleaned_stderr.contains("CSA_URL_CONTROL_UNAVAILABLE") {
-        "Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成两次退避重试。"
+        "login.control_unavailable: Claude Science 端口已出现，但登录控制通道暂时没有响应；CSA 已完成两次退避重试。"
     } else if cleaned_stderr.contains("CSA_URL_DAEMON_TRANSITION") {
-        "Claude Science 运行时入口存在，但登录命令在两次退避后仍处于 daemon 切换状态；这不是运行时缺失。"
+        "login.daemon_transition: Claude Science 运行时入口存在，但登录命令在两次退避后仍处于 daemon 切换状态；这不是运行时缺失。"
     } else if cleaned_stderr.contains("CSA_URL_DAEMON_NOT_READY") {
-        "Claude Science 当前没有稳定的锁文件或控制 socket，服务可能仍在切换。"
+        "login.daemon_not_ready: Claude Science 当前没有稳定的锁文件或 control socket，服务可能仍在切换。"
     } else {
-        "Claude Science 登录地址生成失败。"
+        "login.url_command_failed: Claude Science 登录地址生成失败。"
     };
     if let Some(code) = exit_code {
         if let Some(detail) = safe_claude_url_error_detail(stderr) {
@@ -5497,9 +5808,11 @@ fn get_claude_url_impl() -> Result<String, String> {
 
 #[tauri::command]
 async fn open_claude_science(app: tauri::AppHandle) -> Result<(), String> {
-    let url = run_blocking(get_claude_url_impl).await?;
+    let url = run_blocking(get_claude_url_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("login.open_failed", error))?;
     app.opener().open_url(url, None::<&str>).map_err(|_| {
-        "已生成本机登录地址，但 Windows 无法打开默认浏览器；请检查默认浏览器关联后重试。"
+        "login.browser_open_failed: 已生成本机登录地址，但 Windows 无法打开默认浏览器；请检查默认浏览器关联后重试。"
             .to_string()
     })
 }
@@ -5549,7 +5862,9 @@ print(json.dumps(data, ensure_ascii=False))
 
 #[tauri::command]
 async fn get_dashboard_url() -> Result<String, String> {
-    run_blocking(get_dashboard_url_impl).await
+    run_blocking(get_dashboard_url_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.dashboard_url_failed", error))
 }
 
 fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
@@ -5573,7 +5888,9 @@ fn stop_legacy_windows_bridge_impl() -> Result<SystemStatus, String> {
 
 #[tauri::command]
 async fn stop_legacy_windows_bridge() -> Result<SystemStatus, String> {
-    run_blocking(stop_legacy_windows_bridge_impl).await
+    run_blocking(stop_legacy_windows_bridge_impl)
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.legacy_bridge_stop_failed", error))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5581,6 +5898,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            get_allow_status,
+            get_grade_status,
             get_system_status,
             initialize_runtime,
             run_network_quality_check,
@@ -5609,6 +5928,297 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_allow_status() -> AllowStatus {
+        AllowStatus {
+            wsl_installed: true,
+            distro: Some("Ubuntu-24.04".into()),
+            linux_user: Some("test-user".into()),
+            runtime_present: true,
+            claude_running: true,
+            claude_pid: Some(42),
+            listener_present: true,
+            pid_8765: Some(42),
+            pid_8766: Some(42),
+            daemon_state: "managed_ready".into(),
+            listener_probe_ok: true,
+            control_socket_present: true,
+            windows_bridge_pid: None,
+            windows_bridge_probe: "checked".into(),
+            can_open: true,
+            can_start: false,
+        }
+    }
+
+    fn ts_member_inputs(source: &str, receiver: &str) -> std::collections::BTreeSet<String> {
+        let needle = format!("{receiver}.");
+        let mut inputs = std::collections::BTreeSet::new();
+        let mut remaining = source;
+        while let Some(offset) = remaining.find(&needle) {
+            let tail = &remaining[offset + needle.len()..];
+            let name = tail
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect::<String>();
+            if !name.is_empty() {
+                inputs.insert(name);
+            }
+            remaining = tail;
+        }
+        inputs
+    }
+
+    #[test]
+    fn allow_inputs_frozen() {
+        const TAX_MESSAGE: &str =
+            "ALLOW 输入集合被改动。改它要走 §4.4 的税单（改测试 + 改合同 + 反例测试 + 错误前缀）。";
+        let source = include_str!("../../src/App.tsx");
+        let can_open_start = source
+            .find("const canOpenFromAllow =")
+            .expect("canOpenFromAllow should exist");
+        let can_open_end = source[can_open_start..]
+            .find("const primaryLabelFromAllow =")
+            .map(|offset| can_open_start + offset)
+            .expect("primaryLabelFromAllow should follow canOpenFromAllow");
+        let can_open = &source[can_open_start..can_open_end];
+        let actual_can_open_inputs = ts_member_inputs(can_open, "allow");
+        let expected_can_open_inputs = ALLOW_OPEN_INPUTS
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual_can_open_inputs, expected_can_open_inputs,
+            "{TAX_MESSAGE}"
+        );
+        assert!(
+            source.contains(
+                "const ALLOW_OPEN_INPUTS = [\"claudeRunning\", \"windowsBridgePid\"] as const"
+            ),
+            "{TAX_MESSAGE}"
+        );
+        assert!(
+            source.contains("const canOpenClaude = canOpenFromAllow(allowStatus);"),
+            "产品主路径必须调用冻结后的 ALLOW 判据。{TAX_MESSAGE}"
+        );
+
+        let label_start = can_open_end;
+        let label_end = source[label_start..]
+            .find("interface SystemStatus")
+            .map(|offset| label_start + offset)
+            .expect("SystemStatus should follow the label helper");
+        let label_helper = &source[label_start..label_end];
+        let mut label_inputs = ts_member_inputs(label_helper, "allow");
+        if label_helper.contains("canOpenFromAllow(allow)") {
+            label_inputs.extend(actual_can_open_inputs);
+        }
+        let allow_fields = serde_json::to_value(sample_allow_status())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            label_inputs.is_subset(&allow_fields),
+            "主按钮文案读取了非 ALLOW 字段：{:?}。{TAX_MESSAGE}",
+            label_inputs.difference(&allow_fields).collect::<Vec<_>>()
+        );
+        for label in [
+            "打开 Claude Science",
+            "启动 Claude Science",
+            "先停止旧 Windows Bridge",
+            "安装运行环境",
+        ] {
+            assert_eq!(
+                label_helper.matches(&format!("return \"{label}\"")).count(),
+                1,
+                "主按钮固定文案缺失或重复：{label}。{TAX_MESSAGE}"
+            );
+        }
+        assert_eq!(
+            label_helper.matches("return \"").count(),
+            4,
+            "主按钮文案不再是固定四条。{TAX_MESSAGE}"
+        );
+        for forbidden in [
+            "先处理诊断问题",
+            "尚未启动",
+            "restartBlocked",
+            "status.state",
+            "status.network",
+        ] {
+            assert!(
+                !label_helper.contains(forbidden),
+                "主按钮文案混入了 GRADE/WORK 输入 {forbidden}。{TAX_MESSAGE}"
+            );
+        }
+        assert!(
+            source.contains(
+                "const primaryLabel = useMemo(() => primaryLabelFromAllow(allowStatus), [allowStatus]);"
+            ),
+            "产品主路径必须只用 AllowStatus 生成主按钮文案。{TAX_MESSAGE}"
+        );
+        let button_start = source
+            .find("className=\"primary-button\"")
+            .expect("primary button should exist");
+        let button_end = source[button_start..]
+            .find("</button>")
+            .map(|offset| button_start + offset)
+            .expect("primary button should close");
+        let button = &source[button_start..button_end];
+        assert!(button.contains("disabled={busy}"));
+        assert!(button.contains("{primaryLabel}"));
+        for forbidden in ["status.", "networkChecking", "restartBlocked", "正在处理"] {
+            assert!(
+                !button.contains(forbidden),
+                "主按钮渲染混入了 GRADE/WORK 输入 {forbidden}。{TAX_MESSAGE}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_lane_serialization_keeps_allow_grade_and_work_separate() {
+        let allow = serde_json::to_value(sample_allow_status()).unwrap();
+        for forbidden in [
+            "state",
+            "bridgeHealthy",
+            "restartBlocked",
+            "storageWarning",
+            "network",
+            "deep",
+            "warnings",
+        ] {
+            assert!(
+                allow.get(forbidden).is_none(),
+                "ALLOW leaked {forbidden} from GRADE/WORK"
+            );
+        }
+
+        let work_warning = "Sandbox deep egress quality check to pypi failed".to_string();
+        let grade_warning = "Bridge identity mismatch".to_string();
+        let grade_value = GradeStatus::from(SystemStatus {
+            warnings: vec![work_warning.clone(), grade_warning.clone()],
+            ..Default::default()
+        });
+        assert_eq!(grade_value.warnings, [grade_warning]);
+        let grade = serde_json::to_value(grade_value).unwrap();
+        for forbidden in [
+            "claudeRunning",
+            "claudePid",
+            "windowsBridgePid",
+            "canOpen",
+            "canStart",
+            "deepChecked",
+            "sandboxEgressState",
+            "sandboxUnixSocketState",
+            "sandboxSocksHandshakeState",
+        ] {
+            assert!(
+                grade.get(forbidden).is_none(),
+                "GRADE leaked {forbidden} from ALLOW/WORK"
+            );
+            assert!(
+                grade
+                    .get("network")
+                    .and_then(|value| value.get(forbidden))
+                    .is_none(),
+                "GRADE.network leaked WORK field {forbidden}"
+            );
+        }
+
+        let work = network_quality_work_report(SystemStatus {
+            claude_running: true,
+            claude_pid: Some(42),
+            windows_bridge_pid: Some(7),
+            network: NetworkQualityStatus {
+                deep_checked: true,
+                sandbox_egress_state: "failed".into(),
+                ..Default::default()
+            },
+            warnings: vec![work_warning.clone(), "Bridge identity mismatch".into()],
+            ..Default::default()
+        });
+        assert_eq!(work.warnings, [work_warning]);
+        let work = serde_json::to_value(work).unwrap();
+        for forbidden in [
+            "claudeRunning",
+            "claudePid",
+            "windowsBridgePid",
+            "canOpen",
+            "canStart",
+            "state",
+            "runtimeReady",
+            "listenerPresent",
+            "pid8765",
+            "pid8766",
+            "network",
+        ] {
+            assert!(
+                work.get(forbidden).is_none(),
+                "WORK leaked {forbidden} from ALLOW/GRADE"
+            );
+        }
+    }
+
+    #[test]
+    fn status_commands_and_smoke_share_the_authoritative_implementations() {
+        let backend = include_str!("lib.rs");
+        let smoke = include_str!("smoke.rs");
+        assert!(backend.contains("run_blocking(allow_status_impl)"));
+        assert!(backend.contains("Ok(grade_status_impl())"));
+        assert!(smoke.contains("allow_status_impl()"));
+        assert!(smoke.contains("let status = grade_status_impl();"));
+    }
+
+    #[test]
+    fn layered_error_prefixes_preserve_known_codes_and_classify_unknown_errors() {
+        assert_eq!(
+            ensure_error_prefix(
+                "runtime.start_failed",
+                "login.daemon_not_ready: wait".into()
+            ),
+            "login.daemon_not_ready: wait"
+        );
+        assert_eq!(
+            ensure_error_prefix("runtime.start_failed", "raw failure".into()),
+            "runtime.start_failed: raw failure"
+        );
+        assert!(classify_service_operation_error(
+            "provider-transition",
+            "Another CSA service operation owns the lock".into()
+        )
+        .starts_with("bridge.transition_lock_held:"));
+        assert!(classify_service_operation_error(
+            "start-services",
+            "Another CSA service operation owns the lock".into()
+        )
+        .starts_with("runtime.lock_held:"));
+        assert!(ensure_no_legacy_windows_bridge(&SystemStatus {
+            windows_bridge_pid: Some(99),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .starts_with("runtime.legacy_windows_bridge_present:"));
+
+        let source = include_str!("lib.rs");
+        for boundary in [
+            "bridge.api_key_test_failed",
+            "bridge.api_key_auto_map_failed",
+            "bridge.provider_save_failed",
+            "bridge.api_key_save_failed",
+            "bridge.api_key_activate_failed",
+            "bridge.aggregate_save_activate_failed",
+            "bridge.aggregate_activate_failed",
+            "bridge.api_key_delete_failed",
+            "work.runtime_update_status_failed",
+            "bridge.dashboard_url_failed",
+        ] {
+            assert!(
+                source.contains(&format!("ensure_error_prefix(\"{boundary}\"")),
+                "user-reachable command is missing its layered error boundary: {boundary}"
+            );
+        }
+    }
 
     #[test]
     fn prepared_atomic_write_replaces_existing_file() {
@@ -5720,29 +6330,34 @@ mod tests {
             &format!("failed to mint nonce at http://127.0.0.1:8765/?nonce={nonce}\nCSA_URL_CONTROL_UNAVAILABLE\n"),
         )
         .unwrap_err();
+        assert!(control.starts_with("login.control_unavailable:"));
         assert!(control.contains("登录控制通道"));
         assert!(!control.contains(&nonce));
         assert!(!control.contains("nonce="));
 
         let missing =
             claude_url_result(Some(2), &secret_stdout, "CSA_URL_RUNTIME_MISSING\n").unwrap_err();
+        assert!(missing.starts_with("runtime.entry_missing:"));
         assert!(missing.contains("运行时入口缺失"));
         assert!(!missing.contains(&nonce));
 
         let vendor_two =
             claude_url_result(Some(2), &secret_stdout, "CSA_URL_COMMAND_FAILED=2\n").unwrap_err();
+        assert!(vendor_two.starts_with("login.url_command_failed:"));
         assert!(vendor_two.contains("登录地址生成失败"));
         assert!(!vendor_two.contains("运行时入口缺失"));
         assert!(!vendor_two.contains(&nonce));
 
         let transition =
             claude_url_result(Some(2), &secret_stdout, "CSA_URL_DAEMON_TRANSITION\n").unwrap_err();
+        assert!(transition.starts_with("login.daemon_transition:"));
         assert!(transition.contains("运行时入口存在"));
         assert!(transition.contains("不是运行时缺失"));
         assert!(!transition.contains(&nonce));
 
         let io_blocked =
             claude_url_result(Some(76), &secret_stdout, "CSA_URL_DAEMON_IO_BLOCKED\n").unwrap_err();
+        assert!(io_blocked.starts_with("login.daemon_io_blocked:"));
         assert!(io_blocked.contains("不可中断 WSL I/O"));
         assert!(!io_blocked.contains(&nonce));
 
@@ -5752,6 +6367,7 @@ mod tests {
             "CSA_URL_DAEMON_IDENTITY_UNVERIFIED\n",
         )
         .unwrap_err();
+        assert!(unverified.starts_with("login.daemon_identity_unverified:"));
         assert!(unverified.contains("同一受管进程身份校验"));
         assert!(unverified.contains("未知本地服务"));
         assert!(!unverified.contains(&nonce));
@@ -5763,6 +6379,7 @@ mod tests {
                 &format!("CSA_URL_COMMAND_FAILED={vendor_code}\n"),
             )
             .unwrap_err();
+            assert!(vendor_failure.starts_with("login.url_command_failed:"));
             assert!(vendor_failure.contains("登录地址生成失败"));
             assert!(!vendor_failure.contains("生命周期"));
             assert!(!vendor_failure.contains("flock"));
@@ -5771,6 +6388,7 @@ mod tests {
 
         let busy =
             claude_url_result(Some(75), &secret_stdout, "CSA_URL_LIFECYCLE_BUSY\n").unwrap_err();
+        assert!(busy.starts_with("login.lifecycle_busy:"));
         assert!(busy.contains("启动或重启"));
         assert!(!busy.contains(&nonce));
 
@@ -5780,6 +6398,7 @@ mod tests {
             "provider failed at https://example.invalid/private\n",
         )
         .unwrap_err();
+        assert!(unknown.starts_with("login.url_command_failed:"));
         assert!(unknown.contains("退出码 9"));
         assert!(unknown.contains("<地址已隐藏>"));
         assert!(!unknown.contains("example.invalid"));
@@ -5933,10 +6552,12 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = network_quality_check_result(failed_inspection);
+        let result = network_quality_work_report(failed_inspection);
 
         assert!(result.deep.is_none());
-        assert_eq!(result.warnings, ["WSL deep inspection timed out"]);
+        assert_eq!(result.operation, "network_quality");
+        assert!(!result.ok);
+        assert!(result.warnings.is_empty());
         let serialized = serde_json::to_value(&result).unwrap();
         assert!(serialized.get("deep").is_none());
         assert!(serialized.get("state").is_none());
@@ -5952,7 +6573,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let result = network_quality_check_result(completed);
+        let result = network_quality_work_report(completed);
+        assert!(!result.ok);
         assert_eq!(result.deep.unwrap().sandbox_egress_state, "failed");
 
         let busy = SystemStatus {
@@ -5965,7 +6587,17 @@ mod tests {
             },
             ..Default::default()
         };
-        let serialized = serde_json::to_value(network_quality_check_result(busy)).unwrap();
+        let serialized = serde_json::to_value(network_quality_work_report(busy)).unwrap();
+        let top_level = serialized.as_object().unwrap();
+        assert_eq!(
+            top_level
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["code", "deep", "ok", "operation", "warnings"]
+                .into_iter()
+                .collect()
+        );
         let deep = serialized.get("deep").unwrap();
         assert_eq!(
             deep.get("sandboxEgressState").unwrap(),
@@ -6795,7 +7427,7 @@ mod tests {
             .expect("lifecycle action should follow deep network handler");
         let deep = &source[deep_start..deep_end];
         let can_open_start = source
-            .find("const canOpenClaude = Boolean(")
+            .find("const canOpenClaude = canOpenFromAllow(allowStatus);")
             .expect("open readiness should exist");
         let can_open_end = source[can_open_start..]
             .find("const mutationBusy")
@@ -6818,7 +7450,7 @@ mod tests {
         assert!(action.contains("await invoke<void>(\"open_claude_science\");"));
         assert!(!action.contains("get_system_status"));
         assert!(!refresh.contains("run_network_quality_check"));
-        assert!(deep.contains("invoke<NetworkQualityCheckResult>(\"run_network_quality_check\")"));
+        assert!(deep.contains("invoke<WorkReport>(\"run_network_quality_check\")"));
         assert!(deep.contains("setStatus((current) =>"));
         assert!(deep.contains("...current"));
         assert!(deep.contains("...current.network"));
@@ -6828,7 +7460,8 @@ mod tests {
         assert!(!deep.contains("setStatus(next)"));
         assert!(source.contains("const [networkChecking, setNetworkChecking] = useState(false);"));
         assert!(source.contains("networkCheckingRef.current"));
-        assert!(can_open.contains("status.claudeRunning"));
+        assert!(can_open.contains("canOpenFromAllow(allowStatus)"));
+        assert!(!can_open.contains("status.claudeRunning"));
         assert!(!can_open.contains("status.network.daemonIoBlocked"));
         assert!(!can_open.contains("status.network.localReady"));
         assert!(!can_open.contains("status.bridgeHealthy"));
