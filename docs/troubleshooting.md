@@ -157,6 +157,14 @@ is streamed over stdin rather than embedded in `wsl.exe ... bash -lc`, preventin
 from expanding helper calls before Bash defines them. A login
 error is shown immediately rather than hidden behind a second full refresh.
 
+Startup and fast reuse do not run the external canary automatically. A deep check that observes the daemon
+in `D/p9_client_rpc` during one interval does not publish that scheduler event to the reusable 15-minute
+cache. If the same managed PID has returned to `R`, `S`, or `I`, a legacy busy cache is invalidated instead
+of being combined with the current `do_epoll_wait` value. The network card may invite another deep check,
+but the recovered event is not a current service diagnostic. CSA only recommends narrowing a persistent
+grant when inspection actually reports a broad DrvFS writable grant; an active Windows-backed workspace or
+concurrent MCP I/O can also cause a transient mount wait.
+
 ## Tool Call Markers Appear As Text
 
 Some OpenAI-compatible providers emit native tool-call markers in normal text.

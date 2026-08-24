@@ -218,6 +218,39 @@ def test_deep_cache_is_reused_only_for_the_same_daemon_contract(tmp_path, monkey
     assert merged["deep_checked"] is True
     assert merged["sandbox_egress_state"] == "ok"
 
+    transient_busy_cache = {
+        **cached,
+        "sandbox_egress_state": "daemon_mount_io_busy",
+        "sandbox_egress_failure_stage": "daemon_event_loop",
+        "sandbox_probe_daemon_state": "D",
+        "sandbox_probe_daemon_wait_channel": "p9_client_rpc",
+        "sandbox_probe_daemon_io_blocked": True,
+        "sandbox_probe_daemon_mount_io_blocked": True,
+    }
+    assert network_quality.write_cache(transient_busy_cache, cache_file)
+    recovered = network_quality.merge_fresh_cache(current, cache_file, 900)
+    assert recovered["claude_process_state"] == "S"
+    assert recovered["claude_io_blocked"] is False
+    assert recovered["deep_checked"] is False
+    assert recovered["sandbox_egress_state"] == "not_checked"
+    assert not cache_file.exists()
+    assert network_quality.deep_result_is_cacheable(transient_busy_cache) is False
+    assert network_quality.deep_result_is_cacheable(cached) is True
+
+    contract_changed_after_block = {
+        **transient_busy_cache,
+        "sandbox_egress_state": "contract_changed",
+        "sandbox_egress_failure_stage": "contract",
+    }
+    assert network_quality.deep_result_is_cacheable(contract_changed_after_block) is False
+    assert network_quality.write_cache(contract_changed_after_block, cache_file)
+    recovered = network_quality.merge_fresh_cache(current, cache_file, 900)
+    assert recovered["deep_checked"] is False
+    assert recovered["sandbox_egress_state"] == "not_checked"
+    assert not cache_file.exists()
+
+    assert network_quality.write_cache(cached, cache_file)
+
     blocked_current = {
         **current,
         "claude_process_state": "D",

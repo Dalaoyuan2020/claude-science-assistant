@@ -159,9 +159,21 @@ record_deep_network_quality() {
     if [ "$verdict" != "ready" ]; then
       success_streak=0
       success_token=""
-      if [ "$verdict" != "cache_identity_invalid" ] && [ -f "$pending_cache" ]; then
-        mv -f -- "$pending_cache" "$degraded_cache" || true
-      fi
+      case "$verdict" in
+        egress_daemon_mount_io_busy|egress_daemon_busy)
+          # A scheduler observation is only true for this attempt.  Never
+          # promote it to the reusable cache, even if an older helper happened
+          # to create a pending file.
+          rm -f -- "$pending_cache" "$degraded_cache"
+          ;;
+        cache_identity_invalid)
+          ;;
+        *)
+          if [ -f "$pending_cache" ]; then
+            mv -f -- "$pending_cache" "$degraded_cache" || true
+          fi
+          ;;
+      esac
     fi
     [ "$attempt" -lt 4 ] || break
     case "$verdict" in
@@ -185,7 +197,7 @@ record_deep_network_quality() {
   DEEP_NETWORK_VERDICT="$verdict"
   case "$verdict" in
     egress_daemon_mount_io_busy)
-      echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop is blocked on WSL-mounted filesystem I/O. A broad persistent Windows RW grant can make the upstream Git safety scan recurse through DrvFS. The daemon was kept running; wait for I/O to return, then narrow the grant to a specific project/output directory or move hot repositories to WSL ext4. No model request was made." >&2
+      echo "Warning: the deep quality attempt observed transient WSL-mounted filesystem I/O. The daemon was kept running, and this scheduler event was not published to the reusable cache. Refresh after I/O returns; no model request was made." >&2
       ;;
     egress_daemon_busy)
       echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop remained busy during protocol handshakes. The daemon was kept running for a later retry; no model request was made." >&2
@@ -832,7 +844,6 @@ BRIDGE_VALIDATED=0
 CLAUDE_POINTER_CHANGED=0
 CLAUDE_PREVIOUS_RUNTIME=""
 CLAUDE_CANDIDATE_RUNTIME=""
-CLAUDE_VALIDATED=0
 CLAUDE_STOPPED_FOR_ACTIVATION=0
 PREVIOUS_RUNNING_CLAUDE_BIN=""
 CLAUDE_CANDIDATE_LAUNCHED=0
@@ -940,11 +951,7 @@ if [ -n "$preflight_unsafe_pid" ]; then
     exit 1
   fi
   echo "Claude Science PID $preflight_unsafe_pid is temporarily unsafe to signal. Existing healthy local services were preserved without staging or mutating Bridge/runtime pointers."
-  if record_deep_network_quality; then
-    echo "Claude Science recovered and passed the network probe, but package migration was intentionally deferred; refresh once more to apply it safely."
-  else
-    echo "Claude Science remains locally available but external API readiness is degraded ($DEEP_NETWORK_VERDICT). Refresh after I/O returns; CSA did not restart WSL or touch unrelated port 2222."
-  fi
+  echo "External sandbox quality checking is deferred to the launcher's independent Deep Check action; CSA did not restart WSL or touch unrelated port 2222."
   csa_print_bridge_identity
   START_COMPLETED=1
   exit 0
@@ -1046,11 +1053,8 @@ if [ "${CSA_FORCE_RESTART:-0}" != "1" ] \
   && check_claude_health "$PATCHED_BIN" \
   && check_claude_network_contract; then
   echo "Claude Science and WSL BYOK proxy are already running; using fast start path."
-  if record_deep_network_quality && [ -x "$PATCHED_BIN" ]; then
-    echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
-  else
-    echo "Claude Science local listeners remain available on 127.0.0.1:$CLAUDE_SCIENCE_PORT, but external API readiness is degraded ($DEEP_NETWORK_VERDICT). The launcher will not report the service ready until a later deep check passes twice consecutively."
-  fi
+  echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
+  echo "External sandbox quality checking is independent and may be run from the launcher's Deep Check action."
   csa_print_bridge_identity
   START_COMPLETED=1
   exit 0
@@ -1361,17 +1365,10 @@ if ! wait_claude_network_contract 5; then
   exit 1
 fi
 csa_atomic_symlink "$PATCH_DIR" "$CSA_CLAUDE_ROOT/patched-current"
-if record_deep_network_quality; then
-  CLAUDE_VALIDATED=1
-  echo "Started Claude Science validated patched copy:"
-  echo "  daemon: $PATCHED_BIN"
-  echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
-  echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
-else
-  echo "Started Claude Science patched copy with degraded network quality:"
-  echo "  daemon: $PATCHED_BIN"
-  echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
-  echo "Claude Science local listeners remain available on 127.0.0.1:$CLAUDE_SCIENCE_PORT, but external API readiness is degraded ($DEEP_NETWORK_VERDICT). The process was kept running without restarting WSL or touching unrelated port 2222."
-fi
+echo "Started Claude Science validated local runtime:"
+echo "  daemon: $PATCHED_BIN"
+echo "  ANTHROPIC_BASE_URL=$PROXY_URL"
+echo "Claude Science is ready on 127.0.0.1:$CLAUDE_SCIENCE_PORT. Use the launcher to open it."
+echo "External sandbox quality checking is independent and may be run from the launcher's Deep Check action."
 csa_print_bridge_identity
 START_COMPLETED=1

@@ -43,6 +43,7 @@ DEFAULT_CANARY_URL = "https://pypi.org/simple/pip/"
 DEFAULT_CACHE_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_EXPECTED_SANDBOX_FORWARDERS = 3
 SANDBOX_PROBE_IDENTITY = "analysis-socks5h-pypi-head-v2"
+TRANSIENT_DAEMON_EGRESS_STATES = {"daemon_busy", "daemon_mount_io_busy"}
 # The three built-in role forwarders are spawned together during daemon start.
 # A later replacement can make PID ordering assign the wrong allowlist to a
 # role, so fail closed when their start times are no longer one startup burst.
@@ -990,6 +991,24 @@ def build_report(
     }
 
 
+def deep_result_has_transient_daemon_block(report: Mapping[str, object]) -> bool:
+    return bool(
+        report.get("sandbox_egress_state") in TRANSIENT_DAEMON_EGRESS_STATES
+        or report.get("sandbox_probe_daemon_io_blocked") is True
+        or report.get("sandbox_probe_daemon_mount_io_blocked") is True
+    )
+
+
+def invalidate_cache(cache_file: Path) -> bool:
+    try:
+        cache_file.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> dict:
     report = dict(report)
     if report.get("claude_pid") is not None and (
@@ -1003,6 +1022,19 @@ def merge_fresh_cache(report: dict, cache_file: Path, max_age_seconds: int) -> d
     try:
         cached = json.loads(cache_file.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
+        return report
+    if (
+        deep_result_has_transient_daemon_block(cached)
+        and report.get("claude_pid") is not None
+        and report.get("claude_io_blocked") is False
+        and report.get("claude_process_state") in {"R", "S", "I"}
+    ):
+        # A D-state observation is evidence about one probe interval, not a
+        # 15-minute property of a daemon which has since returned to a safe
+        # scheduler state.  Do not combine the old p9_client_rpc snapshot with
+        # the live do_epoll_wait state or keep presenting a recovered service
+        # as broken.
+        invalidate_cache(cache_file)
         return report
     checked_at = cached.get("deep_checked_at_unix")
     if not isinstance(checked_at, int):
@@ -1084,6 +1116,12 @@ def write_cache(report: dict, cache_file: Path) -> bool:
         return False
 
 
+def deep_result_is_cacheable(report: Mapping[str, object]) -> bool:
+    """Keep transient daemon scheduler observations out of the durable cache."""
+
+    return not deep_result_has_transient_daemon_block(report)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     target = parser.add_mutually_exclusive_group(required=True)
@@ -1127,7 +1165,14 @@ def main() -> int:
     )
     cache_written = True
     if args.deep and args.write_cache and args.cache_file is not None:
-        cache_written = write_cache(report, args.cache_file)
+        if deep_result_is_cacheable(report):
+            cache_written = write_cache(report, args.cache_file)
+        else:
+            # A previous green result is no longer authoritative after this
+            # probe observed the daemon blocked, while publishing the transient
+            # D-state itself would make a recovered process look broken for the
+            # full cache TTL.  Leave the durable quality state unknown.
+            cache_written = invalidate_cache(args.cache_file)
     elif not args.deep and args.cache_file is not None:
         report = merge_fresh_cache(report, args.cache_file, args.cache_max_age)
     if args.contract_only:

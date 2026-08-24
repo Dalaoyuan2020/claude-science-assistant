@@ -348,13 +348,18 @@ $deepEgressReady = [bool](
   $sandboxEgressHttpStatus -ge 200 -and
   $sandboxEgressHttpStatus -lt 300
 )
-$networkReady = [bool](
+$localNetworkReady = [bool](
   $claudeDetected -and
   -not $claudeIoBlocked -and
   $proxyContractReady -and
-  $sandboxForwardersReady -and
-  $deepEgressReady
+  $sandboxForwardersReady
 )
+$networkReady = [bool]($localNetworkReady -and $deepEgressReady)
+$hostAccess = if ($wslProbe) { Get-OptionalProperty $wslProbe "host_access" $null } else { $null }
+$preferencesPresent = [bool](Get-OptionalProperty $hostAccess "preferences_present" $false)
+$preferencesParseOk = [bool](Get-OptionalProperty $hostAccess "preferences_parse_ok" $false)
+$drvfsGrantCount = [int](Get-OptionalProperty $hostAccess "drvfs_write_grant_count" 0)
+$broadGrantCount = [int](Get-OptionalProperty $hostAccess "broad_drvfs_write_grant_count" 0)
 
 if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid", "unknown")) {
   $endpoints = @($wslProbe.network.proxy_endpoints) -join ", "
@@ -364,31 +369,32 @@ if ($claudeDetected -and $proxyState -in @("unreachable", "conflict", "invalid",
 if ($claudeDetected -and -not $sandboxForwardersReady) {
   $warnings.Add("Claude Science is listening, but its owned sandbox HTTP/SOCKS pair topology is not ready ($sandboxPairCount/$sandboxExpectedCount, state=$sandboxTopologyState).")
 }
-if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -not $sandboxDeepChecked) {
-  $warnings.Add("Sandbox egress has not passed a fresh end-to-end canary. Re-run with -DeepNetworkProbe.")
-}
 if ($wslProbe -and $sandboxDeepChecked -and -not $deepEgressReady) {
   if ($sandboxProbeDaemonMountIoBlocked -or $sandboxEgressState -eq "daemon_mount_io_busy") {
-    $waitChannel = if ($sandboxProbeDaemonWaitChannel -and $sandboxProbeDaemonWaitChannel -ne "unknown") { $sandboxProbeDaemonWaitChannel } else { "WSL mount I/O" }
-    $warnings.Add("Claude Science owns its ports, but the daemon event loop was blocked in $waitChannel during the end-to-end probe. A broad persistent RW grant can make the upstream Git safety scan recurse through DrvFS. The result was withheld and this is not evidence of an external API outage; wait for I/O to return, then narrow the grant or move hot repositories to WSL ext4.")
+    if (-not $claudeIoBlocked) {
+      $warnings.Add("The deep quality check observed transient WSL mount I/O, but the live Claude Science daemon has recovered to $claudeProcessState/$claudeWaitChannel. The transient result was not retained and does not prevent opening the local UI.")
+    }
   } elseif ($sandboxProbeDaemonIoBlocked -or $sandboxEgressState -eq "daemon_busy") {
-    $warnings.Add("Claude Science entered uninterruptible I/O during the protocol probe ($sandboxProbeDaemonWaitChannel). External API readiness is not established; the daemon was kept running and no billable model request was made.")
+    if (-not $claudeIoBlocked) {
+      $warnings.Add("The deep quality check observed transient daemon I/O, but the live Claude Science daemon has recovered. The transient result was not retained and does not prevent opening the local UI.")
+    }
   } else {
-    $warnings.Add("Sandbox egress canary failed at $sandboxEgressFailureStage`: $sandboxEgressState. No billable model request was made.")
+    $warnings.Add("Sandbox egress quality check failed at $sandboxEgressFailureStage`: $sandboxEgressState. This does not prevent opening the verified local UI; no billable model request was made.")
   }
 }
 if ($claudeDetected -and $claudeMountIoBlocked) {
-  $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel. A broad writable Windows grant can make the upstream Git safety scan recurse through DrvFS; do not force a partial restart until the mount I/O returns.")
+  if ($preferencesPresent -and -not $preferencesParseOk) {
+    $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel. Persistent host-access scope could not be verified, so CSA will not recommend an authorization change; do not force a partial restart until the I/O returns.")
+  } elseif ($broadGrantCount -gt 0) {
+    $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel, and CSA detected $broadGrantCount broad persistent writable Windows grant(s). Do not force a partial restart until the I/O returns; then convert the broad grant to read-only or move the hot repository to WSL ext4.")
+  } else {
+    $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel. No broad persistent writable Windows grant was detected; this may be transient activity from an open Windows-backed workspace or concurrent MCP work. Do not force a partial restart until the I/O returns.")
+  }
 } elseif ($claudeDetected -and $claudeIoBlocked) {
   $warnings.Add("Claude Science is currently in uninterruptible I/O ($claudeProcessState at $claudeWaitChannel); CSA will not report network ready or attempt a partial restart until it becomes safely stoppable.")
 }
-$hostAccess = if ($wslProbe) { Get-OptionalProperty $wslProbe "host_access" $null } else { $null }
 $hostAccessRepairNeeded = $false
 if ($hostAccess) {
-  $preferencesPresent = [bool](Get-OptionalProperty $hostAccess "preferences_present" $false)
-  $preferencesParseOk = [bool](Get-OptionalProperty $hostAccess "preferences_parse_ok" $false)
-  $drvfsGrantCount = [int](Get-OptionalProperty $hostAccess "drvfs_write_grant_count" 0)
-  $broadGrantCount = [int](Get-OptionalProperty $hostAccess "broad_drvfs_write_grant_count" 0)
   if ($preferencesPresent -and -not $preferencesParseOk) {
     $warnings.Add("Claude Science preferences.json exists but its host-access grants could not be parsed safely; no granted path was walked or modified.")
   }
@@ -403,7 +409,7 @@ if ($hostAccess) {
 $overall = "not_ready"
 if ($hostAccessRepairNeeded) {
   $overall = "repair_required"
-} elseif ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject -and $networkReady) {
+} elseif ($bridgeHealthy -and $claudeDetected -and $unitMatchesProject -and $localNetworkReady) {
   $overall = if ($storageWarning) { "ready_with_storage_warning" } else { "ready" }
 } elseif ($bridgeHealthy) {
   $overall = "bridge_ready"
@@ -432,6 +438,7 @@ $report = [ordered]@{
   bridge_service_active = $bridgeServiceActive
   claude_detected = $claudeDetected
   unit_matches_project = $unitMatchesProject
+  local_network_ready = $localNetworkReady
   network_ready = $networkReady
   project_root = $ProjectRoot
   project_wsl = $projectWsl

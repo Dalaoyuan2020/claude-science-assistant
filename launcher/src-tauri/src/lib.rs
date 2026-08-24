@@ -59,6 +59,22 @@ fn core_runtime_ready_for_ui(local_network_ready: bool, claude_io_blocked: bool)
     local_network_ready && !claude_io_blocked
 }
 
+fn transient_deep_daemon_result_recovered(
+    deep_checked: bool,
+    sandbox_egress_state: &str,
+    sandbox_probe_daemon_io_blocked: bool,
+    sandbox_probe_daemon_mount_io_blocked: bool,
+    daemon_process_state: &str,
+    daemon_io_blocked: bool,
+) -> bool {
+    deep_checked
+        && (matches!(sandbox_egress_state, "daemon_busy" | "daemon_mount_io_busy")
+            || sandbox_probe_daemon_io_blocked
+            || sandbox_probe_daemon_mount_io_blocked)
+        && !daemon_io_blocked
+        && matches!(daemon_process_state, "R" | "S" | "I")
+}
+
 // Provider changes update the WSL Bridge config and restart its listener. Keep
 // the whole write/restart/verify transaction single-flight to prevent a second
 // click from racing the first transaction's rollback.
@@ -1381,11 +1397,25 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let deep_result_fresh = deep_network_result_is_fresh(
+    let cached_deep_result_fresh = deep_network_result_is_fresh(
         probe.network.deep_checked,
         probe.network.deep_checked_at_unix,
         now_unix,
     );
+    // A cached D/p9 observation describes one probe interval.  Once the same
+    // live daemon is back in R/S/I, discard that transient quality result
+    // instead of combining it with a current do_epoll_wait snapshot for the
+    // next 15 minutes.
+    let deep_result_fresh = cached_deep_result_fresh
+        && (deep_network_probe
+            || !transient_deep_daemon_result_recovered(
+                probe.network.deep_checked,
+                &probe.network.sandbox_egress_state,
+                probe.network.sandbox_probe_daemon_io_blocked,
+                probe.network.sandbox_probe_daemon_mount_io_blocked,
+                &probe.network.claude_process_state,
+                probe.network.claude_io_blocked,
+            ));
     let network_ready = local_network_ready
         && !probe.network.claude_io_blocked
         && deep_result_fresh
@@ -1551,61 +1581,39 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
             probe.network.sandbox_forwarder_topology_state
         ));
     }
-    if local_network_ready && !deep_result_fresh {
-        warnings.push("Claude Science local proxy/forwarder contract is healthy, but the end-to-end sandbox egress result is missing or stale. Run the anonymous, non-billable HTTPS HEAD deep check (PyPI) before treating external APIs as ready.".into());
-    }
     if deep_result_fresh
         && !matches!(
             probe.network.sandbox_egress_state.as_str(),
-            "ok" | "not_checked"
+            "ok" | "not_checked" | "daemon_busy" | "daemon_mount_io_busy"
         )
+        && !probe.network.sandbox_probe_daemon_io_blocked
+        && !probe.network.sandbox_probe_daemon_mount_io_blocked
     {
-        if probe.network.sandbox_probe_daemon_mount_io_blocked
-            || probe.network.sandbox_egress_state == "daemon_mount_io_busy"
-        {
-            let wait_channel = if probe
-                .network
-                .sandbox_probe_daemon_wait_channel
-                .trim()
-                .is_empty()
-            {
-                "mount I/O"
-            } else {
-                probe.network.sandbox_probe_daemon_wait_channel.as_str()
-            };
-            warnings.push(format!(
-                "Claude Science owns all expected ports, but its event loop was blocked in {wait_channel} while accessing a WSL-mounted Windows path during the end-to-end probe. A broad persistent RW grant can make the upstream Git safety scan recurse through DrvFS. The readiness result was withheld, so this is not evidence of an external API or proxy outage. Wait for I/O to return, then narrow the grant or move hot repositories to WSL ext4."
-            ));
-        } else if probe.network.sandbox_probe_daemon_io_blocked
-            || probe.network.sandbox_egress_state == "daemon_busy"
-        {
-            warnings.push(format!(
-                "Claude Science owns all expected ports, but its event loop entered scheduler state {} at {} during the protocol probe. External API readiness is not established; the daemon was kept running and no billable model request was made.",
-                probe.network.sandbox_probe_daemon_state,
-                probe.network.sandbox_probe_daemon_wait_channel
-            ));
-        } else {
-            let target = probe
-                .network
-                .sandbox_egress_target
-                .as_deref()
-                .unwrap_or("research API canary");
-            let status = probe
-                .network
-                .sandbox_egress_http_status
-                .map(|value| format!(", HTTP {value}"))
-                .unwrap_or_default();
-            warnings.push(format!(
-                "Sandbox deep egress check to {target} failed at stage {} ({}{}). This can be a local proxy, policy, DNS/TLS, or remote-service issue; the probe does not make a billable model request.",
-                probe.network.sandbox_egress_failure_stage,
-                probe.network.sandbox_egress_state,
-                status
-            ));
-        }
+        let target = probe
+            .network
+            .sandbox_egress_target
+            .as_deref()
+            .unwrap_or("research API canary");
+        let status = probe
+            .network
+            .sandbox_egress_http_status
+            .map(|value| format!(", HTTP {value}"))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "Sandbox deep egress quality check to {target} failed at stage {} ({}{}). This does not prevent opening the verified local Claude Science UI; no billable model request was made.",
+            probe.network.sandbox_egress_failure_stage,
+            probe.network.sandbox_egress_state,
+            status
+        ));
     }
-
     if claude_running && probe.network.claude_mount_io_blocked {
-        warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. A broad writable Windows grant can make the upstream Git safety scan recurse through DrvFS; repair/restart is temporarily blocked so CSA does not leave Bridge and daemon in a partial state. Refresh after I/O returns, then narrow the grant to a specific project or output directory.".into());
+        if probe.host_access.preferences_present && !probe.host_access.preferences_parse_ok {
+            warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. CSA could not verify the persistent host-access grant scope, so it will not recommend or apply an authorization change. Repair/restart is temporarily blocked; refresh after the current I/O returns.".into());
+        } else if probe.host_access.broad_drvfs_write_grant_count > 0 {
+            warnings.push("Claude Science is currently in uninterruptible WSL mount I/O, and CSA detected a broad persistent writable Windows grant. Repair/restart is temporarily blocked so CSA does not leave Bridge and daemon in a partial state. Refresh after I/O returns, then convert that grant to read-only or move the hot repository to WSL ext4.".into());
+        } else {
+            warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. CSA found no broad persistent writable Windows grant, so this may be transient activity from an open Windows-backed workspace or concurrent MCP work. Repair/restart is temporarily blocked; refresh after the current I/O returns.".into());
+        }
     } else if claude_running && probe.network.claude_io_blocked {
         warnings.push("Claude Science is currently in uninterruptible I/O. Repair/restart is temporarily blocked; CSA will not signal the daemon or mutate Bridge until the process becomes safely stoppable.".into());
     }
@@ -6812,6 +6820,9 @@ mod tests {
         assert!(source.contains("const requestEpoch = statusCommitEpoch.current;"));
         assert!(source.contains("requestEpoch !== statusCommitEpoch.current"));
         assert!(source.contains("statusCommitEpoch.current += 1;"));
+        assert!(source.contains("深检时遇到瞬时 I/O；不影响本地打开，恢复后可重试"));
+        assert!(source.contains("status.network.daemonIoBlocked"));
+        assert!(!source.contains("? ` · 守护进程忙（${status.network.daemonWaitChannel"));
         assert!(action.contains("finally"));
         assert!(action.contains("updateBusy(false);"));
         assert!(!source.contains("get_claude_url"));
@@ -6976,7 +6987,9 @@ mod tests {
         assert!(bridge_only < claude_start);
         assert!(script[bridge_only..token_refresh].contains("exit 0"));
         assert!(!script.contains("record_deep_network_quality || true"));
-        assert!(script.contains("if record_deep_network_quality; then\n  CLAUDE_VALIDATED=1"));
+        assert_eq!(script.matches("record_deep_network_quality").count(), 1);
+        assert!(!script.contains("CLAUDE_VALIDATED=1"));
+        assert!(script.contains("External sandbox quality checking is independent"));
     }
 
     #[test]
@@ -7096,6 +7109,45 @@ mod tests {
         assert!(!deep_network_result_is_fresh(true, Some(now + 1), now));
         assert!(!deep_network_result_is_fresh(true, None, now));
         assert!(!deep_network_result_is_fresh(false, Some(now), now));
+    }
+
+    #[test]
+    fn recovered_transient_deep_daemon_state_is_not_current_health() {
+        assert!(transient_deep_daemon_result_recovered(
+            true,
+            "daemon_mount_io_busy",
+            true,
+            true,
+            "S",
+            false,
+        ));
+        assert!(transient_deep_daemon_result_recovered(
+            true,
+            "contract_changed",
+            true,
+            true,
+            "I",
+            false,
+        ));
+        assert!(!transient_deep_daemon_result_recovered(
+            true,
+            "daemon_mount_io_busy",
+            true,
+            true,
+            "D",
+            true,
+        ));
+        assert!(!transient_deep_daemon_result_recovered(
+            true, "http_502", false, false, "S", false,
+        ));
+        assert!(!transient_deep_daemon_result_recovered(
+            false,
+            "daemon_mount_io_busy",
+            true,
+            true,
+            "S",
+            false,
+        ));
     }
 
     #[test]

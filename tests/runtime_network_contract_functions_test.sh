@@ -279,6 +279,10 @@ grep -Fq 'daemon was kept running' "$TEST_ROOT/deep-output-busy" || {
   echo "Busy-daemon diagnostics did not preserve the running process." >&2
   exit 1
 }
+[ ! -e "$NETWORK_CACHE_FILE" ] || {
+  echo "A transient mount-I/O result was incorrectly promoted to the final cache." >&2
+  exit 1
+}
 
 printf '%s\n' egress_daemon_busy egress_daemon_busy egress_daemon_busy ready >"$CSA_TEST_DEEP_SEQUENCE_FILE"
 : >"$CSA_TEST_DEEP_COUNTER_FILE"
@@ -290,14 +294,10 @@ fi
   echo "An isolated final success produced a misleading ready verdict." >&2
   exit 1
 }
-python3 - "$NETWORK_CACHE_FILE" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    report = json.load(stream)
-assert report["sandbox_egress_state"] != "ok"
-PY
+[ ! -e "$NETWORK_CACHE_FILE" ] || {
+  echo "An isolated success after transient daemon-busy attempts left a reusable cache." >&2
+  exit 1
+}
 
 # Lifecycle scripts may recommend manual recovery, but must never execute a
 # global WSL shutdown or distro termination as an automatic repair step.

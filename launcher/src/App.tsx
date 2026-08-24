@@ -1306,8 +1306,10 @@ function App() {
   const deepEgressLabel = status.network.deepChecked
     ? status.network.sandboxEgressState === "ok"
       ? ` · SOCKS 握手与实链路通过${status.network.sandboxEgressHttpStatus ? ` HTTP ${status.network.sandboxEgressHttpStatus}` : ""}`
-      : status.network.daemonIoBlocked || ["daemon_mount_io_busy", "daemon_busy"].includes(status.network.sandboxEgressState)
-        ? ` · 守护进程忙（${status.network.daemonWaitChannel || "I/O 等待"}）`
+      : status.network.daemonIoBlocked
+        ? ` · 当前守护进程忙（${status.network.daemonWaitChannel || "I/O 等待"}）`
+        : ["daemon_mount_io_busy", "daemon_busy"].includes(status.network.sandboxEgressState)
+          ? " · 深检时遇到瞬时 I/O；不影响本地打开，恢复后可重试"
         : ` · ${status.network.sandboxEgressFailureStage} 阶段失败（${status.network.sandboxEgressState}）`
     : " · 可深度检测";
   const networkDetail = status.claudeRunning
