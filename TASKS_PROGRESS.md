@@ -118,3 +118,15 @@
 待人工清单：`verify-proxy.ps1` 增加 aggregate-only 识别；目标电脑复验视觉订阅图片请求和旧版并排升级；确认六份本地 `CSA_T8*20260809.md` 草案应保留、合并还是删除。这些事项未混入本次 tag 和 Release。
 
 下一步：人工按 `docs/reports/CSA_v015_release_report_20260810.md` 第一段执行两项 10 分钟内复验。
+
+---
+
+# CSA v0.1.6 结构减负（MASTER 单文件任务）
+
+## S0 完成
+
+做了什么：以 `03dc6c2` 为基线完成只读测绘；核对 20 个 Tauri command、首屏/打开/30 秒刷新三张调用图、二元 ALLOW 判据和全部现有探针链路，未改产品代码。
+
+证据在哪：`docs/reports/CSA_v016_S0_survey_20260824.md`；其中记录 `lib.rs=7521` 行、`main.rs=6` 行、`App.tsx=2001` 行，以及 Bridge `outbound_proxy_url` 在现有启动器/体检链路中 0 命中的结构缺口。
+
+下一步：进入 S0.5，在 `main.rs` 增加进程内 `--smoke`，并以 debug 构建验证 allow/paint/open/bridge/egress/grade，不启动第二个 GUI 或 Bridge。
