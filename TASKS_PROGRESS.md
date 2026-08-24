@@ -130,3 +130,21 @@
 证据在哪：`docs/reports/CSA_v016_S0_survey_20260824.md`；其中记录 `lib.rs=7521` 行、`main.rs=6` 行、`App.tsx=2001` 行，以及 Bridge `outbound_proxy_url` 在现有启动器/体检链路中 0 命中的结构缺口。
 
 下一步：进入 S0.5，在 `main.rs` 增加进程内 `--smoke`，并以 debug 构建验证 allow/paint/open/bridge/egress/grade，不启动第二个 GUI 或 Bridge。
+
+## S0.5 完成
+
+做了什么：新增 debug `--smoke [--only ...]` 进程内分流；ALLOW 用 550ms 发行版枚举 + 单次 2.2 秒 WSL 快探针，端口占用与 PID 可见性分离，Windows Bridge 使用 `Absent/Present/PortConflict/Unknown` 四态；open dry-run 与 GUI 共用 7 秒内部硬期限和客体进程组回收；Bridge `/health`+`/v1/models` 同时对拍当前包四文件 bundle、9876 listener PID、受管 current 指针和 required path-secret。薄壳 `scripts/csa-smoke.ps1` 先增量 debug build，杜绝陈旧 EXE 假绿。smoke 不进入 Tauri GUI、不启动/停止服务、不弹浏览器，ALLOW/paint 共用一次快照。
+
+证据在哪：`launcher/src-tauri/src/smoke.rs`、`launcher/src-tauri/src/main.rs`、`launcher/src-tauri/src/runtime_lifecycle.rs`、`scripts/csa-smoke.ps1`；Rust 81 passed、0 failed、4 ignored；现场运行后仍为 Claude PID 443、Bridge PID 18733、2222 保持监听，未留下第二个启动器进程。完整 smoke 输出如下。
+
+下一步：进入 S1，将已验证的 ALLOW 快路径正式暴露为 `get_allow_status`，拆出 `AllowStatus / GradeStatus / WorkReport`，并以 `allow_inputs_frozen` 同时冻结 canOpen 输入与主按钮文案输入。
+
+```text
+PASS allow 475ms inputs=claudeRunning,windowsBridgePid distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS paint 475ms budget=3000ms
+PASS open 789ms login.url_ready loopback=true port=8765 nonce=present
+PASS bridge 502ms health=200 models=200 identity=current modelCount=5
+FAIL egress 0ms work.bridge_egress.not_implemented
+PASS grade 5524ms state=running warnings=0 gating=false
+SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=7291 exit=0
+```

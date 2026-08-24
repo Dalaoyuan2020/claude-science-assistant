@@ -134,7 +134,7 @@ struct OperationOwner<'a> {
 }
 
 pub(crate) struct ServiceOperationLock {
-    _file: File,
+    _file: Option<File>,
     #[allow(dead_code)]
     path: PathBuf,
     #[cfg(windows)]
@@ -172,7 +172,7 @@ impl ServiceOperationLock {
             .map_err(|error| format!("Unable to serialize service lock owner: {error}"))?;
 
         #[cfg(windows)]
-        let mutex_handle = acquire_windows_mutex(path, timeout)?;
+        let mutex_handle = acquire_windows_mutex(path, timeout, true)?;
 
         #[cfg(not(windows))]
         let fallback_guard = acquire_fallback_mutex(timeout)?;
@@ -192,7 +192,24 @@ impl ServiceOperationLock {
         }
 
         Ok(Self {
-            _file: file,
+            _file: Some(file),
+            path: path.to_path_buf(),
+            #[cfg(windows)]
+            mutex_handle,
+            #[cfg(not(windows))]
+            fallback_guard,
+        })
+    }
+
+    pub(crate) fn acquire_quick(path: &Path, timeout: Duration) -> Result<Self, String> {
+        #[cfg(windows)]
+        let mutex_handle = acquire_windows_mutex(path, timeout, false)?;
+
+        #[cfg(not(windows))]
+        let fallback_guard = acquire_fallback_mutex(timeout)?;
+
+        Ok(Self {
+            _file: None,
             path: path.to_path_buf(),
             #[cfg(windows)]
             mutex_handle,
@@ -222,7 +239,11 @@ fn lock_name_hash(path: &Path) -> u64 {
 }
 
 #[cfg(windows)]
-fn acquire_windows_mutex(path: &Path, timeout: Duration) -> Result<*mut c_void, String> {
+fn acquire_windows_mutex(
+    path: &Path,
+    timeout: Duration,
+    include_owner: bool,
+) -> Result<*mut c_void, String> {
     let name = format!("Local\\CSA.ServiceLifecycle.{:016x}", lock_name_hash(path));
     let wide: Vec<u16> = std::ffi::OsStr::new(&name)
         .encode_wide()
@@ -241,7 +262,11 @@ fn acquire_windows_mutex(path: &Path, timeout: Duration) -> Result<*mut c_void, 
         CloseHandle(handle);
     }
     if result == WAIT_TIMEOUT {
-        let owner = fs::read_to_string(path).unwrap_or_default();
+        let owner = if include_owner {
+            fs::read_to_string(path).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let owner = owner.trim();
         let suffix = if owner.is_empty() {
             String::new()
@@ -407,6 +432,15 @@ mod tests {
         .unwrap()
         .expect("a concurrent owner must not acquire the lock");
         assert!(second_error.contains("Another CSA service operation"));
+        let quick_path = path.clone();
+        let quick_error = std::thread::spawn(move || {
+            ServiceOperationLock::acquire_quick(&quick_path, Duration::from_millis(100)).err()
+        })
+        .join()
+        .unwrap()
+        .expect("a quick read-only lease must share the lifecycle mutex");
+        assert!(quick_error.contains("Another CSA service operation"));
+        assert!(!quick_error.contains("Current owner:"));
         drop(first);
         ServiceOperationLock::acquire(&path, "third", Duration::from_secs(1))
             .expect("lock should be released when the owner exits");

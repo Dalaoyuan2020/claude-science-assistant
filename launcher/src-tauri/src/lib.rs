@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri_plugin_opener::OpenerExt;
 
 mod runtime_lifecycle;
+mod smoke;
+
+pub use smoke::smoke_exit_code_if_requested;
 
 use runtime_lifecycle::{
     parse_runtime_identity, runtime_identity_from_health, RuntimeIdentity, ServiceOperationLock,
@@ -35,11 +38,11 @@ const SUBSCRIPTION_ROLES: [&str; 3] = ["default", "vision", "fast"];
 const NETWORK_DEEP_CACHE_MAX_AGE_SECONDS: u64 = 15 * 60;
 const SANDBOX_NETWORK_PROBE_IDENTITY: &str = "analysis-socks5h-pypi-head-v2";
 const SANDBOX_NETWORK_CANARY_IDENTITY: &str = "https://pypi.org/simple/pip/";
-const CLAUDE_URL_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-// The WSL transaction can legitimately spend 25 seconds waiting for the
-// lifecycle lock, followed by two bounded retry backoffs and three vendor
-// control requests. Keep the Windows watchdog outside that valid budget.
-const CLAUDE_URL_COMMAND_TIMEOUT: Duration = Duration::from_secs(75);
+const CLAUDE_OPEN_HARD_BUDGET: Duration = Duration::from_secs(7);
+const CLAUDE_OPEN_LOCK_BUDGET: Duration = Duration::from_millis(300);
+const CLAUDE_OPEN_DISTRO_BUDGET: Duration = Duration::from_millis(1_200);
+const CLAUDE_OPEN_CLEANUP_RESERVE: Duration = Duration::from_millis(300);
+const CLAUDE_OPEN_GUEST_RESERVE: Duration = Duration::from_millis(300);
 
 fn deep_network_result_is_fresh(
     deep_checked: bool,
@@ -97,6 +100,23 @@ fn service_operation_lock_with_timeout(
 
 fn service_operation_lock(operation: &str) -> Result<ServiceOperationLock, String> {
     service_operation_lock_with_timeout(operation, Duration::from_secs(3))
+}
+
+fn service_operation_quick_lock(
+    operation: &str,
+    timeout: Duration,
+) -> Result<ServiceOperationLock, String> {
+    let path = settings_path()?
+        .parent()
+        .ok_or_else(|| "无法定位 CSA 状态目录".to_string())?
+        .join("service-lifecycle.lock");
+    ServiceOperationLock::acquire_quick(&path, timeout).map_err(|error| {
+        if error.contains("Another CSA service operation") {
+            format!("runtime.lock_held:{operation}")
+        } else {
+            format!("runtime.lock_unavailable:{operation}")
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -976,9 +996,13 @@ fn output_text(output: &Output) -> String {
 }
 
 fn discover_distros() -> Result<Vec<String>, String> {
+    discover_distros_with_timeout(Duration::from_secs(5))
+}
+
+fn discover_distros_with_timeout(timeout: Duration) -> Result<Vec<String>, String> {
     let mut command = background_command("wsl.exe");
     command.args(["--list", "--quiet"]);
-    let output = command_output_with_timeout(command, Duration::from_secs(5), "WSL 发行版检查")?;
+    let output = command_output_with_timeout(command, timeout, "WSL 发行版检查")?;
     if !output.status.success() {
         return Err("WSL 尚未安装或当前不可用".to_string());
     }
@@ -1019,27 +1043,30 @@ fn run_wsl_with_timeout(distro: &str, args: &[&str], timeout: Duration) -> Resul
     command_output_with_timeout(command, timeout, &format!("WSL {distro}"))
 }
 
-fn run_wsl_as_user_script_with_timeout(
+fn run_wsl_default_user_script_with_guest_timeout(
     distro: &str,
-    user: &str,
     script: &str,
-    timeout: Duration,
+    host_timeout: Duration,
     label: &str,
 ) -> Result<Output, String> {
-    // wsl.exe reconstructs its remaining arguments as a Linux command line.
-    // Passing a script containing $() via `bash -lc <script>` lets that outer
-    // layer expand command substitutions before Bash has defined its helper
-    // functions. Feed the script over stdin so only the intended Bash parses it.
+    let guest_timeout = host_timeout
+        .checked_sub(CLAUDE_OPEN_GUEST_RESERVE)
+        .filter(|value| *value >= Duration::from_millis(200))
+        .ok_or_else(|| "login.open_timeout".to_string())?;
+    let guest_seconds = format!(
+        "{}.{:03}s",
+        guest_timeout.as_secs(),
+        guest_timeout.subsec_millis()
+    );
     let mut command = background_command("wsl.exe");
     command
         .arg("--distribution")
         .arg(distro)
-        .arg("--user")
-        .arg(user)
         .arg("--")
-        .arg("bash")
-        .arg("-s");
-    command_output_with_stdin_timeout(command, script.as_bytes(), timeout, label)
+        .args(["timeout", "--signal=TERM", "--kill-after=0.2s"])
+        .arg(guest_seconds)
+        .args(["bash", "-s"]);
+    command_output_with_stdin_timeout(command, script.as_bytes(), host_timeout, label)
 }
 
 fn parse_first_pid(text: &str) -> Option<u32> {
@@ -5088,22 +5115,6 @@ fn selected_distro_quick() -> Result<String, String> {
     preferred_distro(&distros).ok_or_else(|| "WSL 不可用".to_string())
 }
 
-fn selected_linux_user_quick(distro: &str) -> Result<String, String> {
-    let output = run_wsl_with_timeout(distro, &["id", "-un"], Duration::from_secs(5))?;
-    if !output.status.success() {
-        return Err(format!(
-            "无法确定 Claude Science 所属的 WSL 用户：{}",
-            command_error_text(&output)
-        ));
-    }
-    let user = output_text(&output);
-    let user = user.lines().next().unwrap_or_default().trim();
-    if user.is_empty() || user.chars().any(char::is_whitespace) {
-        return Err("无法确定 Claude Science 所属的 WSL 用户。".into());
-    }
-    Ok(user.to_string())
-}
-
 const CLAUDE_URL_SHELL: &str = r#"
 set -u
 state_root="${CSA_STATE_ROOT:-$HOME/.local/share/csa}"
@@ -5113,12 +5124,16 @@ if ! command -v flock >/dev/null 2>&1; then
   echo "CSA_URL_FLOCK_MISSING" >&2
   exit 70
 fi
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "CSA_URL_TIMEOUT_MISSING" >&2
+  exit 70
+fi
 if [ -f "$lifecycle_lock" ]; then
   if ! exec 9<>"$lifecycle_lock"; then
     echo "CSA_URL_LIFECYCLE_LOCK_UNREADABLE" >&2
     exit 74
   fi
-  if ! flock -w 25 9; then
+  if ! flock -w 0.25 9; then
     echo "CSA_URL_LIFECYCLE_BUSY" >&2
     exit 75
   fi
@@ -5264,7 +5279,7 @@ while [ "$attempt" -le 3 ]; do
   # Resolve through the already verified live process instead of reopening a
   # mutable filesystem path. Keep the nonce in-process until the same daemon
   # identity is revalidated after the control call.
-  url_output="$("/proc/$daemon_pid/exe" url)"
+  url_output="$(timeout --signal=TERM --kill-after=0.1s 0.9s "/proc/$daemon_pid/exe" url)"
   last_rc=$?
   if [ "$last_rc" -eq 0 ]; then
     verify_daemon_identity
@@ -5290,7 +5305,7 @@ while [ "$attempt" -le 3 ]; do
   esac
   if [ "$attempt" -lt 3 ]; then
     echo "CSA_URL_TRANSIENT_RETRY=$last_rc" >&2
-    sleep "$attempt"
+    if [ "$attempt" -eq 1 ]; then sleep 0.15; else sleep 0.30; fi
   fi
   attempt=$((attempt + 1))
 done
@@ -5433,40 +5448,45 @@ fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Resu
     }
 }
 
+fn open_deadline_remaining(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err("login.open_timeout".into())
+    } else {
+        Ok(remaining)
+    }
+}
+
 fn get_claude_url_impl() -> Result<String, String> {
-    let _service_operation = service_operation_lock_with_timeout(
-        "open-claude-science",
-        CLAUDE_URL_SERVICE_LOCK_TIMEOUT,
-    )
-    .map_err(|error| {
-        if error.contains("Another CSA service operation") {
-            "另一个 CSA 启动器仍在执行启动或重启；等待 30 秒后仍未完成，请稍后再点“打开 Claude Science”。"
-                .to_string()
-        } else {
-            format!(
-                "无法建立 Claude Science 打开操作的跨进程锁：{}",
-                clean_diagnostic_text(&error)
-            )
-        }
-    })?;
+    let deadline = Instant::now()
+        .checked_add(CLAUDE_OPEN_HARD_BUDGET)
+        .ok_or_else(|| "login.open_timeout".to_string())?;
+    let lock_timeout = open_deadline_remaining(deadline)?.min(CLAUDE_OPEN_LOCK_BUDGET);
+    let _service_operation = service_operation_quick_lock("open-claude-science", lock_timeout)?;
     // Do not put the full storage/network/status inspection on the login
     // critical path. The WSL script below verifies the lifecycle lock,
     // managed executable and daemon scheduler state in one bounded operation.
+    let distro_timeout = open_deadline_remaining(deadline)?.min(CLAUDE_OPEN_DISTRO_BUDGET);
+    let distros = discover_distros_with_timeout(distro_timeout)
+        .map_err(|_| "transport.wsl_distro_probe".to_string())?;
     let distro =
-        selected_distro_quick().map_err(|_| "WSL 不可用，无法打开 Claude Science。".to_string())?;
-    let user = selected_linux_user_quick(&distro)?;
-    let output = run_wsl_as_user_script_with_timeout(
+        preferred_distro(&distros).ok_or_else(|| "runtime.wsl_distro_missing".to_string())?;
+    let host_timeout = open_deadline_remaining(deadline)?
+        .checked_sub(CLAUDE_OPEN_CLEANUP_RESERVE)
+        .filter(|value| *value >= Duration::from_millis(500))
+        .ok_or_else(|| "login.open_timeout".to_string())?;
+    let output = run_wsl_default_user_script_with_guest_timeout(
         &distro,
-        &user,
         CLAUDE_URL_SHELL,
-        CLAUDE_URL_COMMAND_TIMEOUT,
+        host_timeout,
         "Claude Science 登录地址生成",
     )
     .map_err(|error| {
-        format!(
-            "等待 Claude Science 登录控制通道失败：{}",
-            clean_diagnostic_text(&error)
-        )
+        if error.contains("login.open_timeout") || error.contains("没有响应") {
+            "login.open_timeout".to_string()
+        } else {
+            "transport.claude_url_failed".to_string()
+        }
     })?;
     claude_url_result(
         output.status.code(),
@@ -5767,11 +5787,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_login_url_waits_for_lifecycle_and_retries_only_transient_codes() {
-        assert!(CLAUDE_URL_COMMAND_TIMEOUT >= Duration::from_secs(75));
-        assert!(CLAUDE_URL_SHELL.contains("flock -w 25 9"));
+    fn claude_login_url_has_one_hard_deadline_and_retries_only_transient_codes() {
+        assert!(CLAUDE_OPEN_HARD_BUDGET < Duration::from_secs(8));
+        assert!(CLAUDE_OPEN_LOCK_BUDGET <= Duration::from_millis(300));
+        assert!(CLAUDE_URL_SHELL.contains("flock -w 0.25 9"));
+        assert!(!CLAUDE_URL_SHELL.contains("flock -w 25 9"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_LEGACY_NO_LIFECYCLE_LOCK"));
         assert!(CLAUDE_URL_SHELL.contains("while [ \"$attempt\" -le 3 ]"));
+        assert!(CLAUDE_URL_SHELL.contains("timeout --signal=TERM --kill-after=0.1s 0.9s"));
         assert!(CLAUDE_URL_SHELL.contains("1|2|4) ;;"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_TRANSITION"));
         assert!(CLAUDE_URL_SHELL.contains("CSA_URL_DAEMON_IO_BLOCKED"));
@@ -5792,7 +5815,7 @@ mod tests {
     fn claude_login_script_is_streamed_to_bash_without_outer_wsl_expansion() {
         let source = include_str!("lib.rs");
         let helper_start = source
-            .find("fn run_wsl_as_user_script_with_timeout(")
+            .find("fn run_wsl_default_user_script_with_guest_timeout(")
             .expect("WSL stdin script helper should exist");
         let helper_end = source[helper_start..]
             .find("fn parse_first_pid(")
@@ -5800,18 +5823,21 @@ mod tests {
             .expect("PID parser should follow the WSL script helper");
         let helper = &source[helper_start..helper_end];
 
-        assert!(helper.contains(".arg(\"bash\")"));
-        assert!(helper.contains(".arg(\"-s\")"));
+        assert!(helper.contains(".args([\"bash\", \"-s\"])"));
         assert!(helper.contains("command_output_with_stdin_timeout"));
         assert!(helper.contains("script.as_bytes()"));
+        assert!(helper.contains("--kill-after=0.2s"));
+        assert!(helper.contains("CLAUDE_OPEN_GUEST_RESERVE"));
         assert!(!helper.contains("\"-lc\""));
     }
 
     #[test]
     #[ignore = "requires the current user's live managed WSL daemon and mints one unused login URL"]
     fn live_claude_url_stdin_transport_diagnostic() {
+        let started = Instant::now();
         let url = get_claude_url_impl()
             .unwrap_or_else(|error| panic!("live stdin URL transport failed: {error}"));
+        assert!(started.elapsed() < Duration::from_secs(8));
         assert!(url.starts_with("http://"));
         assert!(url.contains(":8765/?nonce="));
     }
@@ -6810,9 +6836,9 @@ mod tests {
         assert!(source.contains("const mutationBusy = busy || networkChecking;"));
         assert!(source.contains("function tryBeginMutation()"));
         assert!(source.contains("if (busyRef.current || networkCheckingRef.current) return false;"));
-        assert!(backend.contains("selected_distro_quick()"));
-        assert!(backend.contains("selected_linux_user_quick(&distro)"));
-        assert!(backend.contains("run_wsl_as_user_script_with_timeout"));
+        assert!(backend.contains("discover_distros_with_timeout(distro_timeout)"));
+        assert!(!backend.contains("selected_linux_user_quick"));
+        assert!(backend.contains("run_wsl_default_user_script_with_guest_timeout"));
         assert!(backend.contains("CLAUDE_URL_SHELL"));
         assert!(!backend.contains("\"-lc\""));
         assert!(!backend.contains("current_status()"));
