@@ -36,12 +36,13 @@ CSA 把这些步骤收口成一个桌面应用：
 
 1. **端口不再等于可用**：分别核对 Bridge `9876`、Claude Science `8765/8766` 的监听者、受管可执行文件和进程身份，旧包或其他目录留下的 Bridge 会被明确识别，不再仅凭端口绿灯放行。
 2. **沙盒出口分层质检**：从 Unix socket、SOCKS5 握手到固定 PyPI HTTPS HEAD 逐级检测；探针匿名、非计费，不会发送模型请求，并要求相邻两次成功才发布绿色缓存。
-3. **识别 WSL 挂载 I/O 卡住**：把 Linux `D` 状态和 `p9_client_rpc` 等等待通道单独报告，避免将 `/mnt/c`、`/mnt/e` 的 DrvFS/9P 阻塞误判为 OpenAlex、arXiv 或模型 API 断网。
+3. **识别并预防 WSL 挂载 I/O 卡住**：把 Linux `D` 状态和 `p9_client_rpc` 等等待通道单独报告，且只读检查持久 Windows RW 授权；启动期 Git 扫描改为按需，避免将 `/mnt/c`、`/mnt/e` 的 DrvFS/9P 阻塞误判为 OpenAlex、arXiv 或模型 API 断网。
 4. **内容寻址的 Bridge 身份**：完整包会把 Bridge 激活为 `bridge-0.1.6-<bundle-hash>` 受管运行时；版本、源码哈希、进程和 `/health` 身份必须一致，不能只复制新版 EXE 覆盖旧脚本。
 5. **启动就绪零业务 HTTP**：Claude Science 只用 `8765/8766` 同 PID、EXE、argv 和线程可安全检查性判定本地就绪，不请求 Web UI 根路径或 daemon `/health`；事件循环与外网出口交给独立 deep SOCKS5H canary。
-6. **MCP 真正按需加载**：禁用启动阶段对 24 个内置 MCP 的预热，catalog snapshot 不再暗中拉起 server；只有实际使用某个 connector/MCP 时才显式加载对应进程。
-7. **更安全的启动与修复边界**：修复只处理 CSA 精确拥有的进程和新建子进程环境，不改系统代理、VPN、DNS、hosts、证书，也不会把全局 `wsl --shutdown` 当成普通自修动作。
-8. **保留 v0.1.5 聚合能力**：API 接入、三层角色映射、方案一/方案二和事务化切换保持兼容；产品版本升级为 0.1.6，内置 Claude Science 仍锁定已验证的 0.1.25。
+6. **MCP 真正按需加载**：禁用启动阶段对 24 个内置 MCP、custom-MCP 元数据和 skeleton Conda 环境的预热，catalog snapshot 不再暗中拉起 server；只有实际使用 connector/MCP 时才加载对应进程和环境。
+7. **Git 安全扫描按需执行**：保留根路径钉住、授权恢复和 `_ensureGitScan()` 的完整安全门，只跳过 daemon 启动链上的宽泛授权预扫描；首次真实沙盒命令仍先扫描再执行。
+8. **更安全的启动与修复边界**：修复只处理 CSA 精确拥有的进程和新建子进程环境，不改系统代理、VPN、DNS、hosts、证书，也不会把全局 `wsl --shutdown` 当成普通自修动作。
+9. **保留 v0.1.5 聚合能力**：API 接入、三层角色映射、方案一/方案二和事务化切换保持兼容；产品版本升级为 0.1.6，内置 Claude Science 仍锁定已验证的 0.1.25。
 
 网络质检的状态机、缓存身份和安全边界见 [架构与产品计划 §10–11](docs/architecture-and-product-plan.zh-CN.md)，安装、升级及已知限制见 [v0.1.6 Release 说明](docs/github-release-v0.1.6.md)。
 

@@ -185,7 +185,7 @@ record_deep_network_quality() {
   DEEP_NETWORK_VERDICT="$verdict"
   case "$verdict" in
     egress_daemon_mount_io_busy)
-      echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop is blocked on WSL-mounted filesystem I/O. The daemon was kept running; wait for MCP warmup or move high-I/O workspaces to WSL ext4, then refresh status. No model request was made." >&2
+      echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop is blocked on WSL-mounted filesystem I/O. A broad persistent Windows RW grant can make the upstream Git safety scan recurse through DrvFS. The daemon was kept running; wait for I/O to return, then narrow the grant to a specific project/output directory or move hot repositories to WSL ext4. No model request was made." >&2
       ;;
     egress_daemon_busy)
       echo "Warning: Claude Science ports and sandbox forwarders exist, but its event loop remained busy during protocol handshakes. The daemon was kept running for a later retry; no model request was made." >&2
@@ -489,9 +489,10 @@ launch_claude_daemon() {
   [ -x "$executable" ] || return 1
   [ -d "$runtime_working_dir" ] || return 1
   # The portable package normally lives on /mnt/c or /mnt/e (DrvFS/9P).
-  # Claude Science inherits its launch cwd and performs substantial workspace
-  # discovery during MCP warmup.  Starting from the managed ext4 runtime keeps
-  # that control-plane I/O off the Windows mount without moving user projects.
+  # Claude Science inherits its launch cwd and performs control-plane workspace
+  # discovery during startup. Starting from the managed ext4 runtime keeps that
+  # I/O off the Windows mount without moving user projects. The managed binary
+  # also defers the separate persisted-grant Git scan until a sandbox is used.
   (
     cd -P "$runtime_working_dir"
     ANTHROPIC_BASE_URL="$base_url" "$executable" serve \
@@ -990,7 +991,7 @@ CLAUDE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
 CLAUDE_CANDIDATE_RUNTIME="$CSA_CLAUDE_RUNTIME_DIR"
 SOURCE_BIN="$CSA_CLAUDE_RUNTIME_DIR/claude-science"
 SOURCE_SHA="$CSA_CLAUDE_SOURCE_SHA256"
-PATCH_PROFILE="byok-demand-mcp-catalog-v2"
+PATCH_PROFILE="byok-demand-mcp-lazy-git-scan-v6"
 if [ -n "$PATCH_DIR_OVERRIDE" ]; then
   PATCH_DIR="$PATCH_DIR_OVERRIDE"
 else
@@ -1073,6 +1074,24 @@ catalog_guard_core = (
 )
 catalog_guard_new = catalog_guard_core + b" " * (len(catalog_guard_old) - len(catalog_guard_core))
 
+git_boot_warmup_old = (
+    b"p_.pinBaseRootsAfterGrantProjection(),p_.warmGitScan(),"
+    b"p_.setStoreDeniedDomains(TP())"
+)
+git_boot_warmup_new = (
+    b"p_.pinBaseRootsAfterGrantProjection(),void           0,"
+    b"p_.setStoreDeniedDomains(TP())"
+)
+custom_mcp_warmup_old = b"let p_=Date.now();return T2"
+custom_mcp_warmup_new = b"let p_=Date.now();return;T2"
+skeleton_env_warmup_old = (
+    b"NYz(G.log,JK_({db:Y.db}),{mcpEnvFirst:!0})"
+)
+skeleton_env_warmup_core = b"Promise.resolve()"
+skeleton_env_warmup_new = skeleton_env_warmup_core + b" " * (
+    len(skeleton_env_warmup_old) - len(skeleton_env_warmup_core)
+)
+
 pairs = [
     (
         [b"https://api.anthropic.com"],
@@ -1117,6 +1136,35 @@ pairs = [
         [catalog_guard_old],
         catalog_guard_new,
     ),
+    # buildApp also starts an independent custom-MCP metadata/environment warmup
+    # after reseeding the local profile.  Its conda existence probe uses an
+    # internal sandbox wrapper and therefore enters _ensureGitScan during boot.
+    # Keep profile reseeding and the on-demand custom-MCP path, but return before
+    # this one boot-only T2 warmup call.
+    (
+        [custom_mcp_warmup_old],
+        custom_mcp_warmup_new,
+    ),
+    # Fastify onReady independently provisions a skeleton MCP environment with
+    # mcpEnvFirst=true.  That boot-only conda command is sandbox-wrapped and
+    # enters _ensureGitScan even after every catalog warmup is disabled.  Leave
+    # NYz/T2 intact for explicit environment work; replace only this unique
+    # onReady expression with an already-resolved promise.
+    (
+        [skeleton_env_warmup_old],
+        skeleton_env_warmup_new,
+    ),
+    # The sandbox manager eagerly scans every persisted writable host grant at
+    # daemon boot.  A broad DrvFS grant such as rw:/mnt/e/Downloads recursively
+    # enters every descendant (depth 4) and can hold Bun in p9_client_rpc before
+    # the UI is usable.  Skip only the unique boot call; keep the warmGitScan
+    # method intact for later grant changes.  Every real sandbox wrapper still
+    # enters _ensureGitScan, which performs the unchanged safety scan before
+    # execution even while background rescans are initially disabled.
+    (
+        [git_boot_warmup_old],
+        git_boot_warmup_new,
+    ),
 ]
 
 for olds, new in pairs:
@@ -1134,15 +1182,50 @@ if data.count(warmup_old) + data.count(warmup_new) != 1:
     raise SystemExit("Unsupported Claude Science daemon build; eager MCP warmup call identity is not unique")
 if data.count(catalog_guard_old) + data.count(catalog_guard_new) != 1:
     raise SystemExit("Unsupported Claude Science daemon build; lazy MCP catalog guard identity is not unique")
+if len(custom_mcp_warmup_old) != 27 or len(custom_mcp_warmup_new) != 27:
+    raise SystemExit("Unsupported launcher patch; custom MCP warmup replacement must remain 27 bytes")
+if data.count(custom_mcp_warmup_old) + data.count(custom_mcp_warmup_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; custom MCP boot warmup identity is not unique")
+if len(skeleton_env_warmup_old) != 42 or len(skeleton_env_warmup_new) != 42:
+    raise SystemExit("Unsupported launcher patch; skeleton MCP warmup replacement must remain 42 bytes")
+if data.count(skeleton_env_warmup_old) + data.count(skeleton_env_warmup_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; skeleton MCP boot warmup identity is not unique")
+if len(git_boot_warmup_old) != 85 or len(git_boot_warmup_new) != 85:
+    raise SystemExit("Unsupported launcher patch; lazy Git boot replacement must remain 85 bytes")
+if data.count(git_boot_warmup_old) + data.count(git_boot_warmup_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; eager Git warmup identity is not unique")
 catalog_markers = {
     b"async snapshotFor(z,O){return this._assemble(z,O,{waitBudgetMs:0})}": 1,
     b"G.serverName===M": 1,
     b"this._loadBundledServer(M,j).catch": 1,
+    b'x_.ops.agents.reseedOperonProfile("local-dev").then': 1,
+    b"[buildApp] custom-MCP warmup complete": 1,
+    b"async ensureMcpEnv(z)": 1,
+    b"mcpEnvFirst": 2,
+    b"if(G?.mcpEnvFirst)try{await w.ensureMcpEnv({})": 1,
+    b"async wrapCondaCommand(z,O)": 1,
+    b"let G=await this._ensureGitScan(),W=rL.conda": 1,
+    b'if(W==="rw"&&!G?.reassert)O.warmGitScan?.().catch(()=>{})': 1,
 }
 for marker, expected_count in catalog_markers.items():
     if data.count(marker) != expected_count:
         raise SystemExit(
             "Unsupported Claude Science daemon build; lazy MCP catalog structure changed: "
+            + marker.decode(errors="replace")
+        )
+git_scan_markers = {
+    b"async _ensureGitScan()": 1,
+    b"await this._ensureGitScan()": 4,
+    b"if(this._gitRescanInFlight===null&&!this._gitRescanDisabled)this._kickGitRescan();": 1,
+    b"async warmGitScan()": 1,
+    b"GIT_SCAN_REFRESH_MS=1e4": 1,
+    b"GIT_SCAN_IDLE_QUIESCE=6": 1,
+    b"warmGitScan:()=>p_.warmGitScan()": 1,
+}
+for marker, expected_count in git_scan_markers.items():
+    if data.count(marker) != expected_count:
+        raise SystemExit(
+            "Unsupported Claude Science daemon build; lazy Git safety structure changed: "
             + marker.decode(errors="replace")
         )
 missing = [
@@ -1185,6 +1268,12 @@ if after.count(warmup_old) != 0 or after.count(warmup_new) != 1:
     raise SystemExit("patch verification failed; eager MCP warmup call was not replaced exactly once")
 if after.count(catalog_guard_old) != 0 or after.count(catalog_guard_new) != 1:
     raise SystemExit("patch verification failed; lazy MCP catalog guard was not replaced exactly once")
+if after.count(custom_mcp_warmup_old) != 0 or after.count(custom_mcp_warmup_new) != 1:
+    raise SystemExit("patch verification failed; custom MCP boot warmup was not replaced exactly once")
+if after.count(skeleton_env_warmup_old) != 0 or after.count(skeleton_env_warmup_new) != 1:
+    raise SystemExit("patch verification failed; skeleton MCP boot warmup was not replaced exactly once")
+if after.count(git_boot_warmup_old) != 0 or after.count(git_boot_warmup_new) != 1:
+    raise SystemExit("patch verification failed; eager Git warmup was not replaced exactly once")
 
 print(f"Patched managed runtime byte occurrence(s): {patched}")
 PY

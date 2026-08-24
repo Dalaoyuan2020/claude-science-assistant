@@ -145,6 +145,60 @@ if [ -n "$claude_pid" ]; then
     network_json="$(network_fallback_json "$claude_pid" unknown unavailable)"
   fi
 fi
+preferences_file="$HOME/.claude-science/preferences.json"
+host_access_json='{"preferences_present":false,"preferences_parse_ok":true,"write_grant_count":0,"drvfs_write_grant_count":0,"drvfs_write_grants":[],"broad_drvfs_write_grant_count":0,"broad_drvfs_write_grants":[],"git_scan_boot_mode":"lazy"}'
+if [ -f "$preferences_file" ]; then
+  host_access_json='{"preferences_present":true,"preferences_parse_ok":false,"write_grant_count":0,"drvfs_write_grant_count":0,"drvfs_write_grants":[],"broad_drvfs_write_grant_count":0,"broad_drvfs_write_grants":[],"git_scan_boot_mode":"lazy"}'
+  if [ -n "$network_python" ]; then
+    parsed_host_access="$($network_python -c '
+import json
+import re
+import sys
+
+result = {
+    "preferences_present": True,
+    "preferences_parse_ok": False,
+    "write_grant_count": 0,
+    "drvfs_write_grant_count": 0,
+    "drvfs_write_grants": [],
+    "broad_drvfs_write_grant_count": 0,
+    "broad_drvfs_write_grants": [],
+    "git_scan_boot_mode": "lazy",
+}
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        preferences = json.load(stream)
+    approval = preferences.get("approvalGrants", {})
+    always = approval.get("always", {}) if isinstance(approval, dict) else {}
+    allow = always.get("allow", {}) if isinstance(always, dict) else {}
+    host = allow.get("host", []) if isinstance(allow, dict) else []
+    if not isinstance(host, list):
+        raise TypeError("approvalGrants.always.allow.host must be an array")
+    write_grants = sorted({item for item in host if isinstance(item, str) and item.startswith("rw:")})
+    drvfs = [item for item in write_grants if re.match(r"^rw:/mnt/[A-Za-z](?:/|$)", item)]
+    broad_pattern = re.compile(
+        r"^rw:/mnt/[A-Za-z](?:/(?:Downloads|Documents|Desktop)|"
+        r"/Users/[^/]+/(?:Downloads|Documents|Desktop))?/?$",
+        re.IGNORECASE,
+    )
+    broad = [item for item in drvfs if broad_pattern.fullmatch(item)]
+    result.update(
+        preferences_parse_ok=True,
+        write_grant_count=len(write_grants),
+        drvfs_write_grant_count=len(drvfs),
+        drvfs_write_grants=drvfs,
+        broad_drvfs_write_grant_count=len(broad),
+        broad_drvfs_write_grants=broad,
+    )
+except (OSError, ValueError, TypeError):
+    pass
+print(json.dumps(result, separators=(",", ":")))
+' "$preferences_file" 2>/dev/null || true)"
+    if [[ "$parsed_host_access" == \{*\} ]]; then
+      host_access_json="$parsed_host_access"
+    fi
+  fi
+fi
 bridge_healthy=false
 bridge_health_responding=false
 bridge_source_matches=null
@@ -341,5 +395,6 @@ printf '"port_8765":%s,' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8
 printf '"port_8766":%s' "$(json_bool bash -c 'ss -ltn 2>/dev/null | grep -q ":8766 "')"
 printf '},'
 printf '"network":%s,' "$network_json"
+printf '"host_access":%s,' "$host_access_json"
 printf '"secrets":{"values_included":false}'
 printf '}\n'

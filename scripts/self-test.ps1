@@ -88,7 +88,7 @@ if ($LASTEXITCODE -ne 0) {
   if ($LASTEXITCODE -ne 0) { throw "Failed to install locked test requirements (exit $LASTEXITCODE)." }
 }
 
-& $Python -m py_compile proxy.py setup-token.py scripts/csa-network-quality.py
+& $Python -m py_compile proxy.py setup-token.py scripts/csa-network-quality.py scripts/csa-narrow-broad-host-grants.py
 if ($LASTEXITCODE -ne 0) { throw "Python syntax check failed (exit $LASTEXITCODE)." }
 
 $RuntimeManifestPath = Join-Path $ProjectDir "vendor\claude-science\linux-x64\manifest.json"
@@ -113,6 +113,13 @@ data = Path(sys.argv[1]).read_bytes()
 old = b"_loadBundledServer(z,O=!1){if(this._bundledTools.has(z))return Promise.resolve();if(this._bundledParked.has(z))return Promise.resolve();"
 new_core = b"_loadBundledServer(z,O=!1){if(!O||this._bundledTools.has(z)||this._bundledParked.has(z))return Promise.resolve();"
 new = new_core + (b" " * (len(old) - len(new_core)))
+git_old = b"p_.pinBaseRootsAfterGrantProjection(),p_.warmGitScan(),p_.setStoreDeniedDomains(TP())"
+git_new = b"p_.pinBaseRootsAfterGrantProjection(),void           0,p_.setStoreDeniedDomains(TP())"
+custom_mcp_old = b"let p_=Date.now();return T2"
+custom_mcp_new = b"let p_=Date.now();return;T2"
+skeleton_old = b"NYz(G.log,JK_({db:Y.db}),{mcpEnvFirst:!0})"
+skeleton_core = b"Promise.resolve()"
+skeleton_new = skeleton_core + (b" " * (len(skeleton_old) - len(skeleton_core)))
 
 if len(old) != 136 or len(new_core) >= len(old) or len(new) != len(old):
     raise SystemExit("lazy MCP patch must remain an equal-length 136-byte replacement")
@@ -120,6 +127,20 @@ if data.count(old) != 1:
     raise SystemExit(f"lazy MCP original byte pattern must be unique; found {data.count(old)}")
 if data.count(new) != 0:
     raise SystemExit(f"locked vendor binary must remain pristine; patched byte pattern count is {data.count(new)}")
+if len(git_old) != 85 or len(git_new) != 85:
+    raise SystemExit("lazy Git scan patch must remain an equal-length 85-byte replacement")
+if data.count(git_old) != 1:
+    raise SystemExit(f"eager Git warmup byte pattern must be unique; found {data.count(git_old)}")
+if data.count(git_new) != 0:
+    raise SystemExit(f"locked vendor binary must remain pristine; lazy Git pattern count is {data.count(git_new)}")
+if len(custom_mcp_old) != 27 or len(custom_mcp_new) != 27:
+    raise SystemExit("custom MCP warmup patch must remain an equal-length 27-byte replacement")
+if data.count(custom_mcp_old) != 1 or data.count(custom_mcp_new) != 0:
+    raise SystemExit("locked vendor binary custom MCP boot warmup identity changed")
+if len(skeleton_old) != 42 or len(skeleton_new) != 42:
+    raise SystemExit("skeleton MCP warmup patch must remain an equal-length 42-byte replacement")
+if data.count(skeleton_old) != 1 or data.count(skeleton_new) != 0:
+    raise SystemExit("locked vendor binary skeleton MCP boot warmup identity changed")
 
 markers = {
     b"._loadBundledServer(": 2,
@@ -127,6 +148,21 @@ markers = {
     b"snapshotFor(z,O){return this._assemble(z,O,{waitBudgetMs:0})": 1,
     b"G.serverName===M": 1,
     b".ready(w,z.db,{serverName:": 1,
+    b'x_.ops.agents.reseedOperonProfile("local-dev").then': 1,
+    b"[buildApp] custom-MCP warmup complete": 1,
+    b"async ensureMcpEnv(z)": 1,
+    b"mcpEnvFirst": 2,
+    b"if(G?.mcpEnvFirst)try{await w.ensureMcpEnv({})": 1,
+    b"async wrapCondaCommand(z,O)": 1,
+    b"let G=await this._ensureGitScan(),W=rL.conda": 1,
+    b'if(W==="rw"&&!G?.reassert)O.warmGitScan?.().catch(()=>{})': 1,
+    b"async _ensureGitScan()": 1,
+    b"await this._ensureGitScan()": 4,
+    b"if(this._gitRescanInFlight===null&&!this._gitRescanDisabled)this._kickGitRescan();": 1,
+    b"async warmGitScan()": 1,
+    b"GIT_SCAN_REFRESH_MS=1e4": 1,
+    b"GIT_SCAN_IDLE_QUIESCE=6": 1,
+    b"warmGitScan:()=>p_.warmGitScan()": 1,
 }
 for marker, expected in markers.items():
     actual = data.count(marker)
@@ -235,7 +271,7 @@ try {
 & (Join-Path $ProjectDir "tests\package_policy_test.ps1")
 if ($LASTEXITCODE -ne 0) { throw "Package policy tests failed (exit $LASTEXITCODE)." }
 
-& $Python -m pytest tests/test_network_quality.py -q
-if ($LASTEXITCODE -ne 0) { throw "Network quality tests failed (exit $LASTEXITCODE)." }
+& $Python -m pytest tests/test_network_quality.py tests/test_narrow_broad_host_grants.py -q
+if ($LASTEXITCODE -ne 0) { throw "Network quality and host-grant safety tests failed (exit $LASTEXITCODE)." }
 
 Write-Host "self-test passed"

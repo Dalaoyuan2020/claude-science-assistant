@@ -370,7 +370,7 @@ if ($claudeDetected -and $proxyContractReady -and $sandboxForwardersReady -and -
 if ($wslProbe -and $sandboxDeepChecked -and -not $deepEgressReady) {
   if ($sandboxProbeDaemonMountIoBlocked -or $sandboxEgressState -eq "daemon_mount_io_busy") {
     $waitChannel = if ($sandboxProbeDaemonWaitChannel -and $sandboxProbeDaemonWaitChannel -ne "unknown") { $sandboxProbeDaemonWaitChannel } else { "WSL mount I/O" }
-    $warnings.Add("Claude Science owns its ports, but the daemon event loop was blocked in $waitChannel during the end-to-end probe. The result was withheld and this is not evidence of an external API outage; wait for I/O to return or move high-I/O workspaces to WSL ext4.")
+    $warnings.Add("Claude Science owns its ports, but the daemon event loop was blocked in $waitChannel during the end-to-end probe. A broad persistent RW grant can make the upstream Git safety scan recurse through DrvFS. The result was withheld and this is not evidence of an external API outage; wait for I/O to return, then narrow the grant or move hot repositories to WSL ext4.")
   } elseif ($sandboxProbeDaemonIoBlocked -or $sandboxEgressState -eq "daemon_busy") {
     $warnings.Add("Claude Science entered uninterruptible I/O during the protocol probe ($sandboxProbeDaemonWaitChannel). External API readiness is not established; the daemon was kept running and no billable model request was made.")
   } else {
@@ -378,9 +378,24 @@ if ($wslProbe -and $sandboxDeepChecked -and -not $deepEgressReady) {
   }
 }
 if ($claudeDetected -and $claudeMountIoBlocked) {
-  $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel; do not force a partial restart until the WSL mount I/O returns.")
+  $warnings.Add("Claude Science is currently in scheduler state $claudeProcessState at $claudeWaitChannel. A broad writable Windows grant can make the upstream Git safety scan recurse through DrvFS; do not force a partial restart until the mount I/O returns.")
 } elseif ($claudeDetected -and $claudeIoBlocked) {
   $warnings.Add("Claude Science is currently in uninterruptible I/O ($claudeProcessState at $claudeWaitChannel); CSA will not report network ready or attempt a partial restart until it becomes safely stoppable.")
+}
+$hostAccess = if ($wslProbe) { Get-OptionalProperty $wslProbe "host_access" $null } else { $null }
+if ($hostAccess) {
+  $preferencesPresent = [bool](Get-OptionalProperty $hostAccess "preferences_present" $false)
+  $preferencesParseOk = [bool](Get-OptionalProperty $hostAccess "preferences_parse_ok" $false)
+  $drvfsGrantCount = [int](Get-OptionalProperty $hostAccess "drvfs_write_grant_count" 0)
+  $broadGrantCount = [int](Get-OptionalProperty $hostAccess "broad_drvfs_write_grant_count" 0)
+  if ($preferencesPresent -and -not $preferencesParseOk) {
+    $warnings.Add("Claude Science preferences.json exists but its host-access grants could not be parsed safely; no granted path was walked or modified.")
+  }
+  if ($drvfsGrantCount -gt 0) {
+    $drvfsGrants = @((Get-OptionalProperty $hostAccess "drvfs_write_grants" @())) -join ", "
+    if (-not $drvfsGrants) { $drvfsGrants = "path details unavailable" }
+    $warnings.Add("Detected $drvfsGrantCount persistent writable Windows/DrvFS grant(s) ($broadGrantCount broad): $drvfsGrants. V0.1.6 skips known boot-only warmups, but a real sandbox command must still run the Git safety scan; prefer read-only access, ext4, or a narrow output leaf.")
+  }
 }
 
 $overall = "not_ready"
@@ -423,6 +438,7 @@ $report = [ordered]@{
   }
   runtime = if ($wslProbe) { $wslProbe.runtime } else { $null }
   network = if ($wslProbe) { $wslProbe.network } else { $null }
+  host_access = if ($wslProbe) { Get-OptionalProperty $wslProbe "host_access" $null } else { $null }
   components = if ($wslProbe) { $wslProbe.components } else { $null }
   storage = [ordered]@{
     blocked = $storageBlocked

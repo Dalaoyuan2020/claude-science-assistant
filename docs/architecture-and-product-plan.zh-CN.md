@@ -405,6 +405,12 @@ Claude Science 的启动就绪检测不得请求任何 daemon HTTP 路径。`GET
 
 端口已开但事件循环或外网不可用的问题由独立 deep network probe 判定，不再借 daemon HTTP 间接推断。该探针经真实 `analysis/socks.sock`、SOCKS5H 和固定 PyPI HTTPS HEAD canary 检查沙盒出口，并在探针前后采样 daemon 状态、启动时间与 wait channel；只有身份相同且相邻两次成功才发布绿色缓存。因此本地就绪、事件循环/挂载阻塞和外网出口三类证据彼此独立，固定 canary 也不会进入 Claude Science 的业务路由、提示词或模型调用链。
 
-v0.1.6 同时把内置 MCP 改为真正按需加载。受管二进制副本禁用启动阶段的 `QT9` bundled-server 预热；catalog snapshot 调用 `_loadBundledServer(serverName, false)` 时固定 no-op，不会因为枚举目录或生成快照启动 24 个 MCP；只有用户实际调用某个 connector/MCP 后进入 `ready(serverName)` 的显式加载路径，才启动对应 server。补丁只写入内容寻址的受管副本，仓库锁定的官方 0.1.25 vendor 二进制保持原始哈希不变。
+v0.1.6 同时把 MCP 改为真正按需加载。受管二进制副本禁用启动阶段的 `QT9` bundled-server 预热；catalog snapshot 调用 `_loadBundledServer(serverName, false)` 时固定 no-op，不会因为枚举目录或生成快照启动 24 个 MCP；buildApp 的 custom-MCP 元数据预热和 Fastify `onReady` 的 skeleton MCP/Conda 环境预建也被改为已完成的空 Promise。后两者原本会经 `wrapCondaCommand()` 进入 `_ensureGitScan()`，即使 bundled catalog 已按需仍能触发 DrvFS 遍历。补丁不改 `ensureMcpEnv()`、`NYz()`、`wrapCondaCommand()` 或 connector demand 路径，只有用户实际调用 connector/MCP 时才加载对应 server 和环境。
+
+另一条独立启动链是 sandbox Git safety warm scan。Claude Science 0.1.25 会在 daemon build 阶段递归扫描所有持久 `rw:` host grant；若存在 `rw:/mnt/e/Downloads` 这类宽泛 DrvFS 授权，深度为 4 的目录遍历可能让 Bun 主线程进入 `D/p9_client_rpc`。v0.1.6 只把唯一的启动期 `warmGitScan()` 调用改为 no-op，并移除上述两条会在启动时间接进入 `_ensureGitScan()` 的 MCP/Conda 预建，仍保留持久授权 hydrate、`pinBaseRootsAfterGrantProjection()`、网络 deny、`warmGitScan()` 方法本体及四类 sandbox wrapper 的 `_ensureGitScan()`。所以 daemon 启动不再遍历授权目录，首次真实 sandbox 命令仍必须完成同一 Git 安全扫描后才能执行，后续新增授权也仍会触发 warm scan。
+
+启动器只读解析授权字符串而不遍历对应路径，并报告所有永久 DrvFS RW grant（同时标记 drive root、Downloads、Documents、Desktop 等宽泛项）。需要处理时可用 `scripts/csa-narrow-broad-host-grants.py --apply` 精确删除宽泛项，或用 `--convert-drvfs-rw-to-ro` 保留读取能力同时撤销全部永久 DrvFS 写权限；两种模式都先写入内容哈希命名的 0600 原始备份，再通过同目录临时文件、CAS 检查、`fsync` 与原子替换提交。ext4 RW grant 和其他偏好保持不变。
+
+这些补丁都只写入内容寻址的受管副本，仓库锁定的官方 0.1.25 vendor 二进制保持原始哈希不变。
 
 v0.1.6 的发行门必须同时验证：产品版本三处一致、Bridge runtime ID 含产品版本和 bundle 哈希、Claude Science `0.1.25` 哈希锁未漂移、旧 v0.1.5 UTF-8 BOM 清单仍可迁移、源码/前端/Rust/WSL 生命周期测试通过，以及最终 ZIP 的 `sourceTreeDirty=false`。历史 v0.1.5 文档与迁移兼容夹具不得为了“全局替换版本号”而改写。

@@ -316,6 +316,8 @@ struct WslProbeReport {
     runtime: WslProbeRuntime,
     #[serde(default)]
     network: WslProbeNetwork,
+    #[serde(default)]
+    host_access: WslProbeHostAccess,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -437,6 +439,20 @@ struct WslProbeNetwork {
     sandbox_forwarder_passed_count: u32,
     #[serde(default)]
     sandbox_forwarder_failed_count: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WslProbeHostAccess {
+    #[serde(default)]
+    preferences_present: bool,
+    #[serde(default)]
+    preferences_parse_ok: bool,
+    #[serde(default)]
+    drvfs_write_grant_count: u32,
+    #[serde(default)]
+    drvfs_write_grants: Vec<String>,
+    #[serde(default)]
+    broad_drvfs_write_grant_count: u32,
 }
 
 fn sandbox_forwarder_topology_is_ready(network: &WslProbeNetwork) -> bool {
@@ -1325,7 +1341,7 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
                 probe.network.sandbox_probe_daemon_wait_channel.as_str()
             };
             warnings.push(format!(
-                "Claude Science owns all expected ports, but its event loop was blocked in {wait_channel} while accessing a WSL-mounted Windows workspace during the end-to-end probe. The readiness result was withheld, so this is not evidence of an external API or proxy outage. Wait for I/O to return, or move high-I/O workspaces to WSL ext4."
+                "Claude Science owns all expected ports, but its event loop was blocked in {wait_channel} while accessing a WSL-mounted Windows path during the end-to-end probe. A broad persistent RW grant can make the upstream Git safety scan recurse through DrvFS. The readiness result was withheld, so this is not evidence of an external API or proxy outage. Wait for I/O to return, then narrow the grant or move hot repositories to WSL ext4."
             ));
         } else if probe.network.sandbox_probe_daemon_io_blocked
             || probe.network.sandbox_egress_state == "daemon_busy"
@@ -1356,9 +1372,22 @@ fn current_status_with_options(deep_network_probe: bool) -> SystemStatus {
     }
 
     if claude_running && probe.network.claude_mount_io_blocked {
-        warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. Repair/restart is temporarily blocked so CSA does not leave Bridge and daemon in a partial state; refresh after the current I/O returns.".into());
+        warnings.push("Claude Science is currently in uninterruptible WSL mount I/O. A broad writable Windows grant can make the upstream Git safety scan recurse through DrvFS; repair/restart is temporarily blocked so CSA does not leave Bridge and daemon in a partial state. Refresh after I/O returns, then narrow the grant to a specific project or output directory.".into());
     } else if claude_running && probe.network.claude_io_blocked {
         warnings.push("Claude Science is currently in uninterruptible I/O. Repair/restart is temporarily blocked; CSA will not signal the daemon or mutate Bridge until the process becomes safely stoppable.".into());
+    }
+
+    if probe.host_access.preferences_present && !probe.host_access.preferences_parse_ok {
+        warnings.push("Claude Science preferences.json exists but its host-access grants could not be parsed safely. CSA did not walk or modify any granted path.".into());
+    }
+    if probe.host_access.drvfs_write_grant_count > 0 {
+        let grants = probe.host_access.drvfs_write_grants.join(", ");
+        warnings.push(format!(
+            "Detected {} persistent writable Windows/DrvFS grant(s) ({} broad): {}. CSA v0.1.6 skips known boot-only MCP/Git warmups, but the first real sandbox command must still run the upstream Git safety scan. Prefer read-only access, an ext4 workspace, or a narrowly scoped output directory to avoid p9_client_rpc stalls.",
+            probe.host_access.drvfs_write_grant_count,
+            probe.host_access.broad_drvfs_write_grant_count,
+            if grants.is_empty() { "path details unavailable" } else { grants.as_str() }
+        ));
     }
 
     if bridge_pid.is_some() && claude_pid.is_none() {
@@ -5853,6 +5882,9 @@ mod tests {
         assert!(start.contains("csa_stage_claude_runtime"));
         assert!(start.contains("trap restore_runtime_after_failure EXIT"));
         assert!(start.contains("csa_print_bridge_identity"));
+        assert!(start.contains("byok-demand-mcp-lazy-git-scan-v6"));
+        assert!(start.contains("git_boot_warmup_old"));
+        assert!(start.contains("async _ensureGitScan()"));
         assert!(start.contains("curl --noproxy '*'"));
         assert!(layout.contains("Implicit Claude Science downgrade rejected"));
         assert!(layout.contains("csa_backup_before_downgrade"));
@@ -5861,6 +5893,8 @@ mod tests {
         assert!(service.contains("ExecStart=\"$python_escaped\" \"$proxy_escaped\""));
         assert!(!service.contains("proxy_escaped=\"$(unit_escape \"$PACKAGE_DIR/proxy.py\")\""));
         assert!(inspect.contains("bridge_proxy=\"$bridge_current/proxy.py\""));
+        assert!(inspect.contains("broad_drvfs_write_grant_count"));
+        assert!(inspect.contains("git_scan_boot_mode"));
     }
 
     #[test]

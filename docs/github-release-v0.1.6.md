@@ -15,7 +15,9 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 - Bridge 包迁移：Bridge 以 `bridge-0.1.6-<bundle-hash>` 内容寻址目录激活，`/health.runtime_identity` 同时报告版本、build ID、源码哈希和 PID。
 - 沙盒出口探针：经真实 `analysis/socks.sock`、SOCKS5H 和固定 PyPI HTTPS HEAD 验证出口；不发送模型请求，不产生模型费用，并要求同一进程身份下相邻两次成功才发布绿色缓存。
 - 挂载 I/O 诊断：单独报告 Linux `D` 状态与 `p9_client_rpc` 等 wait channel，区分 WSL DrvFS/9P 卡住、沙盒转发失败和公网出口故障。
-- MCP 真正按需加载：禁用启动阶段 `QT9` 对内置 MCP 的预热，catalog snapshot 不再启动 server；只有实际使用 connector/MCP 并进入 `ready(serverName)` 时才加载对应进程。
+- MCP 真正按需加载：禁用启动阶段 `QT9` 内置 MCP、custom-MCP 元数据和 skeleton Conda 环境预热，catalog snapshot 不再启动 server；只有实际使用 connector/MCP 时才加载对应进程与环境。
+- Git 安全扫描按需执行：启动时不再递归所有持久 RW host grant；首次真实 sandbox 命令和后续新增授权仍经过未削弱的 `_ensureGitScan()` 安全门。
+- 宽泛授权质检：只读取授权字符串、不遍历目标目录，识别 Windows drive root、Downloads、Documents、Desktop 等高风险 RW grant，并给出具体收窄建议。
 - 版本身份统一：界面、窗口标题、Tauri/Cargo、便携包 manifest、启动脚本和 Bridge runtime ID 统一为 0.1.6；内置 Claude Science 仍保持 0.1.25。
 
 ## 修复与加固
@@ -45,7 +47,7 @@ CSA v0.1.6 继续锁定 Claude Science 0.1.25，把“端口是否监听”升�
 
 - 网络质检使用固定、匿名、非计费的 PyPI canary，只证明本机指定沙盒出口链路可用，不等于所有模型供应商都已通过真实鉴权和计费请求。
 - Claude Science 本地就绪检查不请求 `GET /`、`GET /health` 或任何业务 API；固定 PyPI canary 只经沙盒 SOCKS5H 出口执行匿名 HEAD，不进入提示词、模型或 MCP 业务调用链。
-- 如果 Claude Science 保存了指向 `/mnt/c`、`/mnt/e` 大型 Git 仓库的广泛可写授权，上游 Git safety scan 仍可能进入 `p9_client_rpc`。建议把活跃仓库放在 WSL ext4，并把 Windows 挂载授权收窄为只读或具体输出目录。
+- V0.1.6 不会在 daemon 启动阶段扫描 Windows RW grant，因此 UI 和端口就绪不再被该扫描拖死；但首次真实 sandbox 命令仍会 fail-closed 地执行 Git safety scan。请把 `rw:/mnt/e/Downloads` 一类授权收窄到具体项目/输出目录（能只读就不用 RW），或把热代码与 `.git` 放到 WSL ext4。可在 daemon 安全停止后运行 `python3 scripts/csa-narrow-broad-host-grants.py --apply` 精确删除宽泛项，或运行 `python3 scripts/csa-narrow-broad-host-grants.py --convert-drvfs-rw-to-ro` 保留读取并撤销全部永久 DrvFS 写权限；工具都会先保存 0600 原始备份。
 - Visual/多模态能力仍取决于所选上游模型与供应商。模型名匹配只能生成建议，不能替代真实图片请求验收。
 
 ## 发布校验
