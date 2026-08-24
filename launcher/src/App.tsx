@@ -10,7 +10,7 @@ import {
 } from "./runtimeUpdate";
 import "./App.css";
 
-const APP_VERSION = "V0.1.5";
+const APP_VERSION = "V0.1.6";
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
 

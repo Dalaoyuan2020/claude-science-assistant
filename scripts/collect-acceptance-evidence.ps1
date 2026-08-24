@@ -27,8 +27,39 @@ $OutputDir = (New-Item -ItemType Directory -Force -Path $OutputDir).FullName
 $ManifestPath = Join-Path $ProjectRoot "manifest.json"
 $IsPortablePackage = (Test-Path -LiteralPath (Join-Path $ProjectRoot "claude-science-assistant.exe")) -and (Test-Path -LiteralPath $ManifestPath)
 
+function Resolve-CsaProductVersion {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$PackageManifestPath
+  )
+
+  if (Test-Path -LiteralPath $PackageManifestPath) {
+    try {
+      $packageManifest = Get-Content -LiteralPath $PackageManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $manifestVersion = [string]$packageManifest.version
+      if ($manifestVersion -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+        return $manifestVersion
+      }
+    } catch {
+      Write-Warning "Could not read the portable package version from manifest.json: $($_.Exception.Message)"
+    }
+  }
+
+  $cargoTomlPath = Join-Path $Root "launcher\src-tauri\Cargo.toml"
+  if (Test-Path -LiteralPath $cargoTomlPath) {
+    $cargoToml = Get-Content -LiteralPath $cargoTomlPath -Raw -Encoding UTF8
+    $versionMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"]+)"')
+    if ($versionMatch.Success) {
+      return $versionMatch.Groups[1].Value
+    }
+  }
+
+  return "unknown"
+}
+
+$ProductVersion = Resolve-CsaProductVersion -Root $ProjectRoot -PackageManifestPath $ManifestPath
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$EvidenceName = "claude-science-assistant-v0.1-evidence-$Stamp"
+$EvidenceName = "claude-science-assistant-v$ProductVersion-evidence-$Stamp"
 $EvidenceRoot = Join-Path $OutputDir $EvidenceName
 New-Item -ItemType Directory -Force -Path $EvidenceRoot | Out-Null
 
@@ -136,7 +167,7 @@ function Copy-IfPresent {
 $summary = [ordered]@{
   schemaVersion = 1
   product = "Claude Science Assistant"
-  version = "0.1.3"
+  version = $ProductVersion
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
   mode = "read-only evidence collection"
   projectRootLeaf = Split-Path -Leaf $ProjectRoot

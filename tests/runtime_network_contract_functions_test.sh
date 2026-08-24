@@ -119,6 +119,39 @@ exact_executable_serve_tokens "$PATCHED_BIN" | grep -q . || {
   exit 1
 }
 
+# Local readiness is deliberately observational: it verifies the two listener
+# owners, exact executable/argv, and safe Linux thread states without issuing an
+# HTTP request that could initialize the application, feature flags, or MCP
+# catalog.  Real API reachability is covered separately by the deep SOCKS5H
+# contract test below.
+primary_fixture="$candidate_pid"
+auxiliary_fixture="$candidate_pid"
+curl() {
+  : >"$TEST_ROOT/unexpected-health-curl"
+  return 99
+}
+if ! check_claude_health "$PATCHED_BIN"; then
+  echo "A signalable exact daemon candidate was not accepted as locally ready." >&2
+  exit 1
+fi
+if ( process_threads_signalable() { return 1; }; check_claude_health "$PATCHED_BIN" ); then
+  echo "A daemon with an unsafe thread state was incorrectly accepted as locally ready." >&2
+  exit 1
+fi
+[ ! -e "$TEST_ROOT/unexpected-health-curl" ] || {
+  echo "Claude local readiness performed a side-effecting HTTP request." >&2
+  exit 1
+}
+health_function="$(declare -f check_claude_health)"
+printf '%s\n' "$health_function" | grep -Fq 'process_threads_signalable "$pid"' || {
+  echo "Claude local readiness no longer rejects unsafe thread states." >&2
+  exit 1
+}
+if printf '%s\n' "$health_function" | grep -Eq 'curl|https?://'; then
+  echo "Claude local readiness contains an HTTP probe." >&2
+  exit 1
+fi
+
 cleanup_failed_candidate_processes || true
 if kill -0 "$candidate_pid" 2>/dev/null; then
   echo "A failed non-listening candidate survived exact-process cleanup." >&2

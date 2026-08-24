@@ -448,16 +448,23 @@ running_claude_binary() {
 }
 
 check_claude_health() {
-  local expected_bin="$1" pid cmd executable expected_executable
+  local expected_bin="$1" pid executable expected_executable
+  local -a argv=()
   expected_executable="$(readlink -f "$expected_bin" 2>/dev/null || true)"
   pid="$(claude_primary_pid)" || return 1
   [ -r "/proc/$pid/cmdline" ] || return 1
   executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
   [ -n "$expected_executable" ] && [ "$executable" = "$expected_executable" ] || return 1
-  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-  [[ "$cmd" == *"$expected_bin serve"* ]] || return 1
-  curl --noproxy '*' -sS -o /dev/null --connect-timeout 0.5 --max-time 1 \
-    "http://127.0.0.1:$CLAUDE_SCIENCE_PORT/" 2>/dev/null
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  [ "${argv[0]:-}" = "$expected_bin" ] || return 1
+  [ "${argv[1]:-}" = "serve" ] || return 1
+  # Readiness checks must not request the SPA or any application route.  In
+  # Claude Science 0.1.25 those routes participate in application/feature
+  # initialization and depend on the very event loop being measured.  Listener
+  # ownership plus an exact executable/argv identity establishes the local
+  # contract; the following thread-state check withholds readiness for D-state
+  # mount I/O, and the separate deep SOCKS5H probe validates real API egress.
+  process_threads_signalable "$pid"
 }
 
 wait_claude_health() {
@@ -983,7 +990,7 @@ CLAUDE_PREVIOUS_RUNTIME="$CSA_PREVIOUS_RUNTIME"
 CLAUDE_CANDIDATE_RUNTIME="$CSA_CLAUDE_RUNTIME_DIR"
 SOURCE_BIN="$CSA_CLAUDE_RUNTIME_DIR/claude-science"
 SOURCE_SHA="$CSA_CLAUDE_SOURCE_SHA256"
-PATCH_PROFILE="byok-no-eager-mcp-warmup-v1"
+PATCH_PROFILE="byok-demand-mcp-catalog-v2"
 if [ -n "$PATCH_DIR_OVERRIDE" ]; then
   PATCH_DIR="$PATCH_DIR_OVERRIDE"
 else
@@ -1056,6 +1063,16 @@ target = Path(os.environ["TARGET"]).expanduser()
 port = os.environ["PROXY_PORT"]
 backup = target.with_name(target.name + ".byok-auth-original")
 
+catalog_guard_old = (
+    b"_loadBundledServer(z,O=!1){if(this._bundledTools.has(z))return Promise.resolve();"
+    b"if(this._bundledParked.has(z))return Promise.resolve();"
+)
+catalog_guard_core = (
+    b"_loadBundledServer(z,O=!1){if(!O||this._bundledTools.has(z)||"
+    b"this._bundledParked.has(z))return Promise.resolve();"
+)
+catalog_guard_new = catalog_guard_core + b" " * (len(catalog_guard_old) - len(catalog_guard_core))
+
 pairs = [
     (
         [b"https://api.anthropic.com"],
@@ -1091,6 +1108,15 @@ pairs = [
         [b"QT9(V),oe_(V,WG).catch"],
         b"ZT9(V),oe_(V,WG).catch",
     ),
+    # Catalog snapshots call _loadBundledServer(name, false) for every bundled
+    # connector, even with waitBudgetMs=0.  Require the already-present explicit
+    # request flag before the version-locked loader may touch a connector.  The
+    # only two call sites are boot prewarm (no flag) and _assemble (true only
+    # when ready(..., {serverName}) requests that exact connector).
+    (
+        [catalog_guard_old],
+        catalog_guard_new,
+    ),
 ]
 
 for olds, new in pairs:
@@ -1106,6 +1132,19 @@ if data.count(b"function QT9(z)") != 1 or data.count(b"function ZT9(z){}") != 1:
     raise SystemExit("Unsupported Claude Science daemon build; eager/no-op warmup function identity changed")
 if data.count(warmup_old) + data.count(warmup_new) != 1:
     raise SystemExit("Unsupported Claude Science daemon build; eager MCP warmup call identity is not unique")
+if data.count(catalog_guard_old) + data.count(catalog_guard_new) != 1:
+    raise SystemExit("Unsupported Claude Science daemon build; lazy MCP catalog guard identity is not unique")
+catalog_markers = {
+    b"async snapshotFor(z,O){return this._assemble(z,O,{waitBudgetMs:0})}": 1,
+    b"G.serverName===M": 1,
+    b"this._loadBundledServer(M,j).catch": 1,
+}
+for marker, expected_count in catalog_markers.items():
+    if data.count(marker) != expected_count:
+        raise SystemExit(
+            "Unsupported Claude Science daemon build; lazy MCP catalog structure changed: "
+            + marker.decode(errors="replace")
+        )
 missing = [
     " or ".join(old.decode(errors="replace") for old in olds)
     for olds, new, old_count, new_count in counts
@@ -1144,6 +1183,8 @@ for olds, new, _, _ in counts:
         raise SystemExit(f"patch verification failed; replacement URL missing: {new.decode()}")
 if after.count(warmup_old) != 0 or after.count(warmup_new) != 1:
     raise SystemExit("patch verification failed; eager MCP warmup call was not replaced exactly once")
+if after.count(catalog_guard_old) != 0 or after.count(catalog_guard_new) != 1:
+    raise SystemExit("patch verification failed; lazy MCP catalog guard was not replaced exactly once")
 
 print(f"Patched managed runtime byte occurrence(s): {patched}")
 PY

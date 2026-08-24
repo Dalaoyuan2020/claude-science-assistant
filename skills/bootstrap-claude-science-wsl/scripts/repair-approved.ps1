@@ -116,7 +116,7 @@ $skillRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $skillWsl = Get-WslPath $skillRoot
 $dryRun = if ($PlanOnly) { "1" } else { "0" }
 $start = if ($StartServices) { "1" } else { "0" }
-$packageVersion = "0.1.5"
+$packageVersion = "0.1.6"
 $cargoTomlPath = Join-Path $ProjectRoot "launcher\src-tauri\Cargo.toml"
 if (Test-Path -LiteralPath $cargoTomlPath) {
   $cargoToml = Get-Content -LiteralPath $cargoTomlPath -Raw -Encoding UTF8

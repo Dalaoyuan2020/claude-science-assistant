@@ -66,10 +66,10 @@ if (Test-Path -LiteralPath $packageScriptPath) {
     throw "Portable package naming function is missing."
   }
   Invoke-Expression $nameFunction.Extent.Text
-  $unqualifiedName = Get-CsaPortablePackageName -Version "0.1.5" -BuildProfile "release"
-  $qualityName = Get-CsaPortablePackageName -Version "0.1.5" -Qualifier "quality" -BuildProfile "release"
-  if ($unqualifiedName -eq $qualityName -or $qualityName -ne "claude-science-assistant-v0.1.5-quality-release-portable") {
-    throw "A qualified release must use a distinct artifact name and must not overwrite the unqualified v0.1.5 release."
+  $unqualifiedName = Get-CsaPortablePackageName -Version "0.1.6" -BuildProfile "release"
+  $qualityName = Get-CsaPortablePackageName -Version "0.1.6" -Qualifier "quality" -BuildProfile "release"
+  if ($unqualifiedName -eq $qualityName -or $qualityName -ne "claude-science-assistant-v0.1.6-quality-release-portable") {
+    throw "A qualified release must use a distinct artifact name and must not overwrite the unqualified v0.1.6 release."
   }
   $packageScriptText = Get-Content -LiteralPath $packageScriptPath -Raw -Encoding UTF8
   foreach ($literalCleanup in @(
@@ -111,6 +111,45 @@ if (Test-Path -LiteralPath $packageScriptPath) {
     if (-not $packageScriptText.Contains($portableRuntimeFile)) {
       throw "Portable package is missing a required runtime quality helper/test: $portableRuntimeFile"
     }
+  }
+
+  $cacheCleanupFunction = $packageAst.Find(
+    {
+      param($node)
+      $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Remove-CsaPackageCacheDirectories"
+    },
+    $true
+  )
+  if (-not $cacheCleanupFunction) {
+    throw "Portable packaging must define cache-directory cleanup before archiving."
+  }
+  Invoke-Expression $cacheCleanupFunction.Extent.Text
+  foreach ($forbiddenCacheName in @('__pycache__', '.pytest_cache')) {
+    if (-not $packageScriptText.Contains(('"{0}"' -f $forbiddenCacheName))) {
+      throw "Portable packaging policy is missing forbidden cache directory: $forbiddenCacheName"
+    }
+  }
+
+  $cacheFixture = Join-Path ([System.IO.Path]::GetTempPath()) ("csa-package-cache-{0}" -f [guid]::NewGuid().ToString("N"))
+  try {
+    $pythonCache = Join-Path $cacheFixture "scripts\__pycache__"
+    $pytestCache = Join-Path $cacheFixture "tests\.pytest_cache"
+    New-Item -ItemType Directory -Force -Path $pythonCache, $pytestCache | Out-Null
+    Set-Content -LiteralPath (Join-Path $pythonCache "module.pyc") -Value "cache"
+    Set-Content -LiteralPath (Join-Path $pytestCache "nodeids") -Value "cache"
+    Set-Content -LiteralPath (Join-Path $cacheFixture "keep.txt") -Value "keep"
+
+    Remove-CsaPackageCacheDirectories -PackageRoot $cacheFixture
+
+    if ((Test-Path -LiteralPath $pythonCache) -or (Test-Path -LiteralPath $pytestCache)) {
+      throw "Portable cache cleanup left a forbidden cache directory in the package fixture."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $cacheFixture "keep.txt"))) {
+      throw "Portable cache cleanup removed a non-cache package file."
+    }
+  } finally {
+    Remove-Item -LiteralPath $cacheFixture -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
 

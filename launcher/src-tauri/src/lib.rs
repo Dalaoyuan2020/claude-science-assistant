@@ -4353,7 +4353,7 @@ fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
             .map(|duration| duration.as_secs())
             .unwrap_or_default(),
         release_notes_url: CLAUDE_SCIENCE_CHANGELOG_URL.into(),
-        note: "CSA v0.1.5 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
+        note: "CSA v0.1.6 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
     })
 }
 

@@ -23,6 +23,30 @@ function Get-CsaPortablePackageName {
   return "claude-science-assistant-$qualifiedVersion-$BuildProfile-portable"
 }
 
+function Remove-CsaPackageCacheDirectories {
+  param(
+    [Parameter(Mandatory = $true)][string]$PackageRoot
+  )
+
+  $resolvedPackageRoot = (Resolve-Path -LiteralPath $PackageRoot).Path
+  $rootPrefix = $resolvedPackageRoot.TrimEnd(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+  ) + [System.IO.Path]::DirectorySeparatorChar
+  $cacheDirectories = @(
+    Get-ChildItem -LiteralPath $resolvedPackageRoot -Recurse -Directory -Force |
+      Where-Object { $_.Name -in @("__pycache__", ".pytest_cache") } |
+      Sort-Object { $_.FullName.Length } -Descending
+  )
+  foreach ($cacheDirectory in $cacheDirectories) {
+    $cachePath = [System.IO.Path]::GetFullPath($cacheDirectory.FullName)
+    if (-not $cachePath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Refusing to remove a cache directory outside the package root: $cachePath"
+    }
+    Remove-Item -LiteralPath $cachePath -Recurse -Force
+  }
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 . (Join-Path $ScriptDir "package-policy.ps1")
@@ -165,11 +189,14 @@ Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "quick-start.zh
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "architecture-and-product-plan.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "architecture-and-product-plan.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.3.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.3.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.4.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.4.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.5.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.5.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.6.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.6.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.3-update-record.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.3-update-record.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.4-runtime-update.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.4-runtime-update.zh-CN.md")
+Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1.5-model-switch-and-role-mapping.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1.5-model-switch-and-role-mapping.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-clean-pc-acceptance.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-clean-pc-acceptance.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "provider-access-matrix.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "provider-access-matrix.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "troubleshooting.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "troubleshooting.md")
@@ -263,11 +290,14 @@ $Manifest = [ordered]@{
     "docs/architecture-and-product-plan.zh-CN.md",
     "docs/github-release-v0.1.3.md",
     "docs/github-release-v0.1.4.md",
+    "docs/github-release-v0.1.5.md",
+    "docs/github-release-v0.1.6.md",
     "docs/green-book-integration.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
     "docs/v0.1.3-update-record.zh-CN.md",
     "docs/v0.1.4-runtime-update.zh-CN.md",
+    "docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md",
     "docs/v0.1-clean-pc-acceptance.zh-CN.md",
     "docs/provider-access-matrix.zh-CN.md",
     "docs/troubleshooting.md",
@@ -316,7 +346,7 @@ $Readme = @(
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
-  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
+  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/github-release-v0.1.6.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
   "",
   "This package does not include API keys, OAuth tokens, control tokens, or user config."
 ) -join [Environment]::NewLine
@@ -376,6 +406,15 @@ $RootInstallBat = @(
   "exit /b %ERRORLEVEL%"
 ) -join [Environment]::NewLine
 Set-Content -LiteralPath (Join-Path $PackageRoot "4-install-runtime-after-preview.bat") -Value $RootInstallBat -Encoding ASCII
+
+Remove-CsaPackageCacheDirectories -PackageRoot $PackageRoot
+$remainingPackageCaches = @(
+  Get-ChildItem -LiteralPath $PackageRoot -Recurse -Directory -Force |
+    Where-Object { $_.Name -in @("__pycache__", ".pytest_cache") }
+)
+if ($remainingPackageCaches.Count -gt 0) {
+  throw "Package contains Python or pytest cache directories; refusing to archive."
+}
 
 $verifiedBinaryPaths = @(
   (Join-Path $PackageRoot "claude-science-assistant.exe"),

@@ -389,3 +389,22 @@ Linux `D` 状态且 wait channel 为 `p9_client_rpc`（或同类挂载等待）�
 启动或修复发现失联、冲突或无效代理变量时，只从新建 Claude Science 子进程的环境中移除这些变量；不修改 Windows/WSL 系统代理、VPN、DNS、hosts、证书或网络工具。服务切换由 WSL 生命周期锁串行化，运行时使用内容寻址目录、原子指针和失败回滚；停止逻辑只向已经通过端口、可执行路径、启动时间和运行时身份联合验证，且处于可安全发信号状态的 PID 发送信号。自检和修复绝不自动执行全局 `wsl --shutdown` 或 `wsl --terminate`，以免中断同一 WSL 环境中的 SSH 等无关服务；检测到 `D` 状态时保留现场并提示稍后刷新。
 
 该维护修订继续使用 `0.1.5` 产品版本，通过包限定名区分发行物。由于健康身份同时依赖 EXE、`proxy.py`、脚本、Skill 和测试，升级必须替换完整便携包，不能只复制启动器 EXE。
+
+## 11. v0.1.6 完整包身份与无业务请求就绪检测
+
+v0.1.6 将上一节的网络质检维护修订提升为新的产品版本，不再继续用 `0.1.5` 加包限定名表达不同健康语义。上一节保留为 v0.1.5 的历史设计记录；从 v0.1.6 起，启动器、Bridge、脚本、Skill、诊断与发行说明必须作为一个完整包同步升级。
+
+版本边界固定如下：
+
+1. CSA 产品版本为 `0.1.6`，由 Tauri/Cargo、前端包和 Tauri 配置共同声明；打包脚本要求三处完全一致，并把该版本写入便携包 `manifest.json`。
+2. Bridge 运行时身份为 `bridge-0.1.6-<bundle-sha256-prefix>`。启动与修复把产品版本传给 WSL，运行时清单、`/health.runtime_identity`、源码哈希和实际 PID 必须相互吻合。
+3. 内置 Claude Science 是独立版本面，v0.1.6 仍锁定官方稳定版 `0.1.25` 及其 SHA-256。CSA 升级不得隐式替换、降级或把二者版本号混写。
+4. 发行物必须使用完整 ZIP；只复制 `claude-science-assistant.exe` 会留下旧 `proxy.py`、启动脚本、Skill 或测试，从而被包身份检查判定为版本不一致。
+
+Claude Science 的启动就绪检测不得请求任何 daemon HTTP 路径。`GET /` 会进入 SPA `index.html` 处理，并等待首次 feature-flag 刷新的有限 hold；`GET /health` 还会读取图像处理 provider 的可用状态。二者都不是适合作为零业务请求启动门的纯监听探针。v0.1.6 的 `check_claude_health` 只接受以下本地内核证据：`8765/8766` 由同一个 PID 监听、该 PID 的实际 EXE 与预期受管二进制一致、argv 为预期的 `serve` 进程，且 `process_threads_signalable` 确认进程及线程当前可安全检查和管理。它不向 Claude Science 发送 `GET /`、`GET /health` 或任何其他 HTTP 请求。
+
+端口已开但事件循环或外网不可用的问题由独立 deep network probe 判定，不再借 daemon HTTP 间接推断。该探针经真实 `analysis/socks.sock`、SOCKS5H 和固定 PyPI HTTPS HEAD canary 检查沙盒出口，并在探针前后采样 daemon 状态、启动时间与 wait channel；只有身份相同且相邻两次成功才发布绿色缓存。因此本地就绪、事件循环/挂载阻塞和外网出口三类证据彼此独立，固定 canary 也不会进入 Claude Science 的业务路由、提示词或模型调用链。
+
+v0.1.6 同时把内置 MCP 改为真正按需加载。受管二进制副本禁用启动阶段的 `QT9` bundled-server 预热；catalog snapshot 调用 `_loadBundledServer(serverName, false)` 时固定 no-op，不会因为枚举目录或生成快照启动 24 个 MCP；只有用户实际调用某个 connector/MCP 后进入 `ready(serverName)` 的显式加载路径，才启动对应 server。补丁只写入内容寻址的受管副本，仓库锁定的官方 0.1.25 vendor 二进制保持原始哈希不变。
+
+v0.1.6 的发行门必须同时验证：产品版本三处一致、Bridge runtime ID 含产品版本和 bundle 哈希、Claude Science `0.1.25` 哈希锁未漂移、旧 v0.1.5 UTF-8 BOM 清单仍可迁移、源码/前端/Rust/WSL 生命周期测试通过，以及最终 ZIP 的 `sourceTreeDirty=false`。历史 v0.1.5 文档与迁移兼容夹具不得为了“全局替换版本号”而改写。

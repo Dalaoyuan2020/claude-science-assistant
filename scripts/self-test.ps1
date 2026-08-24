@@ -97,12 +97,47 @@ $StartScriptPath = Join-Path $ProjectDir "scripts\start-claude-science-wsl.sh"
 Assert-CsaUtf8NoBom -Path $RuntimeManifestPath
 $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$RuntimeManifest.version -ne "0.1.25") {
-  throw "v0.1.5 must lock Claude Science stable 0.1.25."
+  throw "v0.1.6 must lock Claude Science stable 0.1.25."
 }
 if (Test-Path -LiteralPath $RuntimeBinaryPath) {
   $RuntimeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RuntimeBinaryPath).Hash.ToLowerInvariant()
   if ($RuntimeHash -ne [string]$RuntimeManifest.sha256) {
     throw "Bundled Claude Science hash does not match manifest.json."
+  }
+
+  $LazyMcpBinaryCheck = @'
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+old = b"_loadBundledServer(z,O=!1){if(this._bundledTools.has(z))return Promise.resolve();if(this._bundledParked.has(z))return Promise.resolve();"
+new_core = b"_loadBundledServer(z,O=!1){if(!O||this._bundledTools.has(z)||this._bundledParked.has(z))return Promise.resolve();"
+new = new_core + (b" " * (len(old) - len(new_core)))
+
+if len(old) != 136 or len(new_core) >= len(old) or len(new) != len(old):
+    raise SystemExit("lazy MCP patch must remain an equal-length 136-byte replacement")
+if data.count(old) != 1:
+    raise SystemExit(f"lazy MCP original byte pattern must be unique; found {data.count(old)}")
+if data.count(new) != 0:
+    raise SystemExit(f"locked vendor binary must remain pristine; patched byte pattern count is {data.count(new)}")
+
+markers = {
+    b"._loadBundledServer(": 2,
+    b"_loadBundledServer(": 3,
+    b"snapshotFor(z,O){return this._assemble(z,O,{waitBudgetMs:0})": 1,
+    b"G.serverName===M": 1,
+    b".ready(w,z.db,{serverName:": 1,
+}
+for marker, expected in markers.items():
+    actual = data.count(marker)
+    if actual != expected:
+        raise SystemExit(
+            f"lazy MCP call-path marker {marker!r} expected {expected}, found {actual}"
+        )
+'@
+  & $Python -c $LazyMcpBinaryCheck $RuntimeBinaryPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "Bundled Claude Science lazy-MCP binary policy failed (exit $LASTEXITCODE)."
   }
 }
 $StartScriptText = Get-Content -LiteralPath $StartScriptPath -Raw -Encoding UTF8
