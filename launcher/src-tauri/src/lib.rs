@@ -8162,7 +8162,10 @@ mod tests {
 
     #[test]
     fn appearance_and_rename_commands_persist_settings_only() {
-        let source = include_str!("lib.rs");
+        // Git may check this file out with CRLF on Windows even when the
+        // developer worktree currently uses LF. Normalize before matching a
+        // multiline source boundary so the release gate is checkout-stable.
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         for (start_marker, end_marker) in [
             (
                 "fn save_ui_skin_impl(",

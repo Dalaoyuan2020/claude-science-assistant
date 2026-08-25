@@ -58,6 +58,8 @@ git diff --check:                       passed
 
 四个 ignored Rust 测试均有明确外部条件：三个会访问真实运行时/Key/模型或修改当前接入，一个读取官方运行时索引。本轮没有把 ignored 当成失败，也没有无授权代跑。
 
+第一次从独立 clean worktree 运行 release gate 时，源码合同测试在 Git 的 CRLF checkout 下无法匹配写死的 LF 多行边界，出现 112 passed / 1 failed。功能代码没有失败，但正式门按预期停止，未生成资产。测试随后在匹配前统一把 CRLF 规范化为 LF，并从 `launcher/src-tauri` 工作目录复测通过；正式打包必须从包含该修复的新提交重新开始，不能沿用失败构建。
+
 新增 UI 回归覆盖：三皮肤 LauncherSettings 往返和非法值回退、单一主 DOM、三个 `aria-pressed` 选项、Help dialog 语义、背景 inert、Escape/Tab/焦点恢复源码合同、二维码资源存在且不引用过期群码，以及关键前景/背景组合的 WCAG AA 4.5:1 下限。
 
 ## 隔离 Windows 可视验收
