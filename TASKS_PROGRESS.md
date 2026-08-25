@@ -302,3 +302,11 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 证据在哪：`docs/troubleshooting.md`、`docs/reports/CSA_v016_S5_capability_audit_20260825.md`、`docs/reports/CSA_v017_acceptance_20260825.md`；最终 smoke 六项 PASS、exit 0；self-test 为 54 translation tests、package policy、35 passed/3 skipped。
 
 下一步：提交代码与文档；后续单独实现 Provider `PREPARED / COMMIT_DECIDED` 跨进程 revision journal，再进入维护窗口与正式发布验收。
+
+## V0.1.8 P0 完成
+
+做了什么：完成 v0.1.6/v0.1.7 全量 Git、台账、报告和代码证据复盘；建立长期开发手册与一页对外复盘，固化三车道、唯一门锁、12 条弯路、代码地雷、验收门和防膨胀五问。
+
+证据在哪：`docs/architecture/DEVELOPMENT_HANDBOOK.md`、`docs/reports/CSA_retrospective_20260825.md`；可复算范围为 `03dc6c2..c9ca823` 与 `c9ca823..8a7e12e`，两轮 `lib.rs` 非空行 7086 → 8876，P0 期间 `App.tsx` / `App.css` 零改动。
+
+下一步：在独立 P1 提交中严格按 `CSA_v018_UI_PROMPT.md` §P1.3 的文字线框改造同一 DOM 双皮肤；不改 ALLOW/探针/事务期望，不制作正式 Release ZIP。
