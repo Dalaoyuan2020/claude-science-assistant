@@ -310,3 +310,11 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 证据在哪：`docs/architecture/DEVELOPMENT_HANDBOOK.md`、`docs/reports/CSA_retrospective_20260825.md`；可复算范围为 `03dc6c2..c9ca823` 与 `c9ca823..8a7e12e`，两轮 `lib.rs` 非空行 7086 → 8876，P0 期间 `App.tsx` / `App.css` 零改动。
 
 下一步：在独立 P1 提交中严格按 `CSA_v018_UI_PROMPT.md` §P1.3 的文字线框改造同一 DOM 双皮肤；不改 ALLOW/探针/事务期望，不制作正式 Release ZIP。
+
+## V0.1.8 P1 代码完成（出口现场复验待补）
+
+做了什么：按 §P1.3 完成同一 DOM 的 Console/Classic 双皮肤、LauncherSettings 首次选择、非门禁状态屏、独立 F1/F2/F3、“我的接入”、任意 Provider 名称/重命名和点名式两步删除；再按用户现场反馈把 Console 改为亮色相对自适应布局、Classic 改为四个等尺寸主控键；没有改 ALLOW、GRADE/WORK 探针、Provider 预设或 Bridge 激活事务。
+
+证据在哪：`docs/reports/CSA_v018_UI_acceptance_20260825.md` 保存双皮肤逐项预览、隔离 Tauri 跨进程皮肤记忆及亮色/四等分实测、Provider 前后同 SHA-256、A–E 核对和最终 smoke；Node 21/21、Vite build、Rust 113/113（4 ignored）+ 集成 9/9、54 translation tests、package policy 与 Python 35 passed/3 skipped 均通过，smoke 为 `required_fail=0`、出口单项 `gating=false`。
+
+下一步：进入独立发布门，一次性同步 package/Cargo/Tauri 的 v0.1.8 元数据，并在维护窗口补停止/重启、旧 Bridge、真实 Key/聚合、出口应用与正式 ZIP/SHA/secret scan/双入口/并排升级验收；本轮 feature-candidate 不制作正式 Release。

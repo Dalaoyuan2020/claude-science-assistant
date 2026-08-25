@@ -1011,12 +1011,27 @@ struct ProviderPreset {
     default_model: Option<String>,
 }
 
+fn deserialize_optional_ui_skin<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(value) => Some(value),
+        // A present-but-invalid value is different from a legacy missing field:
+        // it falls back to console instead of reopening first-run selection.
+        _ => Some("console".into()),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LauncherSettings {
     selected_provider_id: String,
     custom_base_url: String,
     custom_confirmed: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_ui_skin")]
+    ui_skin: Option<String>,
     #[serde(default)]
     active_api_key_id: Option<String>,
     #[serde(default)]
@@ -1098,6 +1113,12 @@ struct LauncherState {
     aggregate_schemes: Vec<StoredAggregateScheme>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct UiPreferences {
+    skin: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BridgeConfigRollback {
     restore: serde_json::Map<String, serde_json::Value>,
@@ -1174,6 +1195,7 @@ impl Default for LauncherSettings {
             selected_provider_id: "deepseek".into(),
             custom_base_url: String::new(),
             custom_confirmed: false,
+            ui_skin: None,
             active_api_key_id: None,
             api_keys: Vec::new(),
             active_role: None,
@@ -2437,6 +2459,55 @@ fn provider_by_id(provider_id: &str) -> Option<ProviderPreset> {
         .find(|provider| provider.id == provider_id)
 }
 
+fn normalized_ui_skin(value: Option<&str>) -> Option<String> {
+    match value {
+        Some("console") => Some("console".into()),
+        Some("classic") => Some("classic".into()),
+        // An invalid persisted value must never blank the launcher or reopen the
+        // first-run chooser forever. Treat it as the safe new-skin fallback.
+        Some(_) => Some("console".into()),
+        None => None,
+    }
+}
+
+fn ui_preferences(settings: &LauncherSettings) -> UiPreferences {
+    UiPreferences {
+        skin: normalized_ui_skin(settings.ui_skin.as_deref()),
+    }
+}
+
+fn ui_preferences_from_text(text: &str) -> UiPreferences {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return UiPreferences {
+            skin: Some("console".into()),
+        };
+    };
+    match value.get("uiSkin") {
+        None => UiPreferences { skin: None },
+        Some(serde_json::Value::String(value)) => UiPreferences {
+            skin: normalized_ui_skin(Some(value)),
+        },
+        Some(_) => UiPreferences {
+            skin: Some("console".into()),
+        },
+    }
+}
+
+fn load_ui_preferences() -> UiPreferences {
+    let Ok(path) = settings_path() else {
+        return UiPreferences {
+            skin: Some("console".into()),
+        };
+    };
+    match fs::read_to_string(path) {
+        Ok(text) => ui_preferences_from_text(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UiPreferences { skin: None },
+        Err(_) => UiPreferences {
+            skin: Some("console".into()),
+        },
+    }
+}
+
 fn load_settings() -> LauncherSettings {
     let Ok(path) = settings_path() else {
         return LauncherSettings::default();
@@ -2748,10 +2819,10 @@ fn current_local_date() -> String {
 fn validate_display_name(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.chars().any(char::is_control) {
-        return Err("中转名称不能包含控制字符".into());
+        return Err("接入名称不能包含控制字符".into());
     }
     if trimmed.chars().count() > 80 {
-        return Err("中转名称不能超过 80 个字符".into());
+        return Err("接入名称不能超过 80 个字符".into());
     }
     Ok(trimmed.to_string())
 }
@@ -2779,6 +2850,21 @@ fn custom_relay_label_for_date(
 
 fn custom_relay_label(settings: &LauncherSettings, requested_name: &str) -> Result<String, String> {
     custom_relay_label_for_date(settings, requested_name, &current_local_date())
+}
+
+fn label_for_provider(
+    settings: &LauncherSettings,
+    provider: &ProviderPreset,
+    requested_name: &str,
+) -> Result<String, String> {
+    let requested_name = validate_display_name(requested_name)?;
+    if !requested_name.is_empty() {
+        return Ok(requested_name);
+    }
+    if provider.id == "custom" {
+        return custom_relay_label(settings, "");
+    }
+    Ok(provider.name.clone())
 }
 
 fn validate_base_url(value: &str) -> Result<String, String> {
@@ -4748,6 +4834,29 @@ fn get_launcher_settings() -> LauncherState {
     launcher_state(&load_settings())
 }
 
+#[tauri::command]
+fn get_ui_preferences() -> UiPreferences {
+    load_ui_preferences()
+}
+
+fn save_ui_skin_impl(ui_skin: String) -> Result<UiPreferences, String> {
+    let ui_skin = match ui_skin.as_str() {
+        "console" | "classic" => ui_skin,
+        _ => return Err("界面外观只能是 console 或 classic".into()),
+    };
+    let mut settings = load_settings();
+    settings.ui_skin = Some(ui_skin);
+    persist_launcher_settings(&settings)?;
+    Ok(ui_preferences(&settings))
+}
+
+#[tauri::command]
+async fn save_ui_skin(ui_skin: String) -> Result<UiPreferences, String> {
+    run_blocking(move || save_ui_skin_impl(ui_skin))
+        .await
+        .map_err(|error| ensure_error_prefix("runtime.ui_skin_save_failed", error))
+}
+
 fn save_provider_selection_impl(
     selected_provider_id: String,
     custom_base_url: String,
@@ -4834,11 +4943,7 @@ fn save_api_key_impl(
         &stored_model,
         &sanitized_aliases,
     )?;
-    let label = if selected_provider_id == "custom" {
-        custom_relay_label(&settings, &display_name)?
-    } else {
-        provider.name
-    };
+    let label = label_for_provider(&settings, &provider, &display_name)?;
     let entry = StoredApiKey {
         id: next_api_key_id(),
         provider_id: selected_provider_id,
@@ -5158,6 +5263,38 @@ fn delete_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     }
     persist_launcher_settings(&settings)?;
     Ok(launcher_state(&settings))
+}
+
+fn rename_api_key_in_settings(
+    settings: &mut LauncherSettings,
+    api_key_id: &str,
+    display_name: &str,
+) -> Result<(), String> {
+    let display_name = validate_display_name(display_name)?;
+    if display_name.is_empty() {
+        return Err("接入名称不能为空".into());
+    }
+    let entry = settings
+        .api_keys
+        .iter_mut()
+        .find(|entry| entry.id == api_key_id)
+        .ok_or_else(|| "没有找到这条 API Key".to_string())?;
+    entry.label = display_name;
+    Ok(())
+}
+
+fn rename_api_key_impl(api_key_id: String, display_name: String) -> Result<LauncherState, String> {
+    let mut settings = load_settings();
+    rename_api_key_in_settings(&mut settings, &api_key_id, &display_name)?;
+    persist_launcher_settings(&settings)?;
+    Ok(launcher_state(&settings))
+}
+
+#[tauri::command]
+async fn rename_api_key(api_key_id: String, display_name: String) -> Result<LauncherState, String> {
+    run_blocking(move || rename_api_key_impl(api_key_id, display_name))
+        .await
+        .map_err(|error| ensure_error_prefix("bridge.api_key_rename_failed", error))
 }
 
 #[tauri::command]
@@ -6388,6 +6525,8 @@ pub fn run() {
             apply_bridge_egress_fix,
             get_provider_catalog,
             get_launcher_settings,
+            get_ui_preferences,
+            save_ui_skin,
             save_provider_selection,
             save_api_key,
             activate_api_key,
@@ -6395,6 +6534,7 @@ pub fn run() {
             save_and_activate_aggregate_scheme,
             test_api_key,
             auto_map_api_key,
+            rename_api_key,
             delete_api_key
         ])
         .run(tauri::generate_context!())
@@ -7247,6 +7387,52 @@ mod tests {
     }
 
     #[test]
+    fn provider_catalog_v018_exact_snapshot() {
+        let catalog = provider_catalog();
+        let groups: Vec<_> = catalog
+            .iter()
+            .map(|group| (group.title.as_str(), group.tier.as_str()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                ("官方直连", "official"),
+                ("聚合与编程订阅", "aggregator"),
+                ("中转服务", "custom"),
+            ]
+        );
+
+        let entries: Vec<_> = catalog
+            .iter()
+            .flat_map(|group| {
+                group.providers.iter().map(move |provider| {
+                    (
+                        group.tier.as_str(),
+                        provider.id.as_str(),
+                        provider.name.as_str(),
+                        provider.badge.as_str(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("official", "glm", "GLM-5.2", "官方"),
+                ("official", "longcat", "LongCat", "官方"),
+                ("official", "deepseek", "DeepSeek", "官方"),
+                ("official", "minimax", "MiniMax", "官方"),
+                ("official", "claude", "Claude", "官方"),
+                ("official", "openai", "OpenAI / GPT", "官方"),
+                ("aggregator", "opencode-go", "OpenCode Go", "聚合"),
+                ("aggregator", "openrouter", "OpenRouter", "聚合"),
+                ("custom", "builtin-relay", "项目方自建中转", "自建"),
+                ("custom", "custom", "自定义中转", "自定义"),
+            ]
+        );
+    }
+
+    #[test]
     fn custom_url_must_be_https() {
         assert!(validate_base_url("").is_ok());
         assert!(validate_base_url("https://10521052.xyz/v1").is_ok());
@@ -7857,6 +8043,143 @@ mod tests {
     fn custom_relay_name_rejects_control_characters() {
         let settings = LauncherSettings::default();
         assert!(custom_relay_label_for_date(&settings, "坏\n名称", "2026-07-11").is_err());
+    }
+
+    #[test]
+    fn skin_choice_persists_and_invalid_values_fall_back_to_console() {
+        let legacy: LauncherSettings = serde_json::from_str(
+            r#"{"selectedProviderId":"deepseek","customBaseUrl":"","customConfirmed":false}"#,
+        )
+        .unwrap();
+        assert_eq!(ui_preferences(&legacy).skin, None);
+
+        let mut selected = LauncherSettings::default();
+        selected.ui_skin = Some("classic".into());
+        let encoded = serde_json::to_string(&selected).unwrap();
+        let decoded: LauncherSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(ui_preferences(&decoded).skin.as_deref(), Some("classic"));
+
+        selected.ui_skin = Some("unknown-skin".into());
+        assert_eq!(ui_preferences(&selected).skin.as_deref(), Some("console"));
+
+        let wrong_type: LauncherSettings = serde_json::from_str(
+            r#"{"selectedProviderId":"deepseek","customBaseUrl":"","customConfirmed":false,"uiSkin":{"bad":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(ui_preferences(&wrong_type).skin.as_deref(), Some("console"));
+        assert_eq!(
+            ui_preferences_from_text("{not-json").skin.as_deref(),
+            Some("console")
+        );
+        assert_eq!(
+            ui_preferences_from_text(r#"{"uiSkin":42}"#).skin.as_deref(),
+            Some("console")
+        );
+    }
+
+    #[test]
+    fn custom_label_is_accepted_for_any_provider_and_blank_uses_fallback() {
+        let settings = LauncherSettings::default();
+        let glm = provider_by_id("glm").unwrap();
+        let openrouter = provider_by_id("openrouter").unwrap();
+        assert_eq!(
+            label_for_provider(&settings, &glm, "  实验室备用  ").unwrap(),
+            "实验室备用"
+        );
+        assert_eq!(
+            label_for_provider(&settings, &openrouter, "夜间线路").unwrap(),
+            "夜间线路"
+        );
+        assert_eq!(label_for_provider(&settings, &glm, "").unwrap(), "GLM-5.2");
+        assert!(label_for_provider(&settings, &glm, &"长".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn rename_api_key_uses_shared_display_name_validation() {
+        let mut settings = LauncherSettings::default();
+        settings.api_keys.push(StoredApiKey {
+            id: "key-lab".into(),
+            provider_id: "glm".into(),
+            label: "GLM-5.2".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            model: "glm-5.2".into(),
+            custom_confirmed: false,
+            model_aliases: Vec::new(),
+            encrypted_api_key: "ciphertext".into(),
+        });
+        rename_api_key_in_settings(&mut settings, "key-lab", "  实验室备用  ").unwrap();
+        assert_eq!(settings.api_keys[0].label, "实验室备用");
+        assert!(rename_api_key_in_settings(&mut settings, "key-lab", "").is_err());
+        assert!(rename_api_key_in_settings(&mut settings, "key-lab", "坏\n名称").is_err());
+    }
+
+    #[test]
+    fn rename_changes_only_the_presentation_label() {
+        let original = StoredApiKey {
+            id: "key-lab".into(),
+            provider_id: "glm".into(),
+            label: "GLM-5.2".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            model: "glm-5.2".into(),
+            custom_confirmed: false,
+            model_aliases: vec![StoredModelAlias {
+                id: "decision".into(),
+                display_name: "决策".into(),
+                model: "glm-5.2".into(),
+            }],
+            encrypted_api_key: "ciphertext".into(),
+        };
+        let mut settings = LauncherSettings {
+            api_keys: vec![original.clone()],
+            ..LauncherSettings::default()
+        };
+
+        rename_api_key_in_settings(&mut settings, "key-lab", "实验室备用").unwrap();
+        let renamed = &settings.api_keys[0];
+        assert_eq!(renamed.label, "实验室备用");
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.provider_id, original.provider_id);
+        assert_eq!(renamed.base_url, original.base_url);
+        assert_eq!(renamed.model, original.model);
+        assert_eq!(renamed.model_aliases.len(), original.model_aliases.len());
+        assert_eq!(renamed.model_aliases[0].id, original.model_aliases[0].id);
+        assert_eq!(
+            renamed.model_aliases[0].display_name,
+            original.model_aliases[0].display_name
+        );
+        assert_eq!(
+            renamed.model_aliases[0].model,
+            original.model_aliases[0].model
+        );
+        assert_eq!(renamed.encrypted_api_key, original.encrypted_api_key);
+    }
+
+    #[test]
+    fn appearance_and_rename_commands_persist_settings_only() {
+        let source = include_str!("lib.rs");
+        for (start_marker, end_marker) in [
+            (
+                "fn save_ui_skin_impl(",
+                "#[tauri::command]\nasync fn save_ui_skin(",
+            ),
+            (
+                "fn rename_api_key_impl(",
+                "#[tauri::command]\nasync fn rename_api_key(",
+            ),
+        ] {
+            let start = source
+                .find(start_marker)
+                .expect("settings command should exist");
+            let end = source[start..]
+                .find(end_marker)
+                .map(|offset| start + offset)
+                .expect("settings command boundary should exist");
+            let implementation = &source[start..end];
+            assert!(implementation.contains("persist_launcher_settings(&settings)?"));
+            assert!(!implementation.contains("commit_launcher_settings_with_bridge"));
+            assert!(!implementation.contains("restart_bridge"));
+            assert!(!implementation.contains("apply_bridge_config"));
+        }
     }
 
     #[test]

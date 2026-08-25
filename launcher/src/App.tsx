@@ -29,15 +29,45 @@ import {
   type AllowStatus,
   type LaneState,
 } from "./laneContract";
+import { deleteConfirmationText, screenMessage } from "./uiPresentation";
 import "./App.css";
 
-const APP_VERSION = "V0.1.6";
+const APP_VERSION = "v0.1.8";
 const GRADE_STATUS_TIMEOUT_MS = 15_000;
 const NETWORK_QUALITY_TIMEOUT_MS = 25_000;
 const RUNTIME_UPDATE_TIMEOUT_MS = 45_000;
 const BRIDGE_EGRESS_TIMEOUT_MS = 75_000;
+const SCREEN_LINE_INTERVAL_MS = 3_000;
+const SCREEN_LINE_LIMIT = 40;
+const STARTUP_CAPTIONS = [
+  "检查 WSL2",
+  "启动 Bridge",
+  "校验运行时身份",
+  "启动 Claude Science",
+  "等待控制通道",
+] as const;
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
+type UiSkin = "console" | "classic";
+type ScreenTone = "normal" | "warning" | "fault" | "safe";
+
+interface UiPreferences {
+  skin?: string;
+}
+
+interface ScreenLine {
+  id: number;
+  time: string;
+  key: string;
+  value: string;
+  tone: ScreenTone;
+}
+
+interface ScreenCandidate {
+  key: string;
+  value: string;
+  tone?: ScreenTone;
+}
 
 interface NetworkQualityStatus {
   proxyState: "unknown" | "not_running" | "direct" | "reachable" | "unreachable" | "conflict" | "invalid";
@@ -315,7 +345,7 @@ const fallbackProviderGroups: ProviderGroup[] = [
     ],
   },
   {
-    title: "聚合平台",
+    title: "聚合与编程订阅",
     tier: "aggregator",
     providers: [
       { id: "opencode-go", name: "OpenCode Go", meta: "订阅 API Key", badge: "聚合", trust: "aggregator", protocol: "openai-compatible", baseUrl: "https://opencode.ai/zen/go/v1" },
@@ -499,6 +529,25 @@ const previewCustomRelayLabel = (entries: ApiKeyEntry[], requestedName: string) 
   return `${prefix}${String(next).padStart(2, "0")}`;
 };
 
+const previewLabelForProvider = (
+  entries: ApiKeyEntry[],
+  provider: Provider,
+  requestedName: string,
+) => {
+  const requested = requestedName.trim();
+  if (requested) return requested;
+  return provider.id === "custom"
+    ? previewCustomRelayLabel(entries, "")
+    : provider.name;
+};
+
+const screenTime = () => new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+}).format(new Date());
+
 const initialHealthCollapsed = () => {
   try {
     return window.localStorage.getItem("csa-health-collapsed") === "1";
@@ -608,6 +657,12 @@ const normalizedSchemes = (settings: LauncherSettings): AggregateScheme[] => {
 };
 
 function App() {
+  const [skin, setSkin] = useState<UiSkin>("console");
+  const [skinPreferenceResolved, setSkinPreferenceResolved] = useState(false);
+  const [showSkinChooser, setShowSkinChooser] = useState(false);
+  const [skinChoiceRequired, setSkinChoiceRequired] = useState(false);
+  const [skinSaving, setSkinSaving] = useState(false);
+  const [skinError, setSkinError] = useState("");
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
   const [allowStatus, setAllowStatus] = useState<AllowStatus>(initialAllowStatus);
   const [allowLoaded, setAllowLoaded] = useState(false);
@@ -636,6 +691,9 @@ function App() {
   const [draftRoleModels, setDraftRoleModels] = useState<DraftRoleModels>(emptyDraftRoleModels);
   const [draftAvailableModels, setDraftAvailableModels] = useState<string[]>([]);
   const [draftConfirmed, setDraftConfirmed] = useState(false);
+  const [deleteConfirmApiKeyId, setDeleteConfirmApiKeyId] = useState<string>();
+  const [renameApiKeyId, setRenameApiKeyId] = useState<string>();
+  const [renameDisplayName, setRenameDisplayName] = useState("");
   const [testPrompt, setTestPrompt] = useState("Reply only: OK");
   const [testResult, setTestResult] = useState<ApiKeyTestResult | undefined>();
   const [autoMapResult, setAutoMapResult] = useState<ApiKeyAutoMapResult | undefined>();
@@ -643,6 +701,7 @@ function App() {
   const [autoMappingKey, setAutoMappingKey] = useState(false);
   const [busy, setBusy] = useState(false);
   const [allowActionBusy, setAllowActionBusy] = useState(false);
+  const [repairBusy, setRepairBusy] = useState(false);
   const [networkChecking, setNetworkChecking] = useState(false);
   const [workWarnings, setWorkWarnings] = useState<string[]>([]);
   const [probeNotice, setProbeNotice] = useState<NonGatingProbeNotice>();
@@ -664,10 +723,15 @@ function App() {
   const [bridgeEgressApplyBusy, setBridgeEgressApplyBusy] = useState(false);
   const [bridgeEgressApplyError, setBridgeEgressApplyError] = useState("");
   const [bridgeEgressApplyResult, setBridgeEgressApplyResult] = useState<BridgeEgressApplyResult>();
+  const [screenLines, setScreenLines] = useState<ScreenLine[]>([]);
+  const [screenPaused, setScreenPaused] = useState(false);
+  const [screenHoverPaused, setScreenHoverPaused] = useState(false);
+  const [startupCaptionIndex, setStartupCaptionIndex] = useState(0);
   const allowRefreshEpoch = useRef(0);
   const gradeRefreshInFlight = useRef(false);
   const busyRef = useRef(false);
   const allowActionBusyRef = useRef(false);
+  const repairBusyRef = useRef(false);
   const networkCheckingRef = useRef(false);
   const statusCommitEpoch = useRef(0);
   const runtimeInitializationAttempted = useRef(false);
@@ -675,6 +739,12 @@ function App() {
   const bridgeEgressCheckingRef = useRef(false);
   const bridgeEgressApplyBusyRef = useRef(false);
   const bridgeEgressDialogRef = useRef<HTMLElement>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
+  const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const screenLogRef = useRef<HTMLDivElement>(null);
+  const screenLineIdRef = useRef(0);
+  const screenCandidateIndexRef = useRef(0);
   const laneStateRef = useRef<LaneState<AllowStatus, SystemStatus, WorkLaneValue | undefined>>(
     createLaneState(initialAllowStatus, initialStatus, undefined),
   );
@@ -700,6 +770,11 @@ function App() {
   const draftProvider = providers.find((provider) => provider.id === draftProviderId) || activeKeyProvider;
   const draftNeedsBaseUrl = draftProvider?.id === "custom";
   const draftIsThirdParty = draftProvider?.trust.startsWith("untrusted") || false;
+  const draftModelOptions = uniqueModels(
+    draftAvailableModels,
+    [draftModel],
+    Object.values(draftRoleModels),
+  );
   const deepNetworkReady = status.network.deepChecked && status.network.sandboxEgressState === "ok";
   const primaryButton = useMemo(
     () => primaryButtonView(allowStatus, allowLoaded, allowActionBusy),
@@ -707,6 +782,7 @@ function App() {
   );
   const canOpenClaude = primaryButton.action === "open";
   const mutationBusy = busy || networkChecking;
+  const appearanceBlocked = busy || allowActionBusy || repairBusy;
   const baseSummary = status.state === "running" && !deepNetworkReady
     ? {
       title: "Claude Science 已准备好",
@@ -736,6 +812,10 @@ function App() {
     () => bridgeEgressReport?.candidates?.find((candidate) => candidate.recommended),
     [bridgeEgressReport],
   );
+
+  useEffect(() => {
+    document.documentElement.dataset.skin = skin;
+  }, [skin]);
 
   const commitAllowStatus = useCallback((next: AllowStatus) => {
     const reduced = laneReducer(laneStateRef.current, { lane: "allow", value: next });
@@ -863,8 +943,45 @@ function App() {
         setError(String(reason));
       }
     }
+
+    async function loadSkinPreference() {
+      if (!isTauri) {
+        setSkin("console");
+        setSkinChoiceRequired(true);
+        setShowSkinChooser(true);
+        setSkinPreferenceResolved(true);
+        return;
+      }
+      try {
+        const preferences = await invoke<UiPreferences>("get_ui_preferences");
+        if (preferences.skin === "classic" || preferences.skin === "console") {
+          setSkin(preferences.skin);
+          setSkinChoiceRequired(false);
+          setShowSkinChooser(false);
+          return;
+        }
+        if (preferences.skin === undefined || preferences.skin === null) {
+          setSkin("console");
+          setSkinChoiceRequired(true);
+          setShowSkinChooser(true);
+          return;
+        }
+        setSkin("console");
+        setSkinChoiceRequired(false);
+        setShowSkinChooser(false);
+      } catch {
+        // Appearance is presentation-only. A read failure must never blank or
+        // gate the launcher, so continue with the console skin.
+        setSkin("console");
+        setSkinChoiceRequired(false);
+        setShowSkinChooser(false);
+      } finally {
+        setSkinPreferenceResolved(true);
+      }
+    }
     void paintAllowThenStartBackground();
     void loadProviderState();
+    void loadSkinPreference();
     return () => {
       cancelled = true;
       if (gradeTimer !== undefined) window.clearInterval(gradeTimer);
@@ -890,6 +1007,41 @@ function App() {
       previouslyFocused?.focus();
     };
   }, [showBridgeEgressAssistant]);
+
+  useEffect(() => {
+    if (!deleteConfirmApiKeyId) return;
+    const focusFrame = window.requestAnimationFrame(() => deleteCancelRef.current?.focus());
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [deleteConfirmApiKeyId]);
+
+  useEffect(() => {
+    if (!renameApiKeyId) return;
+    const focusFrame = window.requestAnimationFrame(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [renameApiKeyId]);
+
+  async function chooseSkin(nextSkin: UiSkin) {
+    if (skinSaving || busyRef.current || allowActionBusyRef.current || repairBusyRef.current) return;
+    setSkinSaving(true);
+    setSkinError("");
+    try {
+      if (isTauri) {
+        const saved = await invoke<UiPreferences>("save_ui_skin", { uiSkin: nextSkin });
+        setSkin(saved.skin === "classic" ? "classic" : "console");
+      } else {
+        setSkin(nextSkin);
+      }
+      setSkinChoiceRequired(false);
+      setShowSkinChooser(false);
+    } catch (reason) {
+      setSkinError(String(reason));
+    } finally {
+      setSkinSaving(false);
+    }
+  }
 
   function updateBusy(value: boolean) {
     if (value) {
@@ -1078,6 +1230,7 @@ function App() {
   }
 
   async function runAction(command: "start_services" | "stop_services" | "restart_services" | "stop_legacy_windows_bridge") {
+    if (command === "restart_services") return runRepairAction();
     if (allowActionBusyRef.current) return;
     updateAllowActionBusy(true);
     setError("");
@@ -1094,6 +1247,30 @@ function App() {
         if (!actionFailed) setError(String(reason));
       }
       updateAllowActionBusy(false);
+      void refreshGrade();
+    }
+  }
+
+  async function runRepairAction() {
+    if (repairBusyRef.current) return;
+    statusCommitEpoch.current += 1;
+    repairBusyRef.current = true;
+    setRepairBusy(true);
+    setError("");
+    let actionFailed = false;
+    try {
+      await invoke<unknown>("restart_services");
+    } catch (reason) {
+      actionFailed = true;
+      setError(String(reason));
+    } finally {
+      try {
+        await refreshAllow();
+      } catch (reason) {
+        if (!actionFailed) setError(String(reason));
+      }
+      repairBusyRef.current = false;
+      setRepairBusy(false);
       void refreshGrade();
     }
   }
@@ -1128,9 +1305,7 @@ function App() {
       const entry: ApiKeyEntry = {
         id,
         providerId: draftProvider.id,
-        label: draftProvider.id === "custom"
-          ? previewCustomRelayLabel(apiKeys, draftDisplayName)
-          : draftProvider.name,
+        label: previewLabelForProvider(apiKeys, draftProvider, draftDisplayName),
         baseUrl: draftBaseUrl,
         model: draftModel,
         customConfirmed: draftConfirmed,
@@ -1299,6 +1474,17 @@ function App() {
     } finally {
       setAutoMappingKey(false);
     }
+  }
+
+  function autoMatchDraftModels() {
+    if (draftAvailableModels.length === 0) {
+      void autoMapDraftApiKey();
+      return;
+    }
+    applyDraftRoleModels(
+      inferDraftRoleModels(draftAvailableModels, draftModel, draftRoleModels.fast),
+      draftAvailableModels,
+    );
   }
 
   async function activateKey(apiKeyId: string) {
@@ -1483,7 +1669,7 @@ function App() {
   }
 
   async function deleteKey(apiKeyId: string) {
-    if (busyRef.current || networkCheckingRef.current) return;
+    if (busyRef.current || networkCheckingRef.current) return false;
     if (!isTauri) {
       setError("");
       setApiKeys((current) => current.filter((item) => item.id !== apiKeyId));
@@ -1491,16 +1677,77 @@ function App() {
         ? { ...binding, providerId: "", apiKeyId: "", model: "" }
         : binding));
       setRoleMappingsDirty(true);
+      return true;
+    }
+    if (!tryBeginMutation()) return false;
+    setError("");
+    let deleted = false;
+    try {
+      applyLauncherState(await invoke<LauncherSettings>("delete_api_key", { apiKeyId }));
+      deleted = true;
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      updateBusy(false);
+    }
+    return deleted;
+  }
+
+  function beginRenameKey(entry: ApiKeyEntry) {
+    setDeleteConfirmApiKeyId(undefined);
+    setRenameApiKeyId(entry.id);
+    setRenameDisplayName(entry.label);
+    setError("");
+  }
+
+  function cancelRenameKey() {
+    setRenameApiKeyId(undefined);
+    setRenameDisplayName("");
+  }
+
+  async function renameKey(apiKeyId: string) {
+    if (busyRef.current || networkCheckingRef.current) return;
+    const displayName = renameDisplayName.trim();
+    if (!displayName) {
+      setError("接入名称不能为空。");
+      return;
+    }
+    if (!isTauri) {
+      setError("");
+      setApiKeys((current) => current.map((entry) => entry.id === apiKeyId
+        ? { ...entry, label: displayName }
+        : entry));
+      cancelRenameKey();
       return;
     }
     if (!tryBeginMutation()) return;
     setError("");
     try {
-      applyLauncherState(await invoke<LauncherSettings>("delete_api_key", { apiKeyId }));
+      applyLauncherState(await invoke<LauncherSettings>("rename_api_key", {
+        apiKeyId,
+        displayName,
+      }));
+      cancelRenameKey();
     } catch (reason) {
       setError(String(reason));
     } finally {
       updateBusy(false);
+    }
+  }
+
+  function beginDeleteKey(apiKeyId: string) {
+    setRenameApiKeyId(undefined);
+    setDeleteConfirmApiKeyId(apiKeyId);
+  }
+
+  function cancelDeleteKey(apiKeyId: string) {
+    setDeleteConfirmApiKeyId(undefined);
+    window.requestAnimationFrame(() => deleteButtonRefs.current.get(apiKeyId)?.focus());
+  }
+
+  async function confirmDeleteKey(apiKeyId: string) {
+    if (await deleteKey(apiKeyId)) {
+      setDeleteConfirmApiKeyId(undefined);
     }
   }
 
@@ -1785,36 +2032,309 @@ function App() {
     ? `${status.wslStoragePath}${typeof status.wslStorageFreeGb === "number" ? ` · 宿主盘剩余 ${status.wslStorageFreeGb.toFixed(1)} GB` : ""}${typeof status.wslRootFreeGb === "number" ? ` · Linux 剩余 ${status.wslRootFreeGb.toFixed(1)} GB` : ""}`
     : "未定位 WSL 虚拟磁盘";
 
+  const screenReady = canOpenClaude;
+  const screenStarting = allowActionBusy && !screenReady && primaryButton.action === "start";
+  const screenTitle = screenReady
+    ? "Claude Science 已就绪"
+    : screenStarting
+      ? STARTUP_CAPTIONS[startupCaptionIndex]
+      : "待机";
+  const screenDetail = screenReady
+    ? "8765 · 受管运行时 · Bridge 0.1.6"
+    : screenStarting
+      ? "正在准备唯一受管运行时"
+      : "按「启动」开始";
+
+  const screenCandidates = useMemo<ScreenCandidate[]>(() => {
+    const rows: ScreenCandidate[] = [
+      {
+        key: "WSL2",
+        value: allowStatus.wslInstalled
+          ? `${allowStatus.distro || "默认发行版"} 就绪`
+          : "未检测到可用发行版",
+        tone: allowStatus.wslInstalled ? "normal" : "warning",
+      },
+      {
+        key: "运行时",
+        value: status.runtimeReady ? "受管运行时已准备" : "需要体检或安装",
+        tone: status.runtimeReady ? "normal" : "warning",
+      },
+      {
+        key: "Bridge",
+        value: status.bridgeHealthy ? `${bridgeDetail} · 身份已验证` : bridgeDetail,
+        tone: status.bridgeHealthy ? "normal" : "warning",
+      },
+      {
+        key: "端口",
+        value: allowStatus.claudeRunning
+          ? `8765 / 8766${allowStatus.claudePid ? ` · PID ${allowStatus.claudePid}` : ""}`
+          : claudeDetail,
+        tone: allowStatus.claudeRunning ? "normal" : "warning",
+      },
+      {
+        key: "沙盒",
+        value: `${status.network.sandboxForwarderCount}/${status.network.sandboxForwarderExpectedCount} 组 HTTP/SOCKS · ${status.network.sandboxForwarderTopologyState}`,
+        tone: status.network.sandboxForwarderCount === status.network.sandboxForwarderExpectedCount
+          ? "normal"
+          : "warning",
+      },
+      {
+        key: "出口",
+        value: networkDetail,
+        tone: networkOk ? "normal" : "warning",
+      },
+      {
+        key: "当前 Key",
+        value: activeAggregateSchemeId
+          ? `${activeAggregateSchemeId === "scheme-1" ? "方案一" : "方案二"} · 三个 Key 分工`
+          : activeKeyEntry
+            ? `${activeKeyEntry.label} · ${activeKeyProvider?.name || activeKeyEntry.providerId}`
+            : "尚未添加接入",
+        tone: activeAggregateSchemeId || activeKeyEntry ? "normal" : "warning",
+      },
+      {
+        key: "存储",
+        value: storageDetail,
+        tone: status.storageWarning ? "warning" : "normal",
+      },
+    ];
+
+    const addFault = (key: string, value: string, muted = false) => {
+      if (!value) return;
+      if (screenReady && !muted) {
+        rows.push({ key, value, tone: "fault" });
+        rows.push({ key: "主控", value: "仍可打开 Claude Science", tone: "safe" });
+      } else {
+        rows.push({ key, value, tone: "warning" });
+      }
+    };
+    if (probeNotice) addFault("探针", screenMessage(probeNotice.message), probeNotice.muted);
+    status.warnings.forEach((warning) => rows.push({ key: "诊断", value: screenMessage(warning), tone: "warning" }));
+    workWarnings.forEach((warning) => rows.push({ key: "车间", value: screenMessage(warning), tone: "warning" }));
+    if (error) addFault("错误", screenMessage(error));
+    return rows;
+  }, [
+    activeAggregateSchemeId,
+    activeKeyEntry,
+    activeKeyProvider,
+    allowStatus.claudePid,
+    allowStatus.claudeRunning,
+    allowStatus.distro,
+    allowStatus.wslInstalled,
+    bridgeDetail,
+    claudeDetail,
+    error,
+    networkDetail,
+    networkOk,
+    probeNotice,
+    screenReady,
+    status.bridgeHealthy,
+    status.network.sandboxForwarderCount,
+    status.network.sandboxForwarderExpectedCount,
+    status.network.sandboxForwarderTopologyState,
+    status.runtimeReady,
+    status.storageWarning,
+    status.warnings,
+    storageDetail,
+    workWarnings,
+  ]);
+
+  useEffect(() => {
+    if (!screenStarting) {
+      setStartupCaptionIndex(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setStartupCaptionIndex((current) => Math.min(current + 1, STARTUP_CAPTIONS.length - 1));
+    }, SCREEN_LINE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [screenStarting]);
+
+  useEffect(() => {
+    if (skin !== "console" || !screenReady || screenPaused || screenHoverPaused || screenCandidates.length === 0) return;
+    const appendNext = () => {
+      const index = screenCandidateIndexRef.current % screenCandidates.length;
+      const candidate = screenCandidates[index];
+      const selected = [candidate];
+      let consumed = 1;
+      const next = screenCandidates[(index + 1) % screenCandidates.length];
+      if (candidate.tone === "fault" && next?.tone === "safe") {
+        selected.push(next);
+        consumed = 2;
+      }
+      screenCandidateIndexRef.current = (index + consumed) % screenCandidates.length;
+      const time = screenTime();
+      setScreenLines((current) => [
+        ...current,
+        ...selected.map((item) => ({
+          ...item,
+          id: ++screenLineIdRef.current,
+          time,
+          tone: item.tone || "normal",
+        })),
+      ].slice(-SCREEN_LINE_LIMIT));
+    };
+    appendNext();
+    const timer = window.setInterval(appendNext, SCREEN_LINE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [screenCandidates, screenHoverPaused, screenPaused, screenReady, skin]);
+
+  useEffect(() => {
+    if (screenPaused || screenHoverPaused) return;
+    const log = screenLogRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [screenHoverPaused, screenLines, screenPaused]);
+
   return (
-    <main className="app-shell">
-      <header className="topbar">
+    <main className="app-shell" data-skin={skin}>
+      {!skinPreferenceResolved && (
+        <div className="skin-loading-backdrop" role="status" aria-live="polite">
+          <div><span className="nameplate-led starting" aria-hidden="true" />正在读取界面设置…</div>
+        </div>
+      )}
+      {showSkinChooser && (
+        <div className="skin-choice-backdrop" role="presentation">
+          <section
+            className="skin-choice-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="skin-choice-title"
+          >
+            <div className="skin-choice-head">
+              <div>
+                <span className="eyebrow">CSA Launcher</span>
+                <h2 id="skin-choice-title">选择界面外观</h2>
+                <p>两套外观使用同一组功能；选择会保存在启动器设置中。</p>
+              </div>
+              {!skinChoiceRequired && (
+                <button className="quiet-button" onClick={() => setShowSkinChooser(false)} disabled={skinSaving}>关闭</button>
+              )}
+            </div>
+            <div className="skin-choice-grid">
+              <article className={`skin-option ${skin === "console" ? "selected" : ""}`}>
+                <div className="skin-thumbnail console-thumbnail" aria-hidden="true">
+                  <span className="thumb-screen">&gt;_ 就绪</span>
+                  <span className="thumb-key" /><span className="thumb-key" /><span className="thumb-key" />
+                </div>
+                <h3>终端控制台</h3>
+                <p>一块屏说状态，实体按键操作</p>
+                <button onClick={() => void chooseSkin("console")} disabled={skinSaving || appearanceBlocked}>
+                  使用终端控制台
+                </button>
+              </article>
+              <article className={`skin-option ${skin === "classic" ? "selected" : ""}`}>
+                <div className="skin-thumbnail classic-thumbnail" aria-hidden="true">
+                  <span /><span /><span /><span />
+                </div>
+                <h3>经典面板</h3>
+                <p>分区卡片，信息平铺</p>
+                <button onClick={() => void chooseSkin("classic")} disabled={skinSaving || appearanceBlocked}>
+                  使用经典面板
+                </button>
+              </article>
+            </div>
+            {skinError && <p className="skin-choice-error" role="alert">{skinError}</p>}
+          </section>
+        </div>
+      )}
+
+      <div
+        className="app-content"
+        aria-hidden={!skinPreferenceResolved || showSkinChooser}
+        inert={!skinPreferenceResolved || showSkinChooser}
+      >
+
+      <header className="topbar nameplate">
+        <span className={`nameplate-led ${screenReady ? "ready" : screenStarting ? "starting" : "standby"}`} aria-hidden="true" />
         <div className="brand-mark">CSA</div>
-        <div>
+        <div className="brand-copy">
           <div className="brand-title-row">
             <h1>CSA - Claude Science Assistant</h1>
             <span className="app-version" aria-label={`启动器版本 ${APP_VERSION}`}>{APP_VERSION}</span>
           </div>
           <p>三模型聚合，一个安全启动入口</p>
         </div>
-        <button className="quiet-button" onClick={refresh} disabled={mutationBusy}>刷新状态</button>
+        <div className="topbar-actions">
+          <button className="quiet-button" onClick={refresh} disabled={mutationBusy}>刷新状态</button>
+        </div>
       </header>
 
       <section className={`hero state-${status.state}`}>
         <div className="status-orb"><span /></div>
         <div className="hero-copy">
           <span className="eyebrow">系统状态</span>
-          <h2>{summary.title}</h2>
-          <p>{summary.detail}</p>
+          <h2>{skin === "console" ? screenTitle : summary.title}<span className="screen-cursor" aria-hidden="true">▮</span></h2>
+          <p>{skin === "console" ? screenDetail : summary.detail}</p>
+          {screenStarting && (
+            <div className="startup-progress" role="progressbar" aria-label="启动进度" aria-valuemin={0} aria-valuemax={5} aria-valuenow={startupCaptionIndex + 1}>
+              <span style={{ width: `${((startupCaptionIndex + 1) / STARTUP_CAPTIONS.length) * 100}%` }} />
+            </div>
+          )}
+          {screenReady && <>
+            <div className="screen-readout-head">
+              <span>实时读数 · 最近 {SCREEN_LINE_LIMIT} 行</span>
+              <button type="button" onClick={() => setScreenPaused((current) => !current)} aria-pressed={screenPaused}>
+                {screenPaused ? "继续" : "暂停"}
+              </button>
+            </div>
+            <div
+              className="screen-readout"
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions"
+              ref={screenLogRef}
+              onMouseEnter={() => setScreenHoverPaused(true)}
+              onMouseLeave={() => setScreenHoverPaused(false)}
+            >
+              {screenLines.length === 0 && <div className="screen-line tone-normal"><span>--:--:--</span><strong>系统</strong><em>等待状态读数…</em></div>}
+              {screenLines.map((line) => (
+                <div className={`screen-line tone-${line.tone}`} key={line.id}>
+                  <span>{line.time}</span>
+                  <strong>{line.key}</strong>
+                  <em>{line.value}</em>
+                </div>
+              ))}
+            </div>
+            {(screenPaused || screenHoverPaused) && <small className="screen-pause-state">读数已暂停，完整诊断仍保留在下方。</small>}
+          </>}
         </div>
-        <button
-          className="primary-button"
-          onClick={primaryAction}
-          disabled={primaryButton.disabled}
-        >
-          {primaryButton.label}
-        </button>
       </section>
 
+      <section className="control-deck" aria-label="主控与功能键">
+        <div className="primary-control">
+          <span>主控</span>
+          <button
+            className="primary-button"
+            onClick={primaryAction}
+            disabled={primaryButton.disabled}
+          >
+            {primaryButton.label}
+          </button>
+        </div>
+        <div className="function-keys">
+          <button type="button" onClick={runNetworkQualityCheck} disabled={networkChecking || !allowStatus.claudeRunning}>
+            <span>F1</span><strong>{networkChecking ? "检测中…" : "深度检测"}</strong>
+          </button>
+          <button type="button" onClick={openBridgeEgressAssistant} disabled={bridgeEgressChecking}>
+            <span>F2</span><strong>{bridgeEgressChecking ? "体检中…" : "能力体检"}</strong>
+          </button>
+          <button
+            type="button"
+            onClick={() => runAction("restart_services")}
+            disabled={repairBusy || !allowStatus.wslInstalled || status.restartBlocked}
+            title="备份配置、收窄持久 DrvFS 写授权，并重启受管 Bridge 与 Claude Science"
+          >
+            <span>F3</span><strong>{repairBusy ? "修复中…" : "修复并重启"}</strong>
+          </button>
+        </div>
+      </section>
+
+      <details className="diagnostics-drawer" open={skin === "classic" ? true : undefined}>
+        <summary>
+          <span>完整诊断与维护</span>
+          <small>环境状态、错误详情、存储建议与运行时更新</small>
+        </summary>
+        <div className="diagnostics-content">
       <section className={`health-panel ${healthCollapsed ? "collapsed" : ""}`} aria-label="环境检查">
         <div className="health-panel-head">
           <div>
@@ -1897,6 +2417,28 @@ function App() {
           )}
         </section>
       )}
+
+      <section className="runtime-update-panel" aria-label="Claude Science 运行时更新">
+        <div className="runtime-update-copy">
+          <span className="eyebrow">Runtime Update</span>
+          <h2>Claude Science {runtimeUpdate?.bundledVersion || "0.1.25"}</h2>
+          <p>{runtimeUpdate
+            ? `官方 stable ${runtimeUpdate.stable.version} · latest ${runtimeUpdate.latest.version}`
+            : "CSA 已验证版 0.1.25 · 可读取官方索引检查新版本"}</p>
+          {runtimeError && <small className="runtime-update-error">{runtimeError}</small>}
+        </div>
+        <div className="runtime-update-state">
+          <strong>{runtimeUpdate?.updateAvailable ? "发现官方新版本" : runtimeUpdate ? "已是 CSA 推荐版" : "尚未检查"}</strong>
+          <small>{runtimeUpdate?.note || "检查不会安装或替换运行时"}</small>
+        </div>
+        <div className="runtime-update-actions">
+          <button onClick={checkRuntimeUpdate} disabled={runtimeChecking}>{runtimeChecking ? "检查中…" : "检查更新"}</button>
+          <button onClick={() => openRuntimePrompt("upgrade")} disabled={!runtimeUpdate}>升级 Prompt</button>
+          <button onClick={() => openRuntimePrompt("rollback")}>回退 Prompt</button>
+        </div>
+      </section>
+        </div>
+      </details>
 
       {showMigrationAssistant && (
         <div className="migration-backdrop" role="presentation" onMouseDown={(event) => {
@@ -2116,38 +2658,18 @@ function App() {
         </div>
       )}
 
-      <section className="runtime-update-panel" aria-label="Claude Science 运行时更新">
-        <div className="runtime-update-copy">
-          <span className="eyebrow">Runtime Update</span>
-          <h2>Claude Science {runtimeUpdate?.bundledVersion || "0.1.25"}</h2>
-          <p>{runtimeUpdate
-            ? `官方 stable ${runtimeUpdate.stable.version} · latest ${runtimeUpdate.latest.version}`
-            : "CSA 已验证版 0.1.25 · 可读取官方索引检查新版本"}</p>
-          {runtimeError && <small className="runtime-update-error">{runtimeError}</small>}
-        </div>
-        <div className="runtime-update-state">
-          <strong>{runtimeUpdate?.updateAvailable ? "发现官方新版本" : runtimeUpdate ? "已是 CSA 推荐版" : "尚未检查"}</strong>
-          <small>{runtimeUpdate?.note || "检查不会安装或替换运行时"}</small>
-        </div>
-        <div className="runtime-update-actions">
-          <button onClick={checkRuntimeUpdate} disabled={runtimeChecking}>{runtimeChecking ? "检查中…" : "检查更新"}</button>
-          <button onClick={() => openRuntimePrompt("upgrade")} disabled={!runtimeUpdate}>升级 Prompt</button>
-          <button onClick={() => openRuntimePrompt("rollback")}>回退 Prompt</button>
-        </div>
-      </section>
-
       <section className={`kit-section ${accessMode === "api" && apiSectionCollapsed ? "collapsed" : ""}`}>
         <div className="section-heading">
           <div>
-            <span className="eyebrow">{accessMode === "api" ? "API Key" : "Aggregate"}</span>
-            <h2>{accessMode === "api" ? "API 接入" : "聚合模式"}</h2>
+            <span className="eyebrow">Model Access</span>
+            <h2>接入模型</h2>
           </div>
           <div className="section-heading-actions">
             <p>{accessMode === "aggregate"
               ? `${activeAggregateSchemeId ? `${activeAggregateSchemeId === "scheme-1" ? "方案一" : "方案二"}已生效` : "尚未生效"} · 三个模型槽同时接入`
               : apiSectionCollapsed
-                ? `${activeKeyEntry?.label || "未添加供应商"} · 已保存 ${apiKeys.length} 个供应商`
-                : "从供应商列表选择一条 API 接入；切换后会重新加载并验证 Bridge。"}</p>
+                ? `${activeKeyEntry?.label || "未添加接入"} · 我的接入 ${apiKeys.length} 条`
+                : `我的接入 ${apiKeys.length} 条 · 启用前会再次确认`}</p>
             {accessMode === "api" && <button
               type="button"
               aria-expanded={!apiSectionCollapsed}
@@ -2169,86 +2691,99 @@ function App() {
             disabled={busy}
             onClick={() => void switchAccessMode("api")}
           >
-            API 接入
+            用一个 Key
           </button>
           <button
             className={accessMode === "aggregate" ? "active" : ""}
             disabled={busy}
             onClick={() => void switchAccessMode("aggregate")}
           >
-            聚合模式
+            三个 Key 分工
           </button>
         </div>
 
         {accessMode === "api" && !apiSectionCollapsed && <div id="api-key-section-content">
         <div className="kit-layout">
-          <article className="current-kit-card">
-            <div className="kit-mark">{providerInitial(activeKeyEntry ? activeKeyProvider : undefined)}</div>
-            <div className="kit-main">
-              <span className="eyebrow">正在使用</span>
-              <h3>{activeKeyEntry ? activeKeyEntry.label : "未添加供应商"}</h3>
-              <p>{activeKeyEntry ? activeKeyProvider?.meta : "请添加一个供应商后再启动服务"}</p>
-              <div className="kit-meta">
-                {activeKeyEntry && activeKeyProvider && <span className={`trust-badge badge-${badgeClass[activeKeyProvider.badge]}`}>{activeKeyProvider.badge}</span>}
-                {activeKeyEntry?.hasSecret && <span>Key 已加密保存</span>}
-                {activeKeyEntry?.model && <span>模型 {activeKeyEntry.model}</span>}
-                {(activeKeyEntry?.modelAliases?.length ?? 0) > 0 && <span>映射 {activeKeyEntry?.modelAliases?.length ?? 0} 条</span>}
-                {activeKeyEntry?.baseUrl && <span>{activeKeyEntry.baseUrl}</span>}
-              </div>
-            </div>
-            <button className="secondary-button" onClick={openKeyPicker} disabled={busy}>更换 / 添加供应商</button>
-          </article>
-
-          <aside className="kit-queue">
+          <aside className="kit-queue" aria-label="我的接入">
             <div className="kit-queue-head">
               <div>
-                <strong>API Key 列表</strong>
-                <small>按添加顺序排列，一次只激活一条</small>
+                <strong>我的接入</strong>
+                <small>{apiKeys.length} 条 · 一次只启用一条</small>
               </div>
-              <button onClick={openKeyPicker} disabled={busy}>添加供应商</button>
+              <button onClick={openKeyPicker} disabled={busy}>＋ 新增接入</button>
             </div>
             <div className="kit-queue-scroll">
-              {apiKeys.length === 0 && <div className="key-empty">还没有供应商，点击下方按钮添加。</div>}
+              {apiKeys.length === 0 && <div className="key-empty">还没有接入，点击「＋ 新增接入」开始。</div>}
               {apiKeys.map((entry, index) => {
                 const provider = providers.find((item) => item.id === entry.providerId);
                 const active = entry.active;
                 const pending = entry.id === pendingApiKeyId && !active;
+                const referencedByActiveScheme = Boolean(
+                  activeAggregateSchemeId
+                  && aggregateSchemes
+                    .find((scheme) => scheme.id === activeAggregateSchemeId)
+                    ?.routes.some((route) => route.apiKeyId === entry.id),
+                );
+                const confirmingDelete = entry.id === deleteConfirmApiKeyId;
+                const renaming = entry.id === renameApiKeyId;
                 return (
                   <div
                     className={`kit-row ${active ? "active" : ""} ${pending ? "pending" : ""}`}
                     key={entry.id}
-                    role="button"
-                    tabIndex={busy ? -1 : 0}
-                    aria-pressed={entry.id === pendingApiKeyId}
-                    onClick={() => preselectKey(entry.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        preselectKey(entry.id);
-                      }
-                    }}
                   >
-                    <span className="kit-index">{String(index + 1).padStart(2, "0")}</span>
-                    <span className="kit-row-copy">
-                      <strong>{entry.label}</strong>
-                      <small>{provider?.badge || "API"} · {entry.hasSecret ? "已加密保存" : "官方登录"}</small>
-                    </span>
-                    <span className="key-row-actions">
+                    <div className="key-entry-main">
+                      <span className="kit-index">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="kit-row-copy">
+                        <strong>{entry.label}</strong>
+                        <small>{provider?.name || entry.providerId} · {entry.hasSecret ? "••••••••" : "官方登录"} · 决策 {entry.model || "未选择"}</small>
+                      </span>
                       {active
                         ? <span className="active-key-label">使用中</span>
                         : pending
                           ? <span className="pending-key-label">待生效</span>
                           : null}
-                      <button
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void deleteKey(entry.id);
-                        }}
-                        disabled={mutationBusy || active}
-                      >
-                        删除
-                      </button>
-                    </span>
+                    </div>
+
+                    {renaming ? (
+                      <div className="rename-key-row">
+                        <label>
+                          <span>接入名称</span>
+                          <input
+                            ref={renameInputRef}
+                            value={renameDisplayName}
+                            maxLength={80}
+                            onChange={(event) => setRenameDisplayName(event.currentTarget.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") void renameKey(entry.id);
+                              if (event.key === "Escape") cancelRenameKey();
+                            }}
+                          />
+                        </label>
+                        <div><button onClick={cancelRenameKey} disabled={busy}>取消</button><button onClick={() => void renameKey(entry.id)} disabled={busy}>保存</button></div>
+                      </div>
+                    ) : confirmingDelete ? (
+                      <div className="delete-confirm-row" role="group" aria-label={`删除 ${entry.label}`}>
+                        <p>{deleteConfirmationText(entry.label)}</p>
+                        <div>
+                          <button ref={deleteCancelRef} onClick={() => cancelDeleteKey(entry.id)} disabled={busy}>取消</button>
+                          <button className="danger-button" onClick={() => void confirmDeleteKey(entry.id)} disabled={busy}>确认删除</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="key-row-actions">
+                        <button onClick={() => preselectKey(entry.id)} disabled={mutationBusy || active}>启用</button>
+                        <button onClick={() => beginRenameKey(entry)} disabled={mutationBusy}>重命名</button>
+                        <button
+                          ref={(node) => {
+                            if (node) deleteButtonRefs.current.set(entry.id, node);
+                            else deleteButtonRefs.current.delete(entry.id);
+                          }}
+                          onClick={() => beginDeleteKey(entry.id)}
+                          disabled={mutationBusy || active || referencedByActiveScheme}
+                          title={referencedByActiveScheme ? "该接入正在被当前聚合方案使用" : undefined}
+                        >删除</button>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -2269,8 +2804,8 @@ function App() {
               </div>
             </div>
             <button className="add-kit-row" onClick={openKeyPicker} disabled={busy}>
-              <span>+</span>
-              添加新的供应商
+              <span>＋</span>
+              新增接入
             </button>
           </aside>
         </div>
@@ -2380,17 +2915,18 @@ function App() {
         </div>}
 
         {showKeyPicker && (
-          <div className="kit-picker" role="dialog" aria-label="添加供应商">
+          <div className="kit-picker" role="dialog" aria-label="新增接入">
             <div className="kit-picker-head">
               <div>
-                <span className="eyebrow">添加供应商</span>
-                <h3>从模板选择，再填入你的 Key</h3>
+                <span className="eyebrow">＋ 新增接入</span>
+                <h3>四步完成一个模型接入</h3>
               </div>
               <button className="quiet-button" onClick={() => setShowKeyPicker(false)} disabled={busy}>关闭</button>
             </div>
 
             <div className="kit-picker-grid">
               <div className="template-list">
+                <div className="add-step-heading"><span>①</span><strong>选供应商</strong></div>
                 {providerGroups.map((group, groupIndex) => (
                   <div className="template-group" key={group.title}>
                     <h4>{group.title}</h4>
@@ -2414,6 +2950,7 @@ function App() {
                         </button>
                       );
                     })}
+                    {group.tier === "custom" && <p className="relay-domain-hint">中转服务要先确认域名才能保存 Key。</p>}
                   </div>
                 ))}
               </div>
@@ -2426,6 +2963,8 @@ function App() {
                     <small>{draftProvider?.protocol}</small>
                   </div>
                 </div>
+
+                <div className="add-step-heading"><span>②</span><strong>粘贴 API Key</strong></div>
 
                 {draftProvider?.id === "claude" ? (
                   <div className="relay-panel">
@@ -2453,19 +2992,6 @@ function App() {
                   </label>
                 )}
 
-                {draftNeedsBaseUrl && (
-                  <label>
-                    中转名称
-                    <input
-                      value={draftDisplayName}
-                      maxLength={80}
-                      placeholder="可留空；自动使用“自定义中转 + 日期 + 序号”"
-                      spellCheck={false}
-                      onChange={(event) => setDraftDisplayName(event.currentTarget.value)}
-                    />
-                  </label>
-                )}
-
                 {(draftProvider?.baseUrl || draftNeedsBaseUrl) && (
                   <label>
                     Base URL
@@ -2486,36 +3012,16 @@ function App() {
                   </label>
                 )}
 
-                <label>
-                  决策模型（手动）
-                  <input
-                    value={draftModel}
-                    placeholder="可留空；建议先获取模型列表，再为三层分别选择"
-                    spellCheck={false}
-                    onChange={(event) => {
-                      setDraftModel(event.currentTarget.value);
-                      setTestResult(undefined);
-                      setAutoMapResult(undefined);
-                      setDraftModelAliases([]);
-                      setDraftRoleModels({ default: event.currentTarget.value, vision: "", fast: "" });
-                      setDraftAvailableModels([]);
-                    }}
-                  />
-                </label>
-
                 {draftProvider?.id !== "claude" && (
                   <div className="test-panel">
                     <div className="test-panel-head">
                       <div>
-                        <strong>测试连通</strong>
-                        <small>先验证连接或获取模型列表，再为决策、视觉、日常三层确认模型。</small>
+                        <strong>测试</strong>
+                        <small>测试会向该供应商发一次很小的请求，确认 Key 能用，并读回可用模型。</small>
                       </div>
                       <div className="test-panel-actions">
                         <button onClick={testDraftApiKey} disabled={busy || testingKey || autoMappingKey}>
-                        {testingKey ? "正在测试…" : "测试 API Key"}
-                        </button>
-                        <button onClick={autoMapDraftApiKey} disabled={busy || testingKey || autoMappingKey}>
-                          {autoMappingKey ? "获取中…" : "获取模型列表"}
+                          {testingKey ? "测试中…" : "测试"}
                         </button>
                       </div>
                     </div>
@@ -2542,33 +3048,68 @@ function App() {
                         <p>{autoMapResult.message}</p>
                       </div>
                     )}
-                    {draftAvailableModels.length > 0 && (
-                      <div className="draft-role-editor" aria-label="三层模型映射">
-                        <div className="draft-role-editor-head">
-                          <strong>三层模型映射</strong>
-                          <small>已给出建议，可按供应商实际能力手动调整。</small>
-                        </div>
-                        {roleDefinitions.map((definition) => (
-                          <label className="draft-role-row" key={definition.role}>
-                            <span className="draft-role-name">
-                              <strong>{definition.label}</strong>
-                              <small>{definition.detail}</small>
-                            </span>
-                            <select
-                              value={draftRoleModels[definition.role]}
-                              onChange={(event) => updateDraftRoleModel(definition.role, event.currentTarget.value)}
-                            >
-                              <option value="">选择模型</option>
-                              {draftAvailableModels.map((model) => (
-                                <option value={model} key={model}>{model}</option>
-                              ))}
-                            </select>
-                          </label>
-                        ))}
-                      </div>
-                    )}
                   </div>
                 )}
+
+                <div className="add-step-heading model-step-heading"><span>③</span><strong>三个角色用哪个模型</strong></div>
+                <label>
+                  决策模型（可手动填写）
+                  <input
+                    value={draftModel}
+                    placeholder="建议先测试或重新获取模型"
+                    spellCheck={false}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      setDraftModel(value);
+                      setTestResult(undefined);
+                      setAutoMapResult(undefined);
+                      setDraftModelAliases([]);
+                      setDraftRoleModels({ default: value, vision: "", fast: "" });
+                    }}
+                  />
+                </label>
+                <div className="model-step-actions">
+                  <button onClick={autoMatchDraftModels} disabled={busy || testingKey || autoMappingKey || draftProvider?.id === "claude"}>
+                    自动匹配
+                  </button>
+                  <button onClick={autoMapDraftApiKey} disabled={busy || testingKey || autoMappingKey || draftProvider?.id === "claude"}>
+                    {autoMappingKey ? "获取中…" : "重新获取模型"}
+                  </button>
+                </div>
+                <p className="form-help">测试通过后会自动填好，一般不用改。</p>
+                <div className="draft-role-editor" aria-label="三个角色用哪个模型">
+                  {roleDefinitions.map((definition) => (
+                    <label className="draft-role-row" key={definition.role}>
+                      <span className="draft-role-name">
+                        <strong>{definition.label}</strong>
+                        <small>{definition.detail}</small>
+                      </span>
+                      <select
+                        value={draftRoleModels[definition.role]}
+                        disabled={draftModelOptions.length === 0}
+                        onChange={(event) => updateDraftRoleModel(definition.role, event.currentTarget.value)}
+                      >
+                        <option value="">选择模型</option>
+                        {draftModelOptions.map((model) => (
+                          <option value={model} key={model}>{model}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ))}
+                </div>
+
+                <div className="add-step-heading"><span>④</span><strong>给它起个名字</strong></div>
+                <label>
+                  接入名称
+                  <input
+                    value={draftDisplayName}
+                    maxLength={80}
+                    placeholder={draftProvider?.id === "custom" ? "可留空；自动使用日期与序号" : draftProvider?.name || "可留空"}
+                    spellCheck={false}
+                    onChange={(event) => setDraftDisplayName(event.currentTarget.value)}
+                  />
+                </label>
+                <p className="form-help">留空会自动取名。以后在「我的接入」里按这个名字找它。</p>
 
                 {draftIsThirdParty && (
                   <label className="confirm-row">
@@ -2589,8 +3130,17 @@ function App() {
                 )}
 
                 <div className="form-actions">
-                  <button className="primary-inline-button" onClick={applyDraftKey} disabled={mutationBusy || testingKey || autoMappingKey || status.restartBlocked}>
-                    {busy ? "正在保存…" : "保存到列表"}
+                  <div className="submit-copy">
+                    <strong>切换只重启 Bridge，不会关掉 Claude Science。失败会自动切回原来的。</strong>
+                    <small>先保存到列表，再显示费用确认；只有再次确认才会启用并发送 1 次 max_tokens=1 验证请求。</small>
+                  </div>
+                  <button
+                    className="primary-inline-button"
+                    onClick={applyDraftKey}
+                    disabled={mutationBusy || testingKey || autoMappingKey || status.restartBlocked}
+                    title="先保存到列表，再进入启用确认"
+                  >
+                    {busy ? "正在保存…" : "保存并启用"}
                   </button>
                   <button onClick={() => setShowKeyPicker(false)} disabled={busy || testingKey || autoMappingKey}>取消</button>
                 </div>
@@ -2603,15 +3153,21 @@ function App() {
       <footer>
         <span>{allowStatus.linuxUser && allowStatus.distro ? `${allowStatus.linuxUser} · ${allowStatus.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
+          <button className="appearance-button" disabled={appearanceBlocked} onClick={() => {
+            setSkinChoiceRequired(false);
+            setSkinError("");
+            setShowSkinChooser(true);
+          }}>外观设置</button>
           <button onClick={openDashboard} disabled={busy || !status.bridgeHealthy}>配置面板</button>
           <button
             onClick={() => runAction("restart_services")}
-            disabled={allowActionBusy || !allowStatus.wslInstalled || status.restartBlocked}
+            disabled={repairBusy || !allowStatus.wslInstalled || status.restartBlocked}
             title="备份配置、收窄持久 DrvFS 写授权，并重启受管 Bridge 与 Claude Science"
           >修复并重启</button>
           <button onClick={() => runAction("stop_services")} disabled={allowActionBusy || (!status.bridgeRunning && !allowStatus.claudeRunning)}>停止</button>
         </div>
       </footer>
+      </div>
     </main>
   );
 }
