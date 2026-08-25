@@ -244,3 +244,11 @@ FAIL egress 379ms work.bridge_egress.proxy_dead health=passed proxy=failed model
 PASS grade 3708ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 ```
+
+## V0.1.7 T0 完成
+
+做了什么：在 `codex/csa-v0.1.7` 上完成只读出口基线；确认 Bridge 与 Windows 系统代理均为 `http://127.0.0.1:12334`，并复测直连、当前代理与旧死口 10808 三条路线。
+
+证据在哪：`docs/reports/CSA_v017_T0_egress_baseline.md` 保存 `/health`、九次无凭据 curl 原始输出、`lib.rs` 感知计数与完整 smoke；当前代理三组目标均达认证/HTTP 层，10808 三组均拒绝，smoke 为 `required_fail=0`、`work.bridge_egress.ok`、`gating=false`。
+
+下一步：进入 T1，在既有 WORK 探针内发现并分层验证候选，输出排序与推荐；不进入 ALLOW、首屏或周期刷新。
