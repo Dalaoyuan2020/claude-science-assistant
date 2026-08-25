@@ -13,7 +13,7 @@ import {
   type AllowStatus,
 } from "../src/laneContract.ts";
 
-test("all_probes_red_button_still_open", () => {
+test("all_probes_red_button_still_open / bridge_egress_never_gates", () => {
   const allow: AllowStatus = {
     wslInstalled: true,
     distro: "Ubuntu-24.04",

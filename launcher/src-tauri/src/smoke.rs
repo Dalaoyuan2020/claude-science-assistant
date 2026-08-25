@@ -1195,8 +1195,13 @@ mod tests {
             models: fake_egress_layer(BridgeEgressLayerState::Skipped, "models_skipped"),
             request: fake_egress_layer(BridgeEgressLayerState::Skipped, "request_skipped"),
             direct: fake_egress_layer(BridgeEgressLayerState::Skipped, "direct_skipped"),
+            candidates: Vec::new(),
             suggested_action: "replace or clear the Bridge proxy".into(),
             warnings: Vec::new(),
+            probe_distro: Some("Ubuntu-24.04".into()),
+            runtime_pid: Some(4242),
+            runtime_source_sha256: Some("a".repeat(64)),
+            runtime_starttime: Some("123456".into()),
         }
     }
 

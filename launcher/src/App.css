@@ -100,6 +100,7 @@ button:disabled, input:disabled { cursor: not-allowed; opacity: .52; }
 .bridge-egress-layer strong { margin-top: 4px; font-size: 11px; }
 .bridge-egress-layer code { margin-top: 4px; color: #536158; font-size: 8px; }
 .bridge-egress-layer small { margin-top: 4px; color: #7c877f; font-size: 8px; }
+.bridge-egress-candidate small { overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.45; }
 .bridge-egress-dialog:focus { outline: 3px solid #7dad8b66; outline-offset: 3px; }
 
 @media (max-width: 900px) {

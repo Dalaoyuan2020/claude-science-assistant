@@ -10,12 +10,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri_plugin_opener::OpenerExt;
 
 mod bridge_egress;
+mod bridge_egress_apply;
 mod runtime_lifecycle;
 mod smoke;
 
 pub use smoke::smoke_exit_code_if_requested;
 
-use bridge_egress::{run_bridge_egress_probe, BridgeEgressReport};
+use bridge_egress::{
+    run_bridge_egress_connection_probe, run_bridge_egress_probe,
+    run_bridge_egress_probe_for_models, BridgeEgressLayerState, BridgeEgressReport,
+};
+use bridge_egress_apply::apply_bridge_egress_fix;
 
 use runtime_lifecycle::{
     parse_runtime_identity, runtime_identity_from_health, RuntimeIdentity, ServiceOperationLock,
@@ -85,6 +90,8 @@ fn transient_deep_daemon_result_recovered(
 // the whole write/restart/verify transaction single-flight to prevent a second
 // click from racing the first transaction's rollback.
 static BRIDGE_CONFIG_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+const BRIDGE_RESTART_GUEST_TIMEOUT_SECONDS: u64 = 42;
+const BRIDGE_RESTART_HOST_TIMEOUT: Duration = Duration::from_secs(48);
 
 fn bridge_config_transition_lock() -> &'static Mutex<()> {
     BRIDGE_CONFIG_TRANSITION.get_or_init(|| Mutex::new(()))
@@ -2785,6 +2792,16 @@ fn validate_base_url(value: &str) -> Result<String, String> {
     if trimmed.len() < "https://a.b".len() || trimmed.contains(char::is_whitespace) {
         return Err("自定义中转地址格式无效".into());
     }
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "自定义中转地址格式无效".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("自定义中转地址不能包含账号、密码、查询参数或片段".into());
+    }
     Ok(trimmed.to_string())
 }
 
@@ -3458,21 +3475,57 @@ fn bridge_config_patch_for_aggregate_routes(
     Ok(serde_json::Value::Object(patch))
 }
 
-fn json_arg_hex<T: Serialize>(value: &T) -> Result<String, String> {
-    let json =
-        serde_json::to_string(value).map_err(|error| format!("无法序列化 Bridge 配置：{error}"))?;
-    Ok(json
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>())
+const BRIDGE_CONFIG_ENVELOPE_LIMIT: usize = 8 * 1024 * 1024;
+
+fn bridge_config_stdin_envelope<T: Serialize>(
+    operation: &str,
+    payload: &T,
+) -> Result<Vec<u8>, String> {
+    if !matches!(operation, "patch" | "rollback") {
+        return Err("Bridge 配置事务 operation 无效".into());
+    }
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "operation": operation,
+        "payload": payload,
+    }))
+    .map_err(|error| format!("无法序列化 Bridge 配置事务：{error}"))?;
+    if bytes.len() > BRIDGE_CONFIG_ENVELOPE_LIMIT {
+        return Err("Bridge 配置事务超过安全大小限制".into());
+    }
+    Ok(bytes)
+}
+
+fn wsl_python_stdin_command(distro: &str, script: &str) -> Command {
+    let mut command = background_command("wsl.exe");
+    command
+        .arg("--distribution")
+        .arg(distro)
+        .arg("--")
+        .args(["timeout", "--signal=TERM", "--kill-after=1s", "9s"])
+        .args(["python3", "-c", script]);
+    command
+}
+
+fn run_wsl_bridge_config_envelope<T: Serialize>(
+    distro: &str,
+    operation: &str,
+    script: &str,
+    payload: &T,
+) -> Result<Output, String> {
+    let input = bridge_config_stdin_envelope(operation, payload)?;
+    command_output_with_stdin_timeout(
+        wsl_python_stdin_command(distro, script),
+        &input,
+        Duration::from_secs(12),
+        "Bridge 配置事务",
+    )
 }
 
 fn write_bridge_config_patch(
     distro: &str,
     patch: &serde_json::Value,
 ) -> Result<BridgeConfigRollback, String> {
-    let patch_hex = json_arg_hex(patch)?;
     let script = r#"
 import json
 import os
@@ -3480,14 +3533,31 @@ import pathlib
 import sys
 import tempfile
 
-patch = json.loads(bytes.fromhex(sys.argv[1]).decode("utf-8"))
+limit = 8 * 1024 * 1024
+raw = sys.stdin.buffer.read(limit + 1)
+if len(raw) > limit:
+    raise SystemExit("Bridge config patch envelope exceeds the bounded limit")
+try:
+    envelope = json.loads(raw.decode("utf-8"))
+except Exception:
+    raise SystemExit("Bridge config patch envelope is invalid")
+if (not isinstance(envelope, dict)
+        or set(envelope) != {"schemaVersion", "operation", "payload"}
+        or envelope.get("schemaVersion") != 1
+        or envelope.get("operation") != "patch"
+        or not isinstance(envelope.get("payload"), dict)):
+    raise SystemExit("Bridge config patch envelope is invalid")
+patch = envelope["payload"]
 path = pathlib.Path.home() / ".claude-science" / "proxy" / "config.json"
 path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+if path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raise SystemExit("Existing Bridge config is unreadable; refusing to replace it")
     if not isinstance(data, dict):
-        data = {}
-except Exception:
+        raise SystemExit("Existing Bridge config is not an object; refusing to replace it")
+else:
     data = {}
 restore = {}
 delete = []
@@ -3508,7 +3578,7 @@ os.replace(tmp, path)
 os.chmod(path, 0o600)
 print(json.dumps({"restore": restore, "delete": delete}, ensure_ascii=False))
 "#;
-    let output = run_wsl(distro, &["python3", "-c", script, &patch_hex])?;
+    let output = run_wsl_bridge_config_envelope(distro, "patch", script, patch)?;
     if output.status.success() {
         serde_json::from_str(&output_text(&output))
             .map_err(|error| format!("Bridge 配置已写入，但回滚信息解析失败：{error}"))
@@ -3521,7 +3591,6 @@ print(json.dumps({"restore": restore, "delete": delete}, ensure_ascii=False))
 }
 
 fn restore_bridge_config(distro: &str, rollback: &BridgeConfigRollback) -> Result<(), String> {
-    let rollback_hex = json_arg_hex(rollback)?;
     let script = r#"
 import json
 import os
@@ -3529,14 +3598,31 @@ import pathlib
 import sys
 import tempfile
 
-rollback = json.loads(bytes.fromhex(sys.argv[1]).decode("utf-8"))
+limit = 8 * 1024 * 1024
+raw = sys.stdin.buffer.read(limit + 1)
+if len(raw) > limit:
+    raise SystemExit("Bridge config rollback envelope exceeds the bounded limit")
+try:
+    envelope = json.loads(raw.decode("utf-8"))
+except Exception:
+    raise SystemExit("Bridge config rollback envelope is invalid")
+if (not isinstance(envelope, dict)
+        or set(envelope) != {"schemaVersion", "operation", "payload"}
+        or envelope.get("schemaVersion") != 1
+        or envelope.get("operation") != "rollback"
+        or not isinstance(envelope.get("payload"), dict)):
+    raise SystemExit("Bridge config rollback envelope is invalid")
+rollback = envelope["payload"]
 path = pathlib.Path.home() / ".claude-science" / "proxy" / "config.json"
 path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+if path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raise SystemExit("Current Bridge config is unreadable; refusing unsafe rollback")
     if not isinstance(data, dict):
-        data = {}
-except Exception:
+        raise SystemExit("Current Bridge config is not an object; refusing unsafe rollback")
+else:
     data = {}
 for key in rollback.get("delete", []):
     data.pop(key, None)
@@ -3551,7 +3637,7 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 os.chmod(path, 0o600)
 "#;
-    let output = run_wsl(distro, &["python3", "-c", script, &rollback_hex])?;
+    let output = run_wsl_bridge_config_envelope(distro, "rollback", script, rollback)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -3584,9 +3670,14 @@ fn restart_bridge_after_config(
         "start"
     };
     eprintln!("[CSA switch] applying Bridge config: action={action}, distro={distro}");
+    let guest_timeout = format!("{BRIDGE_RESTART_GUEST_TIMEOUT_SECONDS}s");
     let restart_output = run_wsl_with_timeout(
         distro,
         &[
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=2s",
+            &guest_timeout,
             "env",
             "CSA_FORCE_RESTART=1",
             "CSA_BRIDGE_ONLY=1",
@@ -3595,7 +3686,7 @@ fn restart_bridge_after_config(
             "bash",
             &start_script,
         ],
-        Duration::from_secs(45),
+        BRIDGE_RESTART_HOST_TIMEOUT,
     )?;
     if !restart_output.status.success() {
         eprintln!(
@@ -3772,11 +3863,20 @@ fn apply_bridge_config_patch_value(
         Err(error) => {
             eprintln!("[CSA switch] activation failed; starting rollback: {error}");
             let rollback_message = match restore_bridge_config(distro, &rollback) {
-                Ok(()) => {
-                    let _ = restart_bridge_after_config(&status, None);
-                    eprintln!("[CSA switch] Bridge rollback completed");
-                    "已回滚 Bridge 配置".to_string()
-                }
+                Ok(()) => match restart_bridge_after_config(&status, None) {
+                    Ok(()) => {
+                        eprintln!("[CSA switch] Bridge rollback completed and verified");
+                        "已回滚 Bridge 配置并确认运行态".to_string()
+                    }
+                    Err(rollback_restart_error) => {
+                        eprintln!(
+                            "[CSA switch] Bridge rollback file restored but runtime verification failed: {rollback_restart_error}"
+                        );
+                        format!(
+                            "Bridge 配置文件已恢复，但回滚重启/运行态确认失败：{rollback_restart_error}"
+                        )
+                    }
+                },
                 Err(rollback_error) => {
                     eprintln!("[CSA switch] Bridge rollback failed: {rollback_error}");
                     format!("回滚失败：{rollback_error}")
@@ -3843,16 +3943,231 @@ fn redact_secret_text(text: &str, secret: &str) -> String {
     text.replace(secret, "[redacted-api-key]")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightFailureLayer {
+    Connection,
+    Authentication,
+    Other,
+}
+
+fn classify_preflight_failure(message: &str) -> PreflightFailureLayer {
+    let normalized = message.to_ascii_lowercase();
+    let authentication_markers = [
+        "http 401",
+        "http 403",
+        "401 (unauthorized)",
+        "403 (forbidden)",
+        "status code 401",
+        "status code 403",
+        "invalid api key",
+        "invalid_api_key",
+        "authentication_error",
+        "authentication failed",
+        "unauthorized",
+        "forbidden",
+        "(401)",
+        "(403)",
+        "（401）",
+        "（403）",
+        "未经授权",
+        "禁止访问",
+        "无权限",
+        "认证失败",
+        "身份验证失败",
+        "api key 无效",
+        "密钥无效",
+    ];
+    if authentication_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return PreflightFailureLayer::Authentication;
+    }
+
+    let connection_markers = [
+        "all connection attempts failed",
+        "connection refused",
+        "could not connect",
+        "unable to connect",
+        "failed to connect",
+        "connectex",
+        "connection timed out",
+        "operation timed out",
+        "request timed out",
+        "timed out",
+        "timeout",
+        "name resolution",
+        "dns",
+        "network is unreachable",
+        "no route to host",
+        "tls handshake",
+        "无法连接到远程服务器",
+        "连接被拒绝",
+        "连接超时",
+        "操作超时",
+        "请求超时",
+        "名称解析",
+        "找不到此远程名称",
+    ];
+    if connection_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        PreflightFailureLayer::Connection
+    } else {
+        PreflightFailureLayer::Other
+    }
+}
+
+fn preflight_failure_message(
+    raw_message: &str,
+    egress_code: Option<&str>,
+    outbound_proxy_url: Option<&str>,
+) -> String {
+    let detail = {
+        let cleaned = clean_diagnostic_text(raw_message);
+        if cleaned.trim().is_empty() {
+            "上游未返回可诊断的错误详情。".to_string()
+        } else {
+            cleaned
+        }
+    };
+    match classify_preflight_failure(&detail) {
+        PreflightFailureLayer::Authentication => format!(
+            "认证失败（HTTP 401/403 或上游认证错误）。这是 API Key 或账号权限问题，不是出口代理问题。\n详情：{detail}"
+        ),
+        PreflightFailureLayer::Connection => {
+            if egress_code == Some("work.bridge_egress.proxy_dead") {
+                let endpoint = outbound_proxy_url.unwrap_or("当前配置值");
+                format!(
+                    "上游不可达。\nBridge 的出口代理 {endpoint} 无人监听或不可达（work.bridge_egress.proxy_dead）。\n这不是 Key 的问题 —— 请打开「能力体检」查看出口修复建议。\n详情：{detail}"
+                )
+            } else {
+                let diagnosis = egress_code.unwrap_or("work.bridge_egress.not_available");
+                format!(
+                    "上游不可达（连接层）。这不是 Key 的问题 —— 请打开「能力体检」检查代理与网络。\n出口只读诊断：{diagnosis}。\n详情：{detail}"
+                )
+            }
+        }
+        PreflightFailureLayer::Other => {
+            format!("切换前连通性检查失败，请检查 Base URL、模型和服务状态。\n详情：{detail}")
+        }
+    }
+}
+
+#[cfg(test)]
+fn attributed_preflight_failure(raw_message: &str) -> String {
+    if classify_preflight_failure(raw_message) != PreflightFailureLayer::Connection {
+        return preflight_failure_message(raw_message, None, None);
+    }
+    match run_bridge_egress_connection_probe() {
+        Ok(report) => preflight_failure_message(
+            raw_message,
+            Some(report.code.as_str()),
+            report.outbound_proxy_url.as_deref(),
+        ),
+        Err(error) => preflight_failure_message(raw_message, Some(error.as_str()), None),
+    }
+}
+
+#[cfg(test)]
 fn require_successful_preflight(result: ApiKeyTestResult) -> Result<(), String> {
     if result.ok {
         return Ok(());
     }
     let message = result.message.trim();
-    Err(if message.is_empty() {
-        "切换前连通性检查失败，请检查 Base URL、API Key 和模型".into()
+    Err(attributed_preflight_failure(message))
+}
+
+fn bridge_switch_failure_message(report: &BridgeEgressReport) -> String {
+    let status = report.request.http_status;
+    if matches!(status, Some(401 | 403)) || report.code == "work.bridge_egress.upstream_401" {
+        return preflight_failure_message(
+            &format!("HTTP {}: {}", status.unwrap_or(401), report.conclusion),
+            Some(report.code.as_str()),
+            report.outbound_proxy_url.as_deref(),
+        );
+    }
+    if report.code == "work.bridge_egress.proxy_dead"
+        || matches!(
+            report.code.as_str(),
+            "work.bridge_egress.upstream_502"
+                | "work.bridge_egress.upstream_timeout"
+                | "work.bridge_egress.upstream_unreachable"
+        )
+    {
+        return preflight_failure_message(
+            &format!("All connection attempts failed. {}", report.conclusion),
+            Some(report.code.as_str()),
+            report.outbound_proxy_url.as_deref(),
+        );
+    }
+    format!(
+        "切换后的 Bridge 验证失败（{}）。\n详情：{}",
+        report.code,
+        clean_diagnostic_text(&report.conclusion)
+    )
+}
+
+fn verify_bridge_after_api_key_switch() -> Result<(), String> {
+    let report = run_bridge_egress_probe(true).map_err(|error| {
+        format!(
+            "切换后的 Bridge 出口验证无法完成。\n详情：{}",
+            clean_diagnostic_text(&error)
+        )
+    })?;
+    if report.ok
+        && report.code == "work.bridge_egress.ok"
+        && report.request.state == BridgeEgressLayerState::Passed
+    {
+        Ok(())
     } else {
-        format!("切换前连通性检查失败：{message}")
-    })
+        Err(bridge_switch_failure_message(&report))
+    }
+}
+
+fn verify_bridge_after_aggregate_switch() -> Result<(), String> {
+    let aliases = [
+        "byok-model-0001",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    ];
+    let report = run_bridge_egress_probe_for_models(true, &aliases).map_err(|error| {
+        format!(
+            "三条聚合路由的切换后 Bridge 验证无法完成。\n详情：{}",
+            clean_diagnostic_text(&error)
+        )
+    })?;
+    if !(report.ok
+        && report.code == "work.bridge_egress.ok"
+        && report.request.state == BridgeEgressLayerState::Passed)
+    {
+        let role = match report.model.as_deref() {
+            Some("byok-model-0001") => "决策路由",
+            Some("claude-sonnet-5") => "视觉路由",
+            Some("claude-haiku-4-5-20251001") => "日常路由",
+            _ => "聚合路由",
+        };
+        return Err(format!("{role}{}", bridge_switch_failure_message(&report)));
+    }
+    Ok(())
+}
+
+fn reject_known_dead_bridge_proxy() -> Result<(), String> {
+    let Ok(report) = run_bridge_egress_connection_probe() else {
+        // A stopped Bridge is allowed here: the transaction may start it. The
+        // post-commit verifier remains authoritative and will roll back if the
+        // managed listener cannot be proven after restart.
+        return Ok(());
+    };
+    if report.code == "work.bridge_egress.proxy_dead" {
+        return Err(preflight_failure_message(
+            "All connection attempts failed",
+            Some(report.code.as_str()),
+            report.outbound_proxy_url.as_deref(),
+        ));
+    }
+    Ok(())
 }
 
 fn test_api_key_impl(
@@ -3920,6 +4235,7 @@ if (-not $prompt) { $prompt = "Reply only: OK" }
 function Redact([string]$text) {
   if (-not $text) { return "" }
   if ($apiKey) { $text = $text.Replace($apiKey, "[redacted-api-key]") }
+  if ($baseUrl) { $text = $text.Replace($baseUrl, "[redacted-upstream-url]") }
   if ($text.Length -gt 900) { return $text.Substring(0, 900) }
   return $text
 }
@@ -4181,6 +4497,7 @@ $documentedModels = @($req.documented_models | ForEach-Object { ([string]$_).Tri
 function Redact([string]$text) {
   if (-not $text) { return "" }
   if ($apiKey) { $text = $text.Replace($apiKey, "[redacted-api-key]") }
+  if ($baseUrl) { $text = $text.Replace($baseUrl, "[redacted-upstream-url]") }
   if ($text.Length -gt 900) { return $text.Substring(0, 900) }
   return $text
 }
@@ -4361,9 +4678,10 @@ fn persist_launcher_settings(settings: &LauncherSettings) -> Result<(), String> 
     prepare_launcher_settings(settings)?.commit()
 }
 
-fn commit_launcher_settings_with_bridge(
+fn commit_launcher_settings_with_bridge_inner(
     settings: &LauncherSettings,
     patch: Option<serde_json::Value>,
+    mut verify_bridge: Option<&mut dyn FnMut() -> Result<(), String>>,
 ) -> Result<(), String> {
     eprintln!("[CSA switch] received configuration transition request");
     let _transition = bridge_config_transition_lock()
@@ -4377,6 +4695,18 @@ fn commit_launcher_settings_with_bridge(
         Some(patch) => Some(apply_bridge_config_patch_value(patch)?),
         None => None,
     };
+    if let Some(verify) = verify_bridge.as_mut() {
+        if let Err(verification_error) = verify() {
+            let rollback_message = match applied_bridge.as_ref() {
+                Some(applied) => match rollback_applied_bridge(applied) {
+                    Ok(()) => "Bridge 已恢复到切换前配置".to_string(),
+                    Err(error) => format!("Bridge 回滚失败：{error}"),
+                },
+                None => "Bridge 未发生改动".to_string(),
+            };
+            return Err(format!("{verification_error}；{rollback_message}"));
+        }
+    }
     if let Err(settings_error) = prepared_settings.commit() {
         let rollback_message = match applied_bridge.as_ref() {
             Some(applied) => match rollback_applied_bridge(applied) {
@@ -4391,6 +4721,21 @@ fn commit_launcher_settings_with_bridge(
     }
     eprintln!("[CSA switch] Windows settings committed; transition complete");
     Ok(())
+}
+
+fn commit_launcher_settings_with_bridge(
+    settings: &LauncherSettings,
+    patch: Option<serde_json::Value>,
+) -> Result<(), String> {
+    commit_launcher_settings_with_bridge_inner(settings, patch, None)
+}
+
+fn commit_launcher_settings_with_verified_bridge(
+    settings: &LauncherSettings,
+    patch: Option<serde_json::Value>,
+    verify_bridge: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    commit_launcher_settings_with_bridge_inner(settings, patch, Some(verify_bridge))
 }
 
 #[tauri::command]
@@ -4548,29 +4893,26 @@ fn activate_api_key_impl(api_key_id: String) -> Result<LauncherState, String> {
     let api_key = unprotect_api_key(&entry.encrypted_api_key)?;
     if entry.provider_id != "claude" {
         eprintln!(
-            "[CSA switch] preflight started: provider={}, model={}",
+            "[CSA switch] managed Bridge verification prepared: provider={}, model={}",
             entry.provider_id, entry.model
         );
-        let preflight = test_api_key_impl(
-            entry.provider_id.clone(),
-            api_key.clone(),
-            entry.base_url.clone(),
-            entry.custom_confirmed,
-            entry.model.clone(),
-            "Reply only: SWITCH_READY".into(),
-        )?;
-        require_successful_preflight(preflight)?;
-        eprintln!("[CSA switch] preflight passed");
+        reject_known_dead_bridge_proxy()?;
     }
     settings.selected_provider_id = entry.provider_id.clone();
     settings.custom_base_url = entry.base_url.clone();
     settings.custom_confirmed = entry.custom_confirmed;
     let patch =
         bridge_config_patch_for_api_key(&settings, &api_key, &entry.model, &entry.model_aliases)?;
-    settings.active_api_key_id = Some(entry.id);
+    settings.active_api_key_id = Some(entry.id.clone());
     settings.active_role = None;
     settings.active_aggregate_scheme_id = None;
-    commit_launcher_settings_with_bridge(&settings, patch)?;
+    if entry.provider_id == "claude" {
+        commit_launcher_settings_with_bridge(&settings, patch)?;
+    } else {
+        let mut verify = verify_bridge_after_api_key_switch;
+        commit_launcher_settings_with_verified_bridge(&settings, patch, &mut verify)?;
+        eprintln!("[CSA switch] managed Bridge real request verified");
+    }
     Ok(launcher_state(&settings))
 }
 
@@ -4696,20 +5038,6 @@ fn aggregate_runtime_routes(
         let profile = runtime_profile_for_settings(&provider_settings)?
             .ok_or_else(|| "聚合接入暂不支持依赖 Claude 官方登录的订阅".to_string())?;
         let model = canonical_model_for_profile(&profile, &binding.model);
-        eprintln!(
-            "[CSA switch] aggregate preflight started: role={role}, provider={}, model={model}",
-            entry.provider_id
-        );
-        let preflight = test_api_key_impl(
-            entry.provider_id.clone(),
-            api_key.clone(),
-            entry.base_url.clone(),
-            entry.custom_confirmed,
-            model.clone(),
-            "Reply only: SWITCH_READY".into(),
-        )?;
-        require_successful_preflight(preflight).map_err(|error| format!("{role} 路由{error}"))?;
-        eprintln!("[CSA switch] aggregate preflight passed: role={role}");
         runtime_routes.push(AggregateRuntimeRoute {
             role: role.to_string(),
             backend: profile.backend.to_string(),
@@ -4727,6 +5055,7 @@ fn activate_aggregate_scheme_in_settings(
     scheme: StoredAggregateScheme,
 ) -> Result<LauncherState, String> {
     let scheme = normalize_aggregate_scheme(&settings, scheme)?;
+    reject_known_dead_bridge_proxy()?;
     let runtime_routes = aggregate_runtime_routes(&settings, &scheme.routes)?;
     let patch = Some(bridge_config_patch_for_aggregate_routes(
         &scheme.id,
@@ -4744,7 +5073,12 @@ fn activate_aggregate_scheme_in_settings(
     settings.role_bindings = scheme.routes.clone();
     settings.active_role = None;
     settings.active_aggregate_scheme_id = Some(scheme.id);
-    commit_launcher_settings_with_bridge(&settings, patch)?;
+    // Verify all three aliases through the freshly restarted managed Bridge.
+    // Keep Windows settings uncommitted until every max_tokens=1 request passes
+    // so one unreachable provider/model rolls the entire Bridge patch back.
+    let mut verify = verify_bridge_after_aggregate_switch;
+    commit_launcher_settings_with_verified_bridge(&settings, patch, &mut verify)?;
+    eprintln!("[CSA switch] all aggregate Bridge routes verified");
     Ok(launcher_state(&settings))
 }
 
@@ -6051,6 +6385,7 @@ pub fn run() {
             open_bridge_dashboard,
             stop_legacy_windows_bridge,
             run_bridge_egress_check,
+            apply_bridge_egress_fix,
             get_provider_catalog,
             get_launcher_settings,
             save_provider_selection,
@@ -6916,6 +7251,9 @@ mod tests {
         assert!(validate_base_url("").is_ok());
         assert!(validate_base_url("https://10521052.xyz/v1").is_ok());
         assert!(validate_base_url("http://10521052.xyz/v1").is_err());
+        assert!(validate_base_url("https://user:secret@example.com/v1").is_err());
+        assert!(validate_base_url("https://example.com/v1?token=secret").is_err());
+        assert!(validate_base_url("https://example.com/v1#secret").is_err());
     }
 
     #[test]
@@ -7527,6 +7865,88 @@ mod tests {
         assert!(API_KEY_TEST_RETRY_MAX_TOKENS >= API_KEY_TEST_INITIAL_MAX_TOKENS * 4);
     }
 
+    #[test]
+    fn preflight_error_attributes_layer() {
+        let connection = preflight_failure_message(
+            "All connection attempts failed",
+            Some("work.bridge_egress.proxy_dead"),
+            Some("http://127.0.0.1:10808"),
+        );
+        assert!(connection.starts_with("上游不可达。"));
+        assert!(connection.contains("http://127.0.0.1:10808"));
+        assert!(connection.contains("work.bridge_egress.proxy_dead"));
+        assert!(connection.contains("这不是 Key 的问题"));
+        assert!(connection.contains("详情：All connection attempts failed"));
+        assert!(!connection.contains("API Key 或账号权限问题"));
+
+        let authentication = preflight_failure_message(
+            "HTTP 401: api key ****-key is invalid",
+            Some("work.bridge_egress.proxy_dead"),
+            Some("http://127.0.0.1:10808"),
+        );
+        assert!(authentication.starts_with("认证失败（HTTP 401/403"));
+        assert!(authentication.contains("API Key 或账号权限问题"));
+        assert!(authentication.contains("不是出口代理问题"));
+        assert!(authentication.contains("详情：HTTP 401"));
+        assert!(!authentication.contains("work.bridge_egress.proxy_dead"));
+        assert!(!authentication.contains("能力体检"));
+
+        assert_eq!(
+            classify_preflight_failure("无法连接到远程服务器：连接被拒绝"),
+            PreflightFailureLayer::Connection
+        );
+        assert_eq!(
+            classify_preflight_failure("远程服务器返回错误：(401) 未经授权"),
+            PreflightFailureLayer::Authentication
+        );
+        let localized = preflight_failure_message(
+            "操作超时，无法连接到远程服务器",
+            Some("work.bridge_egress.proxy_dead"),
+            Some("http://127.0.0.1:10808"),
+        );
+        assert!(localized.starts_with("上游不可达。"));
+        assert!(localized.contains("这不是 Key 的问题"));
+
+        let source = include_str!("lib.rs");
+        let activation = source
+            .split_once("fn activate_api_key_impl")
+            .unwrap()
+            .1
+            .split_once("#[tauri::command]")
+            .unwrap()
+            .0;
+        assert!(activation.contains("reject_known_dead_bridge_proxy()?"));
+        assert!(activation.contains("commit_launcher_settings_with_verified_bridge"));
+        assert!(activation.contains("verify_bridge_after_api_key_switch"));
+        assert!(!activation.contains("test_api_key_impl("));
+
+        let aggregate = source
+            .split_once("fn activate_aggregate_scheme_in_settings")
+            .unwrap()
+            .1
+            .split_once("fn save_and_activate_aggregate_scheme_impl")
+            .unwrap()
+            .0;
+        assert!(aggregate.contains("commit_launcher_settings_with_verified_bridge"));
+        assert!(aggregate.contains("verify_bridge_after_aggregate_switch"));
+        let aggregate_routes = source
+            .split_once("fn aggregate_runtime_routes")
+            .unwrap()
+            .1
+            .split_once("fn activate_aggregate_scheme_in_settings")
+            .unwrap()
+            .0;
+        assert!(!aggregate_routes.contains("test_api_key_impl("));
+        let aggregate_verify = source
+            .split_once("fn verify_bridge_after_aggregate_switch")
+            .unwrap()
+            .1
+            .split_once("fn reject_known_dead_bridge_proxy")
+            .unwrap()
+            .0;
+        assert!(aggregate_verify.contains("run_bridge_egress_probe_for_models(true, &aliases)"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn invalid_saved_base_url_preflight_returns_visible_error() {
@@ -7559,6 +7979,32 @@ mod tests {
                 "missing switch log marker: {marker}"
             );
         }
+        assert!(
+            BRIDGE_RESTART_GUEST_TIMEOUT_SECONDS + 2 < BRIDGE_RESTART_HOST_TIMEOUT.as_secs(),
+            "the WSL restart watchdog must finish before its host watchdog"
+        );
+        let restart = source
+            .split_once("fn restart_bridge_after_config")
+            .unwrap()
+            .1
+            .split_once("fn dashboard_url_from_config")
+            .unwrap()
+            .0;
+        assert!(restart.contains("\"timeout\""));
+        assert!(restart.contains("\"--signal=TERM\""));
+        assert!(restart.contains("\"--kill-after=2s\""));
+        assert!(restart.contains("BRIDGE_RESTART_HOST_TIMEOUT"));
+
+        let transition = source
+            .split_once("fn apply_bridge_config_patch_value")
+            .unwrap()
+            .1
+            .split_once("fn rollback_applied_bridge")
+            .unwrap()
+            .0;
+        assert!(transition.contains("Bridge rollback completed and verified"));
+        assert!(transition.contains("回滚重启/运行态确认失败"));
+        assert!(!transition.contains("let _ = restart_bridge_after_config"));
     }
 
     #[test]
@@ -8096,6 +8542,8 @@ mod tests {
         assert!(!source[switch_mode_start..delete_start].contains("activate_aggregate_scheme"));
         assert!(source.contains("onClick={() => preselectAggregateScheme(scheme.id)}"));
         assert!(source.contains("onClick={() => void confirmPendingAggregateScheme()}"));
+        assert!(source.contains("三条路由各验证 1 次，共 3 次 max_tokens=1 真实请求"));
+        assert!(source.contains("共 3 次，可能产生费用"));
     }
 
     #[test]
@@ -8153,39 +8601,81 @@ mod tests {
     }
 
     #[test]
-    fn bridge_config_hex_argument_roundtrips_json_with_quotes() {
+    fn bridge_config_stdin_envelope_roundtrips_without_putting_secret_in_argv() {
+        let sentinel = "csa-secret-sentinel-argv-must-not-contain-this";
         let value = serde_json::json!({
             "custom_base_url": "https://10521052.xyz/v1",
-            "force_model": "glm-5.2"
+            "force_model": "glm-5.2",
+            "custom_api_key": sentinel,
         });
-        let hex = json_arg_hex(&value).unwrap();
-        let bytes: Vec<u8> = hex
+        let frame = bridge_config_stdin_envelope("patch", &value).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(decoded["schemaVersion"], 1);
+        assert_eq!(decoded["operation"], "patch");
+        assert_eq!(decoded["payload"], value);
+        assert!(String::from_utf8_lossy(&frame).contains(sentinel));
+
+        let command = wsl_python_stdin_command("Ubuntu-24.04", "fixed-safe-script");
+        let argv = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sentinel_hex = sentinel
             .as_bytes()
-            .chunks(2)
-            .map(|pair| {
-                let text = std::str::from_utf8(pair).unwrap();
-                u8::from_str_radix(text, 16).unwrap()
-            })
-            .collect();
-        let decoded: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("hex should decode to JSON");
-        assert_eq!(decoded, value);
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(!argv.contains(sentinel));
+        assert!(!argv.contains(&sentinel_hex));
+        assert!(bridge_config_stdin_envelope("invalid", &value).is_err());
     }
 
     #[test]
     fn bridge_config_rollback_records_restore_and_delete_keys() {
+        let old_secret = "csa-old-secret-must-stay-on-stdin";
         let mut restore = serde_json::Map::new();
         restore.insert(
             "force_model".into(),
             serde_json::Value::String("old".into()),
         );
+        restore.insert(
+            "deepseek_api_key".into(),
+            serde_json::Value::String(old_secret.into()),
+        );
         let rollback = BridgeConfigRollback {
             restore,
             delete: vec!["custom_base_url".into()],
         };
-        let encoded = json_arg_hex(&rollback).unwrap();
-        assert!(!encoded.contains('"'));
-        assert!(encoded.len() > 20);
+        let frame = bridge_config_stdin_envelope("rollback", &rollback).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(decoded["payload"]["restore"]["force_model"], "old");
+        assert_eq!(
+            decoded["payload"]["restore"]["deepseek_api_key"],
+            old_secret
+        );
+        assert_eq!(decoded["payload"]["delete"][0], "custom_base_url");
+
+        let command = wsl_python_stdin_command("Ubuntu-24.04", "fixed-safe-script");
+        let argv = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!argv.contains(old_secret));
+
+        let production = include_str!("lib.rs")
+            .split_once("fn bridge_config_stdin_envelope")
+            .and_then(|(_, value)| value.split_once("fn restart_bridge_after_config"))
+            .map(|(value, _)| value)
+            .unwrap();
+        assert!(!production.contains("json_arg_hex"));
+        assert!(!production.contains("bytes.fromhex(sys.argv[1])"));
+        assert!(production.contains("command_output_with_stdin_timeout("));
+        assert!(production.contains("Existing Bridge config is unreadable; refusing to replace it"));
+        assert!(
+            production.contains("Current Bridge config is unreadable; refusing unsafe rollback")
+        );
     }
 
     #[test]
@@ -8677,7 +9167,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "mutates the current user's active API Key and sends one real request"]
+    #[ignore = "mutates the current user's active API Key and sends one max_tokens=1 Bridge verification request"]
     fn live_api_key_switch_diagnostic() {
         let target_id = std::env::var("CSA_LIVE_SWITCH_API_KEY_ID")
             .expect("set CSA_LIVE_SWITCH_API_KEY_ID to a saved API Key id");
@@ -8694,7 +9184,6 @@ mod tests {
         let switch_result = activate_api_key_impl(target_id.clone());
         let after_status = current_status();
         let after_health = live_bridge_json("/health").ok();
-        let request_result = live_bridge_request();
         let recent = live_bridge_json("/api/recent-requests").ok();
         let routed = recent
             .as_ref()
@@ -8725,9 +9214,8 @@ mod tests {
                 "revision": after_health.as_ref().and_then(|value| value.get("config_revision")).and_then(serde_json::Value::as_str),
                 "forceModel": after_health.as_ref().and_then(|value| value.get("force_model")).and_then(serde_json::Value::as_str),
             },
-            "realRequestOk": request_result.is_ok(),
-            "realRequestError": request_result.as_ref().err(),
-            "responseIdPresent": request_result.as_ref().ok().and_then(|value| value.get("id")).and_then(serde_json::Value::as_str).is_some(),
+            "verificationRequestObserved": routed.is_some(),
+            "verificationRequestOk": routed.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str) == Some("success"),
             "routedBackend": routed.and_then(|value| value.get("backend")).and_then(serde_json::Value::as_str),
             "routedModel": routed.and_then(|value| value.get("model")).and_then(serde_json::Value::as_str),
             "routedStatus": routed.and_then(|value| value.get("status")).and_then(serde_json::Value::as_str),

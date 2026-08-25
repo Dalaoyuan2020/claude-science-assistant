@@ -4,6 +4,10 @@ import { buildStorageMigrationPrompt, storageRecommendation } from "./storageMig
 import {
   browserPreviewBridgeEgressReport,
   buildBridgeEgressRepairPrompt,
+  displayBridgeEgressAddress,
+  displayBridgeEgressCandidateAddress,
+  type BridgeEgressApplyResult,
+  type BridgeEgressCandidate,
   type BridgeEgressLayer,
   type BridgeEgressReport,
 } from "./bridgeEgress";
@@ -657,6 +661,9 @@ function App() {
   const [bridgeEgressChecking, setBridgeEgressChecking] = useState(false);
   const [bridgeEgressError, setBridgeEgressError] = useState("");
   const [bridgeEgressCopyState, setBridgeEgressCopyState] = useState("");
+  const [bridgeEgressApplyBusy, setBridgeEgressApplyBusy] = useState(false);
+  const [bridgeEgressApplyError, setBridgeEgressApplyError] = useState("");
+  const [bridgeEgressApplyResult, setBridgeEgressApplyResult] = useState<BridgeEgressApplyResult>();
   const allowRefreshEpoch = useRef(0);
   const gradeRefreshInFlight = useRef(false);
   const busyRef = useRef(false);
@@ -666,6 +673,7 @@ function App() {
   const runtimeInitializationAttempted = useRef(false);
   const runtimeCheckingRef = useRef(false);
   const bridgeEgressCheckingRef = useRef(false);
+  const bridgeEgressApplyBusyRef = useRef(false);
   const bridgeEgressDialogRef = useRef<HTMLElement>(null);
   const laneStateRef = useRef<LaneState<AllowStatus, SystemStatus, WorkLaneValue | undefined>>(
     createLaneState(initialAllowStatus, initialStatus, undefined),
@@ -722,6 +730,10 @@ function App() {
   }, [runtimePromptMode, runtimeUpdate]);
   const bridgeEgressPrompt = useMemo(
     () => bridgeEgressReport ? buildBridgeEgressRepairPrompt(bridgeEgressReport) : "",
+    [bridgeEgressReport],
+  );
+  const recommendedBridgeEgressCandidate = useMemo(
+    () => bridgeEgressReport?.candidates?.find((candidate) => candidate.recommended),
     [bridgeEgressReport],
   );
 
@@ -1623,6 +1635,8 @@ function App() {
     setBridgeEgressReport(undefined);
     setBridgeEgressError("");
     setBridgeEgressCopyState("");
+    setBridgeEgressApplyError("");
+    setBridgeEgressApplyResult(undefined);
     setShowBridgeEgressAssistant(true);
   }
 
@@ -1662,6 +1676,8 @@ function App() {
         value: { probe: "bridge_egress", value: result.value },
       });
       setBridgeEgressReport(result.value);
+      setBridgeEgressApplyError("");
+      setBridgeEgressApplyResult(undefined);
       if (result.value.ok) {
         setProbeNotice((current) => current?.source === "work.bridge_egress" ? undefined : current);
       } else {
@@ -1684,6 +1700,51 @@ function App() {
       setBridgeEgressCopyState("修复 Prompt 已复制，可以交给本地 Codex。");
     } catch {
       setBridgeEgressCopyState("自动复制失败，请在文本框中按 Ctrl+A、Ctrl+C 手动复制。");
+    }
+  }
+
+  async function applyBridgeEgressFix() {
+    if (!recommendedBridgeEgressCandidate || bridgeEgressApplyBusyRef.current) return;
+    bridgeEgressApplyBusyRef.current = true;
+    setBridgeEgressApplyBusy(true);
+    setBridgeEgressApplyError("");
+    setBridgeEgressApplyResult(undefined);
+    try {
+      const result = isTauri
+        ? await invoke<BridgeEgressApplyResult>("apply_bridge_egress_fix", {
+          candidateUrl: recommendedBridgeEgressCandidate.address,
+        })
+        : await Promise.resolve<BridgeEgressApplyResult>({
+          operation: "bridge_egress_apply",
+          ok: true,
+          code: "work.bridge_egress.apply_ok",
+          backupPath: "/home/user/.claude-science/proxy/config.json.bak-20260825-123456",
+          beforeOutboundProxyUrl: bridgeEgressReport?.outboundProxyUrl || "",
+          afterOutboundProxyUrl: recommendedBridgeEgressCandidate.address,
+          afterProbe: {
+            ...browserPreviewBridgeEgressReport,
+            ok: true,
+            code: "work.bridge_egress.ok",
+            conclusion: "Bridge 出口修复后验证通过。",
+            outboundProxyUrl: recommendedBridgeEgressCandidate.address,
+            proxy: { state: "passed", code: "work.bridge_egress.proxy_ok", durationMs: 2 },
+            models: { state: "passed", code: "work.bridge_egress.models_ok", httpStatus: 200, durationMs: 81 },
+            request: { state: "passed", code: "work.bridge_egress.request_ok", httpStatus: 200, durationMs: 213 },
+          },
+        });
+      setBridgeEgressApplyResult(result);
+      if (!result.ok) {
+        setBridgeEgressApplyError(`${result.code}: 出口修复未通过验证。`);
+      }
+    } catch (caught) {
+      const rawMessage = caught instanceof Error ? caught.message : String(caught);
+      const message = rawMessage.startsWith("work.bridge_egress.apply_")
+        ? rawMessage
+        : `work.bridge_egress.apply_failed: ${rawMessage}`;
+      setBridgeEgressApplyError(message);
+    } finally {
+      bridgeEgressApplyBusyRef.current = false;
+      setBridgeEgressApplyBusy(false);
     }
   }
 
@@ -1970,8 +2031,71 @@ function App() {
                     </div>
                   ))}
                 </div>
+                {bridgeEgressReport.candidates && bridgeEgressReport.candidates.length > 0 && (
+                  <details className="migration-boundary" open>
+                    <summary>出口候选（当前上游可达优先，直连最后）</summary>
+                    <div className="bridge-egress-layers" aria-label="Bridge 出口候选">
+                      {bridgeEgressReport.candidates.map((candidate: BridgeEgressCandidate, index) => (
+                        <div
+                          className={`bridge-egress-layer bridge-egress-candidate ${candidate.upstream?.state ?? candidate.tcp?.state ?? "skipped"}`}
+                          key={`${candidate.address || "direct"}-${index}`}
+                        >
+                          <span>{index + 1} · {candidate.source || "未知来源"}{candidate.processName ? ` / ${candidate.processName}` : ""}</span>
+                          <strong>{candidate.recommended ? "推荐" : "候选"}</strong>
+                          <code>{displayBridgeEgressCandidateAddress(candidate)}</code>
+                          <small>
+                            TCP {candidate.tcp?.code || "未探测"}<br />
+                            上游 {candidate.upstream?.code || "未探测"}<br />
+                            {candidate.reason || "未提供推荐理由"}
+                          </small>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+                {recommendedBridgeEgressCandidate && (
+                  <details className="migration-boundary" open>
+                    <summary>WORK · 出口修复（只有用户点击才写入）</summary>
+                    <p>
+                      before：<code>{bridgeEgressReport.outboundProxyConfigured
+                        ? displayBridgeEgressAddress(bridgeEgressReport.outboundProxyUrl)
+                        : "直连（outbound_proxy_url 未配置）"}</code>
+                    </p>
+                    <p>
+                      after：<code>{displayBridgeEgressCandidateAddress(recommendedBridgeEgressCandidate)}</code>
+                    </p>
+                    <p>推荐理由：{recommendedBridgeEgressCandidate.reason || "该候选的当前上游探测通过。"}</p>
+                    <div className="bridge-egress-consent">
+                      <strong>应用后的验证会发送 1 次真实请求</strong>
+                      <p>验证使用 <code>max_tokens=1</code>，可能产生极少量模型费用；点击下方按钮即表示同意本次写入与这 1 次验证请求。</p>
+                    </div>
+                    {bridgeEgressApplyResult && (
+                      <div className={`bridge-egress-summary ${bridgeEgressApplyResult.ok ? "ok" : "fail"}`} aria-live="polite">
+                        <strong>{bridgeEgressApplyResult.code}</strong>
+                        <p>
+                          探针 before：<code>{bridgeEgressReport.code}</code>
+                          {" → "}
+                          after：<code>{bridgeEgressApplyResult.afterProbe?.code || "未返回"}</code>
+                        </p>
+                        <small>
+                          配置 before：{displayBridgeEgressAddress(bridgeEgressApplyResult.beforeOutboundProxyUrl)} · after：{displayBridgeEgressAddress(bridgeEgressApplyResult.afterOutboundProxyUrl)}
+                          {bridgeEgressApplyResult.backupPath ? ` · 备份：${bridgeEgressApplyResult.backupPath}` : ""}
+                        </small>
+                      </div>
+                    )}
+                    {bridgeEgressApplyError && <div className="bridge-egress-error" role="alert">{bridgeEgressApplyError}</div>}
+                    <div className="migration-actions">
+                      {bridgeEgressApplyBusy && <span aria-live="polite">正在备份、局部更新并验证…</span>}
+                      <button
+                        className="primary-inline-button"
+                        onClick={applyBridgeEgressFix}
+                        disabled={bridgeEgressApplyBusy}
+                      >应用此修复（会修改 Bridge 出口配置）</button>
+                    </div>
+                  </details>
+                )}
                 <div className="migration-boundary">
-                  启动器只生成修复 Prompt，不会自动修改代理配置。请把 Prompt 交给 Codex 做只读复核，再由你决定是否批准最小修改。
+                  启动器不会自动修改代理配置。你可以复制 Prompt 做只读复核；只有上方 WORK 区域的显式应用按钮会备份并局部修改一个字段，验证失败时自动回滚。
                 </div>
                 <label className="migration-prompt-label" htmlFor="bridge-egress-prompt">复制下面内容给 Codex</label>
                 <textarea id="bridge-egress-prompt" value={bridgeEgressPrompt} readOnly spellCheck={false} />
@@ -1981,6 +2105,8 @@ function App() {
                     setBridgeEgressReport(undefined);
                     setBridgeEgressError("");
                     setBridgeEgressCopyState("");
+                    setBridgeEgressApplyError("");
+                    setBridgeEgressApplyResult(undefined);
                   }}>重新检测（重新确认）</button>
                   <button className="primary-inline-button" onClick={copyBridgeEgressPrompt}>复制修复 Prompt</button>
                 </div>
@@ -2129,7 +2255,7 @@ function App() {
             </div>
             <div className="key-switch-confirm" aria-live="polite">
               <span>{pendingApiKeyId && pendingApiKeyId !== activeApiKeyId
-                ? `待切换：${apiKeys.find((entry) => entry.id === pendingApiKeyId)?.label || "已选供应商"}`
+                ? `待切换：${apiKeys.find((entry) => entry.id === pendingApiKeyId)?.label || "已选供应商"}；确认后会重启 Bridge，并发送 1 次 max_tokens=1 真实验证请求`
                 : "点击列表预选，确认后才会重启并生效"}</span>
               <div>
                 <button onClick={cancelPendingKey} disabled={busy || pendingApiKeyId === activeApiKeyId}>取消</button>
@@ -2177,8 +2303,8 @@ function App() {
 
           <div className="key-switch-confirm scheme-switch-confirm" aria-live="polite">
             <span>{pendingSchemeId !== activeAggregateSchemeId
-              ? `待切换：${pendingSchemeId === "scheme-1" ? "方案一" : "方案二"}`
-              : "点击方案预选，确认后才会重启并同时接入三个模型"}</span>
+              ? `待切换：${pendingSchemeId === "scheme-1" ? "方案一" : "方案二"}；会重启 Bridge，并经受管 Bridge 对决策、视觉、日常三路各发送 1 次 max_tokens=1 真实验证请求（共 3 次，可能产生费用）`
+              : "点击方案预选，确认后才会重启 Bridge；三条路由各验证 1 次，共 3 次 max_tokens=1 真实请求，可能产生费用"}</span>
             <div>
               <button onClick={cancelPendingAggregateScheme} disabled={busy}>取消</button>
               <button
@@ -2239,7 +2365,7 @@ function App() {
 
           <div className="role-mapping-footer">
             <span>{roleMappingsDirty
-              ? `${selectedSchemeId === "scheme-1" ? "方案一" : "方案二"}有未应用修改`
+              ? `${selectedSchemeId === "scheme-1" ? "方案一" : "方案二"}有未应用修改；应用后会经受管 Bridge 对三条路由各发送 1 次 max_tokens=1 真实验证请求（共 3 次，可能产生费用）`
               : activeAggregateSchemeId === selectedSchemeId
                 ? "当前方案的三个模型槽已同时生效"
                 : "当前方案尚未应用"}</span>
