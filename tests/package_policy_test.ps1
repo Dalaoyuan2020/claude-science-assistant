@@ -80,7 +80,9 @@ if (Test-Path -LiteralPath $packageScriptPath) {
     '$BridgeVersionSurfaces',
     '$CurrentReleaseDocumentName',
     'Bridge package version disagrees',
-    'Current Release document is missing'
+    'Current Release document is missing',
+    '$SavedCargoBuildJobs',
+    '$env:CARGO_BUILD_JOBS = "1"'
   )) {
     if (-not $packageScriptText.Contains($requiredVersionSurface)) {
       throw "Portable packaging must reject a split launcher version identity: $requiredVersionSurface"

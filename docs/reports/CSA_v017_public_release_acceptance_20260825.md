@@ -60,6 +60,8 @@ git diff --check:                       passed
 
 第一次从独立 clean worktree 运行 release gate 时，源码合同测试在 Git 的 CRLF checkout 下无法匹配写死的 LF 多行边界，出现 112 passed / 1 failed。功能代码没有失败，但正式门按预期停止，未生成资产。测试随后在匹配前统一把 CRLF 规范化为 LF，并从 `launcher/src-tauri` 工作目录复测通过；正式打包必须从包含该修复的新提交重新开始，不能沿用失败构建。
 
+后续 clean-source 门、Rust/WSL 故障注入和 20 次生命周期测试全部通过后，首次优化版 Tauri 冷编译中的 `rustc` 进程以 Windows `STATUS_ACCESS_VIOLATION` 退出，没有产生源码诊断，也没有生成 ZIP。打包脚本原本只把测试固定为单 Cargo job，最终 release build 仍可能并行；现已让最终 Tauri 构建在调用方未显式设置时默认使用 `CARGO_BUILD_JOBS=1`，并在结束后恢复原进程环境。正式资产仍须从包含该修复的新提交完整重跑，不能复用崩溃构建。
+
 新增 UI 回归覆盖：三皮肤 LauncherSettings 往返和非法值回退、单一主 DOM、三个 `aria-pressed` 选项、Help dialog 语义、背景 inert、Escape/Tab/焦点恢复源码合同、二维码资源存在且不引用过期群码，以及关键前景/背景组合的 WCAG AA 4.5:1 下限。
 
 ## 隔离 Windows 可视验收

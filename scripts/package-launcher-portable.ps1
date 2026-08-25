@@ -124,18 +124,26 @@ if (-not $OutputDir) {
 $OutputDir = (New-Item -ItemType Directory -Force -Path $OutputDir).FullName
 
 if (-not $SkipBuild) {
-  Push-Location $LauncherDir
+  $SavedCargoBuildJobs = [Environment]::GetEnvironmentVariable("CARGO_BUILD_JOBS", "Process")
   try {
-    if ($Profile -eq "debug") {
-      & pnpm tauri build --debug --no-bundle
-    } else {
-      & pnpm tauri build --no-bundle
+    if (-not $SavedCargoBuildJobs) {
+      $env:CARGO_BUILD_JOBS = "1"
     }
-    if ($LASTEXITCODE -ne 0) {
-      throw "Tauri build failed with exit code $LASTEXITCODE"
+    Push-Location $LauncherDir
+    try {
+      if ($Profile -eq "debug") {
+        & pnpm tauri build --debug --no-bundle
+      } else {
+        & pnpm tauri build --no-bundle
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "Tauri build failed with exit code $LASTEXITCODE"
+      }
+    } finally {
+      Pop-Location
     }
   } finally {
-    Pop-Location
+    [Environment]::SetEnvironmentVariable("CARGO_BUILD_JOBS", $SavedCargoBuildJobs, "Process")
   }
 }
 $FinalSourceState = Get-CsaGitSourceState -ProjectDir $ProjectDir
