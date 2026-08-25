@@ -66,12 +66,26 @@ if (Test-Path -LiteralPath $packageScriptPath) {
     throw "Portable package naming function is missing."
   }
   Invoke-Expression $nameFunction.Extent.Text
-  $unqualifiedName = Get-CsaPortablePackageName -Version "0.1.6" -BuildProfile "release"
-  $qualityName = Get-CsaPortablePackageName -Version "0.1.6" -Qualifier "quality" -BuildProfile "release"
-  if ($unqualifiedName -eq $qualityName -or $qualityName -ne "claude-science-assistant-v0.1.6-quality-release-portable") {
-    throw "A qualified release must use a distinct artifact name and must not overwrite the unqualified v0.1.6 release."
+  $unqualifiedName = Get-CsaPortablePackageName -Version "9.9.9" -BuildProfile "release"
+  $qualityName = Get-CsaPortablePackageName -Version "9.9.9" -Qualifier "quality" -BuildProfile "release"
+  if ($unqualifiedName -eq $qualityName -or $qualityName -ne "claude-science-assistant-v9.9.9-quality-release-portable") {
+    throw "A qualified release must use a distinct artifact name and must not overwrite the unqualified release."
   }
   $packageScriptText = Get-Content -LiteralPath $packageScriptPath -Raw -Encoding UTF8
+  foreach ($requiredVersionSurface in @(
+    '$AppVersionMatch',
+    '$TauriWindowTitle',
+    '$ExpectedWindowTitle',
+    'app=$AppVersion',
+    '$BridgeVersionSurfaces',
+    '$CurrentReleaseDocumentName',
+    'Bridge package version disagrees',
+    'Current Release document is missing'
+  )) {
+    if (-not $packageScriptText.Contains($requiredVersionSurface)) {
+      throw "Portable packaging must reject a split launcher version identity: $requiredVersionSurface"
+    }
+  }
   foreach ($literalCleanup in @(
     'Remove-Item -LiteralPath $PackageRoot',
     'Remove-Item -LiteralPath $ZipPath',

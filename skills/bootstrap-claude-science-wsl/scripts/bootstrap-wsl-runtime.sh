@@ -94,7 +94,7 @@ if [ "$DRY_RUN" = "1" ]; then
   say "+ stage Bridge into $CSA_BRIDGE_ROOT/versions and atomically activate current"
   say "+ verify Claude Science version/hash, reject implicit downgrade, then activate $CSA_CLAUDE_ROOT/current"
 else
-  csa_stage_bridge_runtime "$PROJECT_DIR" "${CSA_PACKAGE_VERSION:-0.1.6}"
+  csa_stage_bridge_runtime "$PROJECT_DIR" "${CSA_PACKAGE_VERSION:-0.1.7}"
   csa_stage_claude_runtime "$PROJECT_DIR"
 fi
 

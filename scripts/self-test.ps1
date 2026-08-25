@@ -97,7 +97,7 @@ $StartScriptPath = Join-Path $ProjectDir "scripts\start-claude-science-wsl.sh"
 Assert-CsaUtf8NoBom -Path $RuntimeManifestPath
 $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$RuntimeManifest.version -ne "0.1.25") {
-  throw "v0.1.6 must lock Claude Science stable 0.1.25."
+  throw "v0.1.7 must lock Claude Science stable 0.1.25."
 }
 if (Test-Path -LiteralPath $RuntimeBinaryPath) {
   $RuntimeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $RuntimeBinaryPath).Hash.ToLowerInvariant()

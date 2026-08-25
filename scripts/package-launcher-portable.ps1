@@ -58,9 +58,53 @@ if (-not $CargoVersionMatch.Success) {
 }
 $Version = $CargoVersionMatch.Groups[1].Value
 $PackageVersion = (Get-Content -LiteralPath (Join-Path $LauncherDir "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json).version
-$TauriVersion = (Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\tauri.conf.json") -Raw -Encoding UTF8 | ConvertFrom-Json).version
-if ($Version -ne $PackageVersion -or $Version -ne $TauriVersion) {
-  throw "Launcher versions disagree: Cargo=$Version package=$PackageVersion tauri=$TauriVersion"
+$TauriConfig = Get-Content -LiteralPath (Join-Path $LauncherDir "src-tauri\tauri.conf.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+$TauriVersion = $TauriConfig.version
+$TauriWindowTitle = [string]$TauriConfig.app.windows[0].title
+$AppSource = Get-Content -LiteralPath (Join-Path $LauncherDir "src\App.tsx") -Raw -Encoding UTF8
+$AppVersionMatch = [regex]::Match($AppSource, '(?m)^const\s+APP_VERSION\s*=\s*"v([^"]+)";')
+if (-not $AppVersionMatch.Success) {
+  throw "Unable to read launcher display version from App.tsx."
+}
+$AppVersion = $AppVersionMatch.Groups[1].Value
+$ExpectedWindowTitle = "CSA V$Version - Claude Science Assistant"
+if (
+  $Version -ne $PackageVersion -or
+  $Version -ne $TauriVersion -or
+  $Version -ne $AppVersion -or
+  $TauriWindowTitle -ne $ExpectedWindowTitle
+) {
+  throw "Launcher versions disagree: Cargo=$Version package=$PackageVersion tauri=$TauriVersion app=$AppVersion title='$TauriWindowTitle'"
+}
+$BridgeVersionSurfaces = @(
+  [ordered]@{
+    Label = "launcher start script"
+    Path = Join-Path $ProjectDir "scripts\start-claude-science-wsl.ps1"
+    Pattern = '(?m)\[string\]\$PackageVersion\s*=\s*"([^"]+)"'
+  },
+  [ordered]@{
+    Label = "repair skill"
+    Path = Join-Path $ProjectDir "skills\bootstrap-claude-science-wsl\scripts\repair-approved.ps1"
+    Pattern = '(?m)^\$packageVersion\s*=\s*"([^"]+)"'
+  },
+  [ordered]@{
+    Label = "runtime bootstrap"
+    Path = Join-Path $ProjectDir "skills\bootstrap-claude-science-wsl\scripts\bootstrap-wsl-runtime.sh"
+    Pattern = '\$\{CSA_PACKAGE_VERSION:-([^}]+)\}'
+  }
+)
+foreach ($Surface in $BridgeVersionSurfaces) {
+  $SurfaceText = Get-Content -LiteralPath $Surface.Path -Raw -Encoding UTF8
+  $SurfaceMatch = [regex]::Match($SurfaceText, $Surface.Pattern)
+  if (-not $SurfaceMatch.Success -or $SurfaceMatch.Groups[1].Value -ne $Version) {
+    $ActualSurfaceVersion = if ($SurfaceMatch.Success) { $SurfaceMatch.Groups[1].Value } else { "unreadable" }
+    throw "Bridge package version disagrees: $($Surface.Label)=$ActualSurfaceVersion expected=$Version"
+  }
+}
+$CurrentReleaseDocumentName = "github-release-v$Version.md"
+$CurrentReleaseDocumentPath = Join-Path (Join-Path $ProjectDir "docs") $CurrentReleaseDocumentName
+if (-not (Test-Path -LiteralPath $CurrentReleaseDocumentPath -PathType Leaf)) {
+  throw "Current Release document is missing: docs/$CurrentReleaseDocumentName"
 }
 if ($Profile -eq "release" -and $SkipBuild) {
   throw "Release packaging must compile the launcher; -SkipBuild is allowed only for debug packages."
@@ -191,6 +235,7 @@ Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.4.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.4.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.5.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.5.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "github-release-v0.1.6.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "github-release-v0.1.6.md")
+Copy-Item -LiteralPath $CurrentReleaseDocumentPath -Destination (Join-Path (Join-Path $PackageRoot "docs") $CurrentReleaseDocumentName)
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "green-book-integration.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "green-book-integration.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-requirement-audit.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-requirement-audit.zh-CN.md")
 Copy-Item -LiteralPath (Join-Path (Join-Path $ProjectDir "docs") "v0.1-current-pc-verification.zh-CN.md") -Destination (Join-Path (Join-Path $PackageRoot "docs") "v0.1-current-pc-verification.zh-CN.md")
@@ -292,6 +337,7 @@ $Manifest = [ordered]@{
     "docs/github-release-v0.1.4.md",
     "docs/github-release-v0.1.5.md",
     "docs/github-release-v0.1.6.md",
+    "docs/$CurrentReleaseDocumentName",
     "docs/green-book-integration.zh-CN.md",
     "docs/v0.1-requirement-audit.zh-CN.md",
     "docs/v0.1-current-pc-verification.zh-CN.md",
@@ -346,7 +392,7 @@ $Readme = @(
   "For cross-PC diagnostics, run scripts/status-probe.ps1 from the extracted package root. It verifies WSL health, service path relocation, Bridge health, and Claude Science ports without printing secrets.",
   "DPAPI keys are tied to the current Windows user and PC. Copying this portable package to another PC does not carry API keys; add them again on that PC.",
   ("This package bundles locked Claude Science Linux binary {0}, sha256 {1}." -f $BundledClaudeInfo.version, $BundledClaudeInfo.sha256),
-  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/github-release-v0.1.6.md, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
+  "For Chinese instructions, see docs/quick-start.zh-CN.md, docs/$CurrentReleaseDocumentName, docs/prompts/csa-install-or-upgrade-agent-prompt.zh-CN.md, docs/prompts/csa-wsl-storage-migration-codex-prompt.zh-CN.md, docs/green-book-integration.zh-CN.md, docs/v0.1-clean-pc-acceptance.zh-CN.md, and manifest.json.",
   "",
   "This package does not include API keys, OAuth tokens, control tokens, or user config."
 ) -join [Environment]::NewLine

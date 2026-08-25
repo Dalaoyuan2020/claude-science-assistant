@@ -2463,6 +2463,7 @@ fn normalized_ui_skin(value: Option<&str>) -> Option<String> {
     match value {
         Some("console") => Some("console".into()),
         Some("classic") => Some("classic".into()),
+        Some("dark") => Some("dark".into()),
         // An invalid persisted value must never blank the launcher or reopen the
         // first-run chooser forever. Treat it as the safe new-skin fallback.
         Some(_) => Some("console".into()),
@@ -4841,8 +4842,8 @@ fn get_ui_preferences() -> UiPreferences {
 
 fn save_ui_skin_impl(ui_skin: String) -> Result<UiPreferences, String> {
     let ui_skin = match ui_skin.as_str() {
-        "console" | "classic" => ui_skin,
-        _ => return Err("界面外观只能是 console 或 classic".into()),
+        "console" | "classic" | "dark" => ui_skin,
+        _ => return Err("界面外观只能是 console、classic 或 dark".into()),
     };
     let mut settings = load_settings();
     settings.ui_skin = Some(ui_skin);
@@ -5557,7 +5558,7 @@ fn get_runtime_update_status_impl() -> Result<RuntimeUpdateStatus, String> {
             .map(|duration| duration.as_secs())
             .unwrap_or_default(),
         release_notes_url: CLAUDE_SCIENCE_CHANGELOG_URL.into(),
-        note: "CSA v0.1.6 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
+        note: "CSA v0.1.7 已验证并锁定 0.1.25；官方更高版本需先由本地 Agent 隔离验证，不会自动覆盖当前运行时。".into(),
     })
 }
 
@@ -6323,7 +6324,7 @@ fn claude_url_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Resu
     // vendor CLI also uses small exit codes (including 2), so raw-code mapping
     // creates false "runtime missing" diagnostics while the binary is present.
     let base = if cleaned_stderr.contains("CSA_URL_RUNTIME_MISSING") {
-        "runtime.entry_missing: Claude Science 受管运行时入口缺失；请从完整 V0.1.6 便携包执行修复。"
+        "runtime.entry_missing: Claude Science 受管运行时入口缺失；请从完整 V0.1.7 便携包执行修复。"
     } else if cleaned_stderr.contains("CSA_URL_LIFECYCLE_BUSY") {
         "login.lifecycle_busy: Claude Science 仍在启动或重启；生命周期锁当前正忙，请稍后重试。"
     } else if cleaned_stderr.contains("CSA_URL_FLOCK_MISSING") {
@@ -7387,7 +7388,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_v018_exact_snapshot() {
+    fn provider_catalog_release_exact_snapshot() {
         let catalog = provider_catalog();
         let groups: Vec<_> = catalog
             .iter()
@@ -8058,6 +8059,11 @@ mod tests {
         let encoded = serde_json::to_string(&selected).unwrap();
         let decoded: LauncherSettings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(ui_preferences(&decoded).skin.as_deref(), Some("classic"));
+
+        selected.ui_skin = Some("dark".into());
+        let encoded = serde_json::to_string(&selected).unwrap();
+        let decoded: LauncherSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(ui_preferences(&decoded).skin.as_deref(), Some("dark"));
 
         selected.ui_skin = Some("unknown-skin".into());
         assert_eq!(ui_preferences(&selected).skin.as_deref(), Some("console"));

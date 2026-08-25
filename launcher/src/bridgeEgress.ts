@@ -161,7 +161,7 @@ export function buildBridgeEgressRepairPrompt(report: BridgeEgressReport): strin
     : "- 无额外警告";
 
   return [
-    "请协助我只读复核并修复 CSA Bridge → 上游模型 API 的真实出口。当前目录应是 CSA V0.1.6 完整便携包或其源码工作树。",
+    "请协助我只读复核并修复 CSA Bridge → 上游模型 API 的真实出口。当前目录应是 CSA V0.1.7 完整便携包或其源码工作树。",
     "",
     "启动器观测值（均须用本机只读命令复核；不得把它们当作授权直接修改）：",
     `- 顶层判定：${safeCode(report.code)}`,

@@ -17,6 +17,7 @@ import {
   buildRuntimeUpgradePrompt,
   type RuntimeUpdateStatus,
 } from "./runtimeUpdate";
+import { HelpDialog } from "./HelpDialog";
 import {
   classifyNonGatingFailure,
   createLaneState,
@@ -32,7 +33,7 @@ import {
 import { deleteConfirmationText, screenMessage } from "./uiPresentation";
 import "./App.css";
 
-const APP_VERSION = "v0.1.8";
+const APP_VERSION = "v0.1.7";
 const GRADE_STATUS_TIMEOUT_MS = 15_000;
 const NETWORK_QUALITY_TIMEOUT_MS = 25_000;
 const RUNTIME_UPDATE_TIMEOUT_MS = 45_000;
@@ -48,7 +49,7 @@ const STARTUP_CAPTIONS = [
 ] as const;
 
 type SystemState = "loading" | "notInstalled" | "stopped" | "degraded" | "running" | "error";
-type UiSkin = "console" | "classic";
+type UiSkin = "console" | "classic" | "dark";
 type ScreenTone = "normal" | "warning" | "fault" | "safe";
 
 interface UiPreferences {
@@ -660,6 +661,7 @@ function App() {
   const [skin, setSkin] = useState<UiSkin>("console");
   const [skinPreferenceResolved, setSkinPreferenceResolved] = useState(false);
   const [showSkinChooser, setShowSkinChooser] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [skinChoiceRequired, setSkinChoiceRequired] = useState(false);
   const [skinSaving, setSkinSaving] = useState(false);
   const [skinError, setSkinError] = useState("");
@@ -812,6 +814,7 @@ function App() {
     () => bridgeEgressReport?.candidates?.find((candidate) => candidate.recommended),
     [bridgeEgressReport],
   );
+  const closeHelp = useCallback(() => setShowHelp(false), []);
 
   useEffect(() => {
     document.documentElement.dataset.skin = skin;
@@ -954,7 +957,7 @@ function App() {
       }
       try {
         const preferences = await invoke<UiPreferences>("get_ui_preferences");
-        if (preferences.skin === "classic" || preferences.skin === "console") {
+        if (preferences.skin === "classic" || preferences.skin === "console" || preferences.skin === "dark") {
           setSkin(preferences.skin);
           setSkinChoiceRequired(false);
           setShowSkinChooser(false);
@@ -1030,7 +1033,7 @@ function App() {
     try {
       if (isTauri) {
         const saved = await invoke<UiPreferences>("save_ui_skin", { uiSkin: nextSkin });
-        setSkin(saved.skin === "classic" ? "classic" : "console");
+        setSkin(saved.skin === "classic" || saved.skin === "dark" ? saved.skin : "console");
       } else {
         setSkin(nextSkin);
       }
@@ -2040,7 +2043,7 @@ function App() {
       ? STARTUP_CAPTIONS[startupCaptionIndex]
       : "待机";
   const screenDetail = screenReady
-    ? "8765 · 受管运行时 · Bridge 0.1.6"
+    ? "8765 · 受管运行时 · Bridge 0.1.7"
     : screenStarting
       ? "正在准备唯一受管运行时"
       : "按「启动」开始";
@@ -2204,7 +2207,7 @@ function App() {
               <div>
                 <span className="eyebrow">CSA Launcher</span>
                 <h2 id="skin-choice-title">选择界面外观</h2>
-                <p>两套外观使用同一组功能；选择会保存在启动器设置中。</p>
+                <p>三套外观使用同一组功能；选择会保存在启动器设置中。</p>
               </div>
               {!skinChoiceRequired && (
                 <button className="quiet-button" onClick={() => setShowSkinChooser(false)} disabled={skinSaving}>关闭</button>
@@ -2218,7 +2221,7 @@ function App() {
                 </div>
                 <h3>终端控制台</h3>
                 <p>一块屏说状态，实体按键操作</p>
-                <button onClick={() => void chooseSkin("console")} disabled={skinSaving || appearanceBlocked}>
+                <button aria-pressed={skin === "console"} onClick={() => void chooseSkin("console")} disabled={skinSaving || appearanceBlocked}>
                   使用终端控制台
                 </button>
               </article>
@@ -2228,8 +2231,18 @@ function App() {
                 </div>
                 <h3>经典面板</h3>
                 <p>分区卡片，信息平铺</p>
-                <button onClick={() => void chooseSkin("classic")} disabled={skinSaving || appearanceBlocked}>
+                <button aria-pressed={skin === "classic"} onClick={() => void chooseSkin("classic")} disabled={skinSaving || appearanceBlocked}>
                   使用经典面板
+                </button>
+              </article>
+              <article className={`skin-option ${skin === "dark" ? "selected" : ""}`}>
+                <div className="skin-thumbnail dark-thumbnail" aria-hidden="true">
+                  <span /><span /><span /><span />
+                </div>
+                <h3>深色面板</h3>
+                <p>低亮环境使用，结构和功能不变</p>
+                <button aria-pressed={skin === "dark"} onClick={() => void chooseSkin("dark")} disabled={skinSaving || appearanceBlocked}>
+                  使用深色面板
                 </button>
               </article>
             </div>
@@ -2238,10 +2251,12 @@ function App() {
         </div>
       )}
 
+      {showHelp && <HelpDialog version={APP_VERSION} onClose={closeHelp} />}
+
       <div
         className="app-content"
-        aria-hidden={!skinPreferenceResolved || showSkinChooser}
-        inert={!skinPreferenceResolved || showSkinChooser}
+        aria-hidden={!skinPreferenceResolved || showSkinChooser || showHelp}
+        inert={!skinPreferenceResolved || showSkinChooser || showHelp}
       >
 
       <header className="topbar nameplate">
@@ -2329,7 +2344,7 @@ function App() {
         </div>
       </section>
 
-      <details className="diagnostics-drawer" open={skin === "classic" ? true : undefined}>
+      <details className="diagnostics-drawer" open={skin === "console" ? undefined : true}>
         <summary>
           <span>完整诊断与维护</span>
           <small>环境状态、错误详情、存储建议与运行时更新</small>
@@ -3017,7 +3032,7 @@ function App() {
                     <div className="test-panel-head">
                       <div>
                         <strong>测试</strong>
-                        <small>测试会向该供应商发一次很小的请求，确认 Key 能用，并读回可用模型。</small>
+                        <small>测试会读取模型列表，并可能对多个候选模型以两档输出预算发送多次真实请求；可能产生费用，请勿反复点击。</small>
                       </div>
                       <div className="test-panel-actions">
                         <button onClick={testDraftApiKey} disabled={busy || testingKey || autoMappingKey}>
@@ -3153,6 +3168,7 @@ function App() {
       <footer>
         <span>{allowStatus.linuxUser && allowStatus.distro ? `${allowStatus.linuxUser} · ${allowStatus.distro}` : "Windows 10/11 · WSL2"}</span>
         <div className="footer-actions">
+          <button className="help-button" onClick={() => setShowHelp(true)}>？ 帮助</button>
           <button className="appearance-button" disabled={appearanceBlocked} onClick={() => {
             setSkinChoiceRequired(false);
             setSkinError("");

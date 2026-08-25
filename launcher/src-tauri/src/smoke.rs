@@ -1316,20 +1316,21 @@ mod tests {
             "bridge.health_invalid"
         );
 
+        let expected_runtime_id = format!("bridge-{}-0123456789abcdef", env!("CARGO_PKG_VERSION"));
         let expected = ExpectedBridgePackage {
             version: env!("CARGO_PKG_VERSION").into(),
-            runtime_id: "bridge-0.1.6-0123456789abcdef".into(),
+            runtime_id: expected_runtime_id.clone(),
             source_sha256: "a".repeat(64),
         };
         assert!(identity_matches_expected_package(
             env!("CARGO_PKG_VERSION"),
-            "bridge-0.1.6-0123456789abcdef",
+            &expected_runtime_id,
             &"a".repeat(64),
             &expected,
         ));
         assert!(!identity_matches_expected_package(
             env!("CARGO_PKG_VERSION"),
-            "bridge-0.1.6-0123456789abcdef",
+            &expected_runtime_id,
             &"b".repeat(64),
             &expected,
         ));

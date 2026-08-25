@@ -5,7 +5,7 @@ param(
   [int]$ProxyPort = 9876,
   [int]$ClaudeSciencePort = 8765,
   [ValidatePattern('^[A-Za-z0-9._-]+$')]
-  [string]$PackageVersion = "0.1.6",
+  [string]$PackageVersion = "0.1.7",
   [switch]$ForceRestart,
   [switch]$Open
 )

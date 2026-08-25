@@ -10,9 +10,9 @@ Claude Science 的 Windows 启动器、WSL 运行时编排器与 API Bridge 管�
 
 > 状态说明：可下载稳定版以 GitHub Latest Release 为准；`main` 可能包含下一版本的发布候选，安装或升级请始终下载完整 Release ZIP。
 
-> 验证边界：v0.1.6 继续锁定 Claude Science 0.1.25，把端口、受管进程、沙盒出口和 Bridge 包身份纳入同一套质检；最终发布状态、哈希和验证结果以 v0.1.6 Release 页为准，视觉订阅图片请求与干净环境安装仍建议在目标电脑复验。
+> 验证边界：v0.1.7 继续锁定 Claude Science 0.1.25，保留 v0.1.6 的端口、受管进程、沙盒出口和 Bridge 包身份质检；最终发布状态、哈希和验证结果以 v0.1.7 Release 页为准，视觉订阅图片请求与干净环境安装仍建议在目标电脑复验。
 
-[下载 v0.1.6](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.6) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
+[下载 v0.1.7](https://github.com/Dalaoyuan2020/claude-science-assistant/releases/tag/v0.1.7) · [第一次安装](#快速开始) · [从旧版升级](#从旧版升级) · [实现原理](#实现原理) · [Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
 
 官方仓库：[Dalaoyuan2020/claude-science-assistant](https://github.com/Dalaoyuan2020/claude-science-assistant)  
 配套阅读：[Claude Science 绿皮书](https://github.com/Dalaoyuan2020/claude-science-green-book)
@@ -31,6 +31,17 @@ CSA 把这些步骤收口成一个桌面应用：
 - 三层订阅聚合：把决策（Opus / 思考）、视觉（Sonnet / 多模态）和日常（Haiku / Fast）分别绑定到不同订阅与模型，整套方案一次应用。
 - 默认保护隐私：API Key 使用 Windows 当前用户 DPAPI 加密，界面、日志、诊断包和发布包不应回显明文 Key。
 - 面向新手，也保留工程入口：新手双击 BAT 和启动器即可开始；熟悉命令行的用户仍可使用 PowerShell 脚本和诊断报告。
+
+## v0.1.7 的核心变化
+
+1. **三套简洁外观**：亮色终端、经典面板与深色面板共用同一套功能 DOM；经典/深色主控四键等宽，布局随窗口宽度自动收放，外观选择在重启后保持。
+2. **深浅色对比统一**：深色卡片统一使用浅色文字，激活态使用可读的前景/背景组合；旧亮色终端和 Classic 的弱文字也补上 WCAG AA 对比度回归。
+3. **内置帮助与人工支持**：底部新增帮助入口，说明第一次添加/启用 API Key、单 Key 切换、三 Key 聚合、深度检测与修复边界，并提供经授权的微信二维码；帮助页明确禁止发送 Key、Token 或未脱敏配置。
+4. **接入操作更清楚**：保存与启用继续分离，切换必须二次确认；所有 Provider 支持自定义名称和重命名，删除操作必须点名目标后再次确认。
+5. **版本身份硬门**：正式打包同时核对 Cargo、package.json、Tauri、窗口标题与页面版本徽标，任何一处不一致都拒绝出包。
+6. **不改已验证的 Key 事务**：Provider、Bridge patch、验证和回滚实现保持不变；发布验证复用 DeepSeek ↔ OpenRouter 的真实往返成功证据，避免仅为重复证明再次产生计费请求。
+
+开发中曾把本轮界面标为未发布的 `v0.1.8 feature-candidate`。公开发布前按产品版本史重新编号为 v0.1.7；不是覆盖一个已经发布的 v0.1.8。安装、升级与完整边界见 [v0.1.7 Release 说明](docs/github-release-v0.1.7.md)。
 
 ## v0.1.6 的核心变化
 
@@ -218,8 +229,8 @@ Claude Science 侧通常会请求类似 `claude-sonnet-*`、`claude-opus-*`、`c
 
 只从 GitHub Releases 下载官方包：
 
-- `claude-science-assistant-v0.1.6-release-portable.zip`
-- `claude-science-assistant-v0.1.6-release-portable.zip.sha256`
+- `claude-science-assistant-v0.1.7-release-portable.zip`
+- `claude-science-assistant-v0.1.7-release-portable.zip.sha256`
 
 不要从群文件、网盘或第三方镜像下载带 `claude-science-assistant.exe` 的压缩包。
 
@@ -391,6 +402,7 @@ Ubuntu-24.04 是默认推荐测试路径，便于复现问题；但启动器不�
 | [docs/quick-start.zh-CN.md](docs/quick-start.zh-CN.md) | 新手完整接入流程 |
 | [docs/architecture-and-product-plan.zh-CN.md](docs/architecture-and-product-plan.zh-CN.md) | 架构、风险审计、产品任务书 |
 | [docs/provider-access-matrix.zh-CN.md](docs/provider-access-matrix.zh-CN.md) | Provider 接入矩阵 |
+| [docs/github-release-v0.1.7.md](docs/github-release-v0.1.7.md) | v0.1.7 GitHub Release 文案、三套外观、帮助与发布边界 |
 | [docs/github-release-v0.1.6.md](docs/github-release-v0.1.6.md) | v0.1.6 GitHub Release 文案、网络质检与升级说明 |
 | [docs/github-release-v0.1.5.md](docs/github-release-v0.1.5.md) | v0.1.5 GitHub Release 文案与安装说明 |
 | [docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md](docs/v0.1.5-model-switch-and-role-mapping.zh-CN.md) | 三层聚合、方案切换与可靠性实现 |

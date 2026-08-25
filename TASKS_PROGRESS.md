@@ -318,3 +318,11 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 证据在哪：`docs/reports/CSA_v018_UI_acceptance_20260825.md` 保存双皮肤逐项预览、隔离 Tauri 跨进程皮肤记忆及亮色/四等分实测、Provider 前后同 SHA-256、A–E 核对和最终 smoke；Node 21/21、Vite build、Rust 113/113（4 ignored）+ 集成 9/9、54 translation tests、package policy 与 Python 35 passed/3 skipped 均通过，smoke 为 `required_fail=0`、出口单项 `gating=false`。
 
 下一步：进入独立发布门，一次性同步 package/Cargo/Tauri 的 v0.1.8 元数据，并在维护窗口补停止/重启、旧 Bridge、真实 Key/聚合、出口应用与正式 ZIP/SHA/secret scan/双入口/并排升级验收；本轮 feature-candidate 不制作正式 Release。
+
+## V0.1.7 公开发布收口（由内部 V0.1.8 UI 候选重新编号）
+
+做了什么：用户明确要求下一公开版使用 V0.1.7，而不是 V0.1.8；因此保留上面的内部候选历史，并把最终产品身份统一为 0.1.7。新增第三套简洁深色外观、底部帮助/FAQ、经授权的个人微信二维码、三皮肤持久化、Classic/Dark 四等分主控、明暗对比度断言，以及 Cargo/package/Tauri/窗口标题/页面徽标五面一致的打包硬门。
+
+证据在哪：`docs/github-release-v0.1.7.md`、`docs/reports/CSA_v017_public_release_acceptance_20260825.md`、`launcher/src/HelpDialog.tsx`、`launcher/src/assets/csa-support-wechat.jpg`、`launcher/tests/ui-console.test.ts`、`scripts/package-launcher-portable.ps1`。Provider/Bridge 切换事务相对已实测的 V0.1.7 出口候选未变，复用 DeepSeek → OpenRouter → DeepSeek 的真实往返成功证据，不为重复截图增加计费请求。
+
+下一步：完成最终全量回归和 clean-source Release 打包；远端 tag、push 与 GitHub Release 上传只在本地产物、SHA-256、secret scan 和独立解压验收全部通过后执行。
