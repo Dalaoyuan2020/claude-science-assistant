@@ -66,6 +66,28 @@ Then restart:
 
 Do not change Clash, v2rayN, sing-box, DNS, TUN, Windows system proxy, hosts, certificates, or port 443 just to make this project use a node.
 
+## 切不了 API Key / 模型请求全部失败
+
+这两个现象可能来自同一条 Bridge 出口配置，但不能仅凭错误文案下结论。CSA Bridge 的上游客户端使用 `trust_env=False`，因此只认 `/health` 中的 `outbound_proxy_url`，不会自动跟随 Windows 系统代理换端口。
+
+按三步只读自查：
+
+1. 读取 `http://127.0.0.1:9876/health`，记下 `outbound_proxy_url`。不要打印 `config.json` 整份内容，以免带出 Key。
+2. 测该地址的 host/port 是否仍在监听。Windows loopback 端口可用 `Test-NetConnection 127.0.0.1 -Port <port>`；最终以启动器「能力体检」从 Bridge 所在 WSL 网络命名空间得到的结果为准。
+3. 对同一上游做“不经代理”的无凭据对照。HTTP 401/403 说明已到认证层；连接拒绝或超时才是连接层。直连成功不代表应该清空代理，因为其他国际上游仍可能不可达。
+
+2026-08-25 现场对照如下（请求均未携带真实 Key）：
+
+| 路线 | DeepSeek | OpenAI | PyPI |
+|---|---|---|---|
+| 直连 | HTTP 401，可达认证层 | 连接超时 | HTTP 200 |
+| 当前代理 12334（Hiddify） | HTTP 401 | HTTP 401 | HTTP 200 |
+| 旧口 10808（v2rayN） | 连接拒绝 | 连接拒绝 | 连接拒绝 |
+
+因此本例不能用“置空”作为通用修复：正确候选是当前 Windows 系统代理 `http://127.0.0.1:12334`，它也能覆盖 OpenAI。请在「能力体检」查看候选排序，再显式点击 `应用此修复（会修改 Bridge 出口配置）`；启动器会先备份，只向本地 `/api/config` 局部 POST `outbound_proxy_url` 一个字段，验证失败则回滚。
+
+更换代理软件后，必须同步核对并更新 Bridge 的 `outbound_proxy_url`。本次故障就是从 v2rayN 换到 Hiddify 后，Bridge 仍指向旧端口 10808 留下的尾巴。不要为此自动修改 Windows/WSL 系统代理、VPN、DNS、hosts、证书或 443。
+
 ## OpenAlex / arXiv or Other Sandbox Requests Return 502
 
 Do not diagnose this from ports `8765`, `8766`, or the sandbox forwarder alone. Those listeners can

@@ -225,15 +225,17 @@ PASS grade 3311ms state=running warnings=0 gating=false
 SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5224 exit=0
 ```
 
-## S5 进行中（合同与安全入口已落地；高风险验收待人工）
+## S5 补充验收（关键计费链路已完成；破坏性/发布项待人工）
 
 做了什么：将任务书 §1–§8 原文冻结为长期合同，并落下防膨胀五问与“非 ALLOW 默认进 GRADE”规则；按 A–E 能力表逐项核对入口。真实 Tauri 中完成刷新、深检、计费说明取消、存储 Prompt、运行时索引与升级/回退 Prompt、供应商/聚合预选取消、打开 Claude Science 等只读点击；浏览器 preview 完成 dummy Key、模型映射和聚合事务接线点击，并明确只算 fixture。验收同时修复全部 preview 成功分支残留旧错误、隐藏 DrvFS 副作用的“重启”文案、三处 `bash -lc` 运输债，以及配置面板 `--noproxy "*"` 在 DrvFS 中被展开导致的 8 秒超时；dashboard origin 进一步固定为 `127.0.0.1:9876`，即使配置中的 host/port 被篡改也不能把 path secret 带离 loopback。
 
 证据在哪：`docs/architecture/CURRENT_CONTRACT.md` 与 MASTER §1–§8 逐行一致；`docs/architecture/PR_CHECKLIST.md` 含五问；34 项能力入口、响应、证据口径和待人工项记录在 `docs/reports/CSA_v016_S5_capability_audit_20260825.md`。Node 11 passed、0 failed；前端 build 35 modules；Rust 库 100 passed、0 failed、4 ignored，独立目标目录集成测试 9 passed、0 failed；总 self-test 为 54 translation tests、package policy、35 passed/3 skipped。最终 smoke 使用独立目标目录的新产物，完整输出如下。
 
-待人工：维护窗口中的启动/停止/修复并重启、旧 Windows Bridge fixture；需要用户明确费用/凭据授权的真实 Key、模型读取、真实接入切换、聚合提交和 egress 第二次确认；发布阶段的 ZIP、SHA-256、包内 secret scan、双入口与并排升级。根据 MASTER“任一条点不动 = S5 未完成”，本阶段不虚报全绿，本轮也不制作正式 Release ZIP。
+V0.1.7 补充：经用户明确授权，已真实执行 DeepSeek → OpenRouter → 原 DeepSeek 的受管 Key 切换/恢复，两次 `max_tokens=1` 产品请求均成功；最终 smoke 又以一次 `max_tokens=1` 验证 egress，全项 PASS、exit 0。Claude PID 始终为 108819，最终 Bridge PID 157675、revision `166128-1787631265733624000`，活动项已恢复原 DeepSeek。详见 `docs/reports/CSA_v016_S5_capability_audit_20260825.md` 文末补充。
 
-下一步：用户提供维护窗口及费用/真实凭据操作的明确批准后，完成剩余现场点击；全部能力全绿后再进入正式发布验收。
+待人工：维护窗口中的启动/停止/修复并重启、旧 Windows Bridge fixture；真实新增 Key、手工模型映射全流程、聚合整表提交、故障现场真实点击 egress 应用；发布阶段的 ZIP、SHA-256、包内 secret scan、双入口与并排升级。根据 MASTER“任一条点不动 = S5 未完成”，仍不虚报 34 项全绿，本轮也不制作正式 Release ZIP。
+
+下一步：在维护窗口补 A2/A7、B2/B3/B6 与 D3/D7 写操作的 UI 证据；另为 Provider 跨进程崩溃窗口设计 durable revision journal；全部能力全绿后再进入正式发布验收。
 
 ```text
 PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
@@ -252,3 +254,51 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 证据在哪：`docs/reports/CSA_v017_T0_egress_baseline.md` 保存 `/health`、九次无凭据 curl 原始输出、`lib.rs` 感知计数与完整 smoke；当前代理三组目标均达认证/HTTP 层，10808 三组均拒绝，smoke 为 `required_fail=0`、`work.bridge_egress.ok`、`gating=false`。
 
 下一步：进入 T1，在既有 WORK 探针内发现并分层验证候选，输出排序与推荐；不进入 ALLOW、首屏或周期刷新。
+
+## V0.1.7 T1 完成
+
+做了什么：在既有 `work.bridge_egress` WORK 探针内加入 Windows 系统代理、常用监听端口/进程名和直连候选；分别验证 TCP 与当前完整 upstream base-URL path，按可达、系统代理优先、直连最后排序并给单一推荐。
+
+证据在哪：`launcher/src-tauri/src/bridge_egress.rs`；现场只读候选为 Hiddify `http://127.0.0.1:12334`（TCP/base URL passed、HTTP 401、recommended）与 direct（passed、非推荐）；`bridge_egress_detects_dead_proxy` 还断言真实请求 path 为 `/configured/base`。
+
+下一步：T2 在现有修复 Prompt 中展示候选表、理由、直连风险与最小单字段命令，继续保持只读与非门禁。
+
+## V0.1.7 T2 完成
+
+做了什么：扩展 `buildBridgeEgressRepairPrompt()`，加入五层结果、候选排序/推荐理由、直连反面提示、before/after、0600 备份、单字段 POST、回滚与 smoke 验证；删除会绕过受管 identity/control token 的裸 POST fallback。
+
+证据在哪：`launcher/src/bridgeEgress.ts` 与 `launcher/tests/bridge-egress.test.ts`；Node 13/13 通过，包含候选顺序、直连警告、URL credential/query/fragment/path 脱敏和审批边界断言。
+
+下一步：T3 实现只有用户二次确认后可调用的局部应用 command，并对失败回滚做可执行故障注入。
+
+## V0.1.7 T3 完成
+
+做了什么：新增 `apply_bridge_egress_fix`；应用前消费单次 proof 并重跑完整非计费探针确认 exact candidate，持 service/transition lock；受管目录 0600 备份，只 POST `outbound_proxy_url`，读回后跑真实 egress，失败只恢复旧字段。
+
+证据在哪：`launcher/src-tauri/src/bridge_egress_apply.rs`、App WORK 折叠区二次确认 UI；`apply_fix_is_partial_update`、`apply_fix_rolls_back_on_failure`、proof/identity/secret source-contract 测试通过。当前配置已正确为 12334，未为截图强行执行无必要写入。
+
+下一步：T4 把 Key 激活失败按连接层/认证层归因，并让真正激活通过受管 Bridge 做 commit 前验证。
+
+## V0.1.7 T4 完成
+
+做了什么：连接失败首行明确“上游不可达”并带当前代理与 `proxy_dead`；401/403 明确“认证失败”且不引导查代理。单 Key 激活在 Bridge patch/restart 后发送一条 `max_tokens=1` 受管请求；聚合三别名在一个 64 秒总预算内并发验证，任一路失败整批回滚。
+
+证据在哪：`preflight_error_attributes_layer`；真实 DeepSeek → OpenRouter revision `135900-1787631237919379600`，再恢复 DeepSeek revision `166128-1787631265733624000`，两次 switch/verification 均成功、退出码 0，最终活动项和 Claude PID 108819 已恢复/保持。
+
+下一步：T5 把死端口、永不门禁、单字段更新、失败回滚、错误分层、stdin secret 与 watchdog 顺序焊进回归。
+
+## V0.1.7 T5 完成
+
+做了什么：补齐任务书五个指定回归，并增加完整 path stdin、exact-candidate 重验、单次 proof、Bridge listener/source/starttime TOCTOU、Key 不进 argv、聚合三路 commit、guest/host watchdog 与凭据代理回滚比较测试。
+
+证据在哪：完整 Rust 为库 107 passed/0 failed/4 ignored、集成 9 passed/0 failed；Node 13 passed/0 failed；`allow_inputs_frozen` 期望集合仍严格为 `{claudeRunning, windowsBridgePid}`；`npm run build` 35 modules。
+
+下一步：T6 更新 troubleshooting、S5、验收报告和任务台账；运行最终 build/smoke/self-test/secret scan 后整理提交。
+
+## V0.1.7 T6 完成
+
+做了什么：新增“切不了 API Key / 模型请求全部失败”三步自查与三路线对照；补 S5 真实切换/恢复证据和 A–E 最新待人工项；形成 feature-candidate 验收报告，并明确非正式 V0.1.7 Release 边界和 durable journal 残余风险。
+
+证据在哪：`docs/troubleshooting.md`、`docs/reports/CSA_v016_S5_capability_audit_20260825.md`、`docs/reports/CSA_v017_acceptance_20260825.md`；最终 smoke 六项 PASS、exit 0；self-test 为 54 translation tests、package policy、35 passed/3 skipped。
+
+下一步：提交代码与文档；后续单独实现 Provider `PREPARED / COMMIT_DECIDED` 跨进程 revision journal，再进入维护窗口与正式发布验收。
