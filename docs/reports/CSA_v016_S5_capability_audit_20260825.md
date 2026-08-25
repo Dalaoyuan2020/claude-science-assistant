@@ -112,7 +112,7 @@
 - 最终 smoke 从独立目标目录的新源码产物直接执行，未使用被 GUI 锁住的旧 debug EXE；当前 GUI、Bridge PID 18733、Claude PID 443 与 2222 均未停止。
 
 ```text
-PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 322ms budget=3000ms
 PASS open 776ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 416ms health=200 models=200 identity=current modelCount=5
@@ -145,7 +145,7 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5603 exit=0
 ### 现场边界与最终状态
 
 - 没有关闭当前启动器 GUI；没有停止 Claude Science；没有关闭整个 WSL；没有触碰 2222。
-- 最终活动接入恢复为 DeepSeek：`activeApiKeyId=key-…-135948`（报告只保留脱敏后缀），`force_model=deepseek-v4-pro`。
+- 最终活动接入恢复为 DeepSeek：`activeApiKeyId=<redacted>`（报告不保留 ID），`force_model=deepseek-v4-pro`。
 - 最终 Bridge PID `157675` 监听 9876；Claude Science PID `108819` 同时监听 8765/8766；`outbound_proxy_url=http://127.0.0.1:12334`。
 - 最终 Bridge revision 为 `166128-1787631265733624000`。
 
@@ -167,7 +167,7 @@ UI 层仍按“预选 → 二次确认”工作；此前真实 UI 已完成预�
 最终 feature-candidate debug 二进制执行 `--smoke`，真实 egress 为：
 
 ```text
-PASS allow 431ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
+PASS allow 431ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
 PASS paint 431ms budget=3000ms
 PASS open 849ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 392ms health=200 models=200 identity=current modelCount=5

@@ -140,7 +140,7 @@
 下一步：进入 S1，将已验证的 ALLOW 快路径正式暴露为 `get_allow_status`，拆出 `AllowStatus / GradeStatus / WorkReport`，并以 `allow_inputs_frozen` 同时冻结 canOpen 输入与主按钮文案输入。
 
 ```text
-PASS allow 475ms inputs=claudeRunning,windowsBridgePid distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 475ms inputs=claudeRunning,windowsBridgePid distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 475ms budget=3000ms
 PASS open 789ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 502ms health=200 models=200 identity=current modelCount=5
@@ -158,7 +158,7 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=7291 exit=0
 下一步：进入 S2，把 `initialize_runtime` 移到首次 ALLOW paint 之后的后台；30 秒刷新只取 Grade 并只合并 Grade，生命周期动作完成后单独刷新 ALLOW；补首屏/周期/按钮源码边界测试。
 
 ```text
-PASS allow 533ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 533ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 533ms budget=3000ms
 PASS open 837ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 492ms health=200 models=200 identity=current modelCount=5
@@ -176,7 +176,7 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=6361 exit=0
 下一步：进入 S3，把主按钮 selector 与 ALLOW/Grade/Work reducer 做成可执行纯模块，构造全部探针红灯的真实 fixture，证明按钮文案、disabled、PID 与端口完全不变；同时给非阻断探针补 UI 硬期限与熔断。
 
 ```text
-PASS allow 535ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 535ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 535ms budget=3000ms
 PASS open 724ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 381ms health=200 models=200 identity=current modelCount=5
@@ -194,7 +194,7 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5589 exit=0
 下一步：进入 S4，在 WORK 车道新增 Bridge → 上游模型 API 的真实出口探针；复用 smoke 同一实现，现场识别 10808 死代理导致的 502，并只生成需用户确认的修复 Prompt，不自动改系统代理或 Key。
 
 ```text
-PASS allow 429ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 429ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 429ms budget=3000ms
 PASS open 723ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 329ms health=200 models=200 identity=current modelCount=5
@@ -216,7 +216,7 @@ SUMMARY required_pass=4 required_fail=0 non_gating_fail=1 elapsed_ms=5491 exit=0
 下一步：进入 S5，落长期合同与 PR 防膨胀五问，并逐项点击现有 UI/command，记录每项入口、响应和日志证据；任一无法现场安全点击的破坏性/计费能力明确标为待人工，不用源码存在冒充已验收。
 
 ```text
-PASS allow 426ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 426ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 426ms budget=3000ms
 PASS open 724ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 380ms health=200 models=200 identity=current modelCount=5
@@ -238,7 +238,7 @@ V0.1.7 补充：经用户明确授权，已真实执行 DeepSeek → OpenRouter 
 下一步：在维护窗口补 A2/A7、B2/B3/B6 与 D3/D7 写操作的 UI 证据；另为 Provider 跨进程崩溃窗口设计 durable revision journal；全部能力全绿后再进入正式发布验收。
 
 ```text
-PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
+PASS allow 322ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=443 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=443 pid8766=443 controlSocket=true canOpen=true canStart=false
 PASS paint 322ms budget=3000ms
 PASS open 776ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 416ms health=200 models=200 identity=current modelCount=5

@@ -127,7 +127,7 @@ git diff --check:     passed
 最终 debug `--smoke`：
 
 ```text
-PASS allow 431ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
+PASS allow 431ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
 PASS paint 431ms budget=3000ms
 PASS open 849ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 392ms health=200 models=200 identity=current modelCount=5

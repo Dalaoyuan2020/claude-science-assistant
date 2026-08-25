@@ -15,7 +15,7 @@
 `GET http://127.0.0.1:9876/health` 原始输出：
 
 ```json
-{"status":"ok","deepseek_configured":true,"openai_configured":false,"custom_configured":false,"default_backend":"deepseek","force_model":"deepseek-v4-pro","model_list_mode":"aliases","model_aliases":5,"aggregate_upstreams":0,"active_aggregate_scheme_id":"","upstream_modes":{"deepseek":"anthropic","openai":"openai","custom":"openai"},"proxy_auth_mode":"optional","proxy_auth_configured":false,"outbound_proxy_configured":true,"outbound_proxy_url":"http://127.0.0.1:12334","inline_image_policy":"auto","proxy_dir":"/home/lyuwinnie/.claude-science/proxy","source_path":"/home/lyuwinnie/.local/share/csa/runtime/bridge/versions/bridge-0.1.6-6ec4b3246671dc3b/proxy.py","runtime_identity":{"schemaVersion":1,"component":"bridge","runtimeId":"bridge-0.1.6-6ec4b3246671dc3b","version":"0.1.6","buildId":"58139102631dd5b7","sourcePath":"/home/lyuwinnie/.local/share/csa/runtime/bridge/versions/bridge-0.1.6-6ec4b3246671dc3b/proxy.py","sourceSha256":"58139102631dd5b7d620d8ea7dfa294c3fda34b528cd662c6a40e80c5d06d410","pid":108539,"capabilities":["anthropicBridge","configRevision","health"],"managed":true},"config_revision":"152768-1787558525675221700"}
+{"status":"ok","deepseek_configured":true,"openai_configured":false,"custom_configured":false,"default_backend":"deepseek","force_model":"deepseek-v4-pro","model_list_mode":"aliases","model_aliases":5,"aggregate_upstreams":0,"active_aggregate_scheme_id":"","upstream_modes":{"deepseek":"anthropic","openai":"openai","custom":"openai"},"proxy_auth_mode":"optional","proxy_auth_configured":false,"outbound_proxy_configured":true,"outbound_proxy_url":"http://127.0.0.1:12334","inline_image_policy":"auto","proxy_dir":"/home/<wsl-user>/.claude-science/proxy","source_path":"/home/<wsl-user>/.local/share/csa/runtime/bridge/versions/bridge-0.1.6-6ec4b3246671dc3b/proxy.py","runtime_identity":{"schemaVersion":1,"component":"bridge","runtimeId":"bridge-0.1.6-6ec4b3246671dc3b","version":"0.1.6","buildId":"58139102631dd5b7","sourcePath":"/home/<wsl-user>/.local/share/csa/runtime/bridge/versions/bridge-0.1.6-6ec4b3246671dc3b/proxy.py","sourceSha256":"58139102631dd5b7d620d8ea7dfa294c3fda34b528cd662c6a40e80c5d06d410","pid":108539,"capabilities":["anthropicBridge","configRevision","health"],"managed":true},"config_revision":"152768-1787558525675221700"}
 ```
 
 结论：人工临时处置仍然生效；Bridge 当前值与 Windows 系统代理声明值一致。
@@ -79,7 +79,7 @@ outbound_proxy_count=0
 ## 4. 完整 smoke
 
 ```text
-PASS allow 535ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=lyuwinnie claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
+PASS allow 535ms inputs=claudeRunning,windowsBridgePid wslInstalled=true distro=Ubuntu-24.04 linuxUser=<wsl-user> claudeRunning=true claudePid=108819 windowsBridgePid=none windowsBridgeProbe=checked runtimePresent=true listenerProbeOk=true listenerPresent=true daemonState=managed_ready pid8765=108819 pid8766=108819 controlSocket=true canOpen=true canStart=false
 PASS paint 535ms budget=3000ms
 PASS open 906ms login.url_ready loopback=true port=8765 nonce=present
 PASS bridge 508ms health=200 models=200 identity=current modelCount=5
