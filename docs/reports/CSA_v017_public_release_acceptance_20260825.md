@@ -62,6 +62,8 @@ git diff --check:                       passed
 
 后续 clean-source 门、Rust/WSL 故障注入和 20 次生命周期测试全部通过后，首次优化版 Tauri 冷编译中的 `rustc` 进程以 Windows `STATUS_ACCESS_VIOLATION` 退出，没有产生源码诊断，也没有生成 ZIP。打包脚本原本只把测试固定为单 Cargo job，最终 release build 仍可能并行；现已让最终 Tauri 构建在调用方未显式设置时默认使用 `CARGO_BUILD_JOBS=1`，并在结束后恢复原进程环境。正式资产仍须从包含该修复的新提交完整重跑，不能复用崩溃构建。
 
+首份独立解压候选在现场恢复服务时又暴露出一个打包白名单漏项：`-ForceRestart` 会启用窄化 DrvFS 写授权修复，但 ZIP 未包含它依赖的 `scripts/csa-narrow-broad-host-grants.py`，因此该路径按预期以退出码 2 拒绝继续。普通启动不受影响，旧候选 ZIP 已作废。现已把 helper 纳入便携包，加入解压结构验收，并在 package policy 与 runtime layout 测试中绑定启动脚本和固定 helper 路径；最终资产必须从包含此修复的新提交重新生成并再次执行 `-ForceRestart` 现场验收。
+
 新增 UI 回归覆盖：三皮肤 LauncherSettings 往返和非法值回退、单一主 DOM、三个 `aria-pressed` 选项、Help dialog 语义、背景 inert、Escape/Tab/焦点恢复源码合同、二维码资源存在且不引用过期群码，以及关键前景/背景组合的 WCAG AA 4.5:1 下限。
 
 ## 隔离 Windows 可视验收

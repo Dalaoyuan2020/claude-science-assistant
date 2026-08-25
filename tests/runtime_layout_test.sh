@@ -30,6 +30,14 @@ fail() {
   exit 1
 }
 
+start_script="$PROJECT_SOURCE/scripts/start-claude-science-wsl.sh"
+host_grant_repair_helper="$PROJECT_SOURCE/scripts/csa-narrow-broad-host-grants.py"
+[ -f "$start_script" ] || fail "WSL start script is missing from the runtime source"
+[ -f "$host_grant_repair_helper" ] \
+  || fail "ForceRestart host-grant repair helper is missing from the runtime source"
+grep -Fq 'HOST_GRANT_REPAIR_HELPER="$PROJECT_DIR/scripts/csa-narrow-broad-host-grants.py"' "$start_script" \
+  || fail "WSL start script no longer binds ForceRestart to the packaged host-grant repair helper"
+
 assert_eq() {
   [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
 }

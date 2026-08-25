@@ -74,6 +74,7 @@ $required = @(
   "scripts\start-claude-science-wsl.sh",
   "scripts\csa-runtime-layout.sh",
   "scripts\csa-network-quality.py",
+  "scripts\csa-narrow-broad-host-grants.py",
   "scripts\status-probe.ps1",
   "scripts\install-wsl-bridge-service.sh",
   "launcher\src\runtimeUpdate.ts",

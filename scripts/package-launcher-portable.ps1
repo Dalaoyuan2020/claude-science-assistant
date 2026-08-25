@@ -219,6 +219,7 @@ foreach ($file in @(
   "package-policy.ps1",
   "csa-runtime-layout.sh",
   "csa-network-quality.py",
+  "csa-narrow-broad-host-grants.py",
   "install-wsl-bridge-service.sh",
   "start-claude-science-wsl.sh",
   "start-claude-science-wsl.ps1",

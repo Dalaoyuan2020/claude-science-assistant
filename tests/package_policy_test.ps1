@@ -118,6 +118,7 @@ if (Test-Path -LiteralPath $packageScriptPath) {
   }
   foreach ($portableRuntimeFile in @(
     '"csa-network-quality.py"',
+    '"csa-narrow-broad-host-grants.py"',
     '"test_network_quality.py"',
     '"unix_socket_adapter_integration_test.py"',
     '"runtime_activation_integration_test.sh"',
@@ -127,6 +128,9 @@ if (Test-Path -LiteralPath $packageScriptPath) {
     if (-not $packageScriptText.Contains($portableRuntimeFile)) {
       throw "Portable package is missing a required runtime quality helper/test: $portableRuntimeFile"
     }
+  }
+  if (-not $acceptanceText.Contains('scripts\csa-narrow-broad-host-grants.py')) {
+    throw "Portable acceptance must reject a package missing the ForceRestart host-grant repair helper."
   }
 
   $cacheCleanupFunction = $packageAst.Find(
